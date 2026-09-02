@@ -278,7 +278,6 @@ static void handle_req(struct mg_connection *connection, json_value_t *values, s
 
 static void handle_event(struct mg_connection *connection, json_value_t *values, size_t count) {
     event_t event;
-    time_t now = time(NULL);
     
     /* Parse event */
     if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) {

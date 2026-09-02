@@ -5,6 +5,7 @@
 #include <time.h>
 #include <mongoose.h>
 #include "cagliostr.h"
+#include "../storage.h"
 
 /* ============================================================================
  * NIP-01: Basic Protocol Flow, Events and Signatures
@@ -17,8 +18,6 @@
  * - Event kind processing dispatch system
  * - Plugin-style handlers for different event kinds
  * ============================================================================ */
-
-typedef struct storage_context storage_context_t;
 
 /* ============================================================================
  * Event Validation

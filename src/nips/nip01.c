@@ -69,6 +69,9 @@ static nip01_process_result_t handle_kind_deletion(
     storage_context_t *storage,
     const char *relay_url) {
     
+    (void)connection;  /* May be used for future enhancements */
+    (void)relay_url;   /* May be used for relay tag filtering (NIP-09) */
+    
     nip01_process_result_t result = {0};
     
     if (!storage) {
@@ -97,6 +100,8 @@ static nip01_process_result_t handle_kind_vanish(
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
+    
+    (void)connection;  /* May be used for future enhancements */
     
     nip01_process_result_t result = {0};
     
@@ -143,6 +148,9 @@ static nip01_process_result_t handle_kind_replaceable(
     storage_context_t *storage,
     const char *relay_url) {
     
+    (void)connection;  /* May be used for future enhancements */
+    (void)relay_url;   /* May be used for future enhancements */
+    
     nip01_process_result_t result = {0};
     
     if (!storage) {
@@ -175,6 +183,9 @@ static nip01_process_result_t handle_kind_addressable(
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
+    
+    (void)connection;  /* May be used for future enhancements */
+    (void)relay_url;   /* May be used for future enhancements */
     
     nip01_process_result_t result = {0};
     
@@ -209,6 +220,11 @@ static nip01_process_result_t handle_kind_ephemeral(
     storage_context_t *storage,
     const char *relay_url) {
     
+    (void)connection;  /* Not needed for ephemeral events */
+    (void)event;       /* Not needed for ephemeral events */
+    (void)storage;     /* Ephemeral events are not stored */
+    (void)relay_url;   /* Not needed for ephemeral events */
+    
     nip01_process_result_t result = {0};
     
     /* Ephemeral events are never stored, only broadcast */
@@ -228,6 +244,9 @@ static nip01_process_result_t handle_kind_regular(
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
+    
+    (void)connection;  /* May be used for future enhancements */
+    (void)relay_url;   /* May be used for future enhancements */
     
     nip01_process_result_t result = {0};
     
