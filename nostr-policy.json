@@ -1,0 +1,21 @@
+{
+  "roles": [
+    {
+      "role": "nostr_relay",
+      "schemas": [
+        "ws://",
+        "wss://"
+      ],
+      "ws-protocol": "nostr",
+      "port": 8080,
+      "socket-family": "inet",
+      "direction": "inbound",
+      "metadata": [
+        {
+          "name": "mime",
+          "alg": "basic"
+        }
+      ]
+    }
+  ]
+}
