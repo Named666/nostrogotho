@@ -78,10 +78,10 @@ bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
                             int min_pow_difficulty);
 
 /* ============================================================================
- * Event Kind Processing (Dispatch System)
+ * Event Stream Listener System (Plugin Architecture)
  * ============================================================================ */
 
-/* Event processing result - returned by kind handlers
+/* Event processing result - returned by event listeners
  * 
  * Indicates success, failure, and what action relay should take with the event.
  */
@@ -91,33 +91,68 @@ typedef struct {
     char response_msg[256];     /* Human-readable reason (OK or rejection message) */
 } nip01_process_result_t;
 
-/* Handler function type for processing events of a specific kind or kind range
+/* Listener function type - called when event of registered kind arrives
+ * 
+ * Each NIP can register listeners for specific kinds. When an event arrives,
+ * all registered listeners for that kind are called in order. The first
+ * listener to return accepted=true stops further processing.
  * 
  * Args:
  *   connection - WebSocket connection (for auth checks, etc.)
- *   event      - the event to process
+ *   event      - the event that arrived
  *   storage    - storage context for database operations
- *   relay_url  - relay's URL (for delegation/auth checks)
+ *   relay_url  - relay's URL (for relay-specific filtering)
  * 
  * Returns: nip01_process_result_t with acceptance decision and message
  * 
- * Handler responsibility:
- *   1. Perform kind-specific validation
- *   2. Handle storage (insert, replace, delete old events, etc.)
- *   3. Decide if event should broadcast to subscribers
- *   4. Return result with success/failure and message
+ * Listener responsibility:
+ *   1. Check if this event is relevant to this listener
+ *   2. Perform kind-specific validation and processing
+ *   3. Handle storage operations (insert, replace, delete, etc.)
+ *   4. Decide if event should broadcast to subscribers
+ *   5. Return result with success/failure/decision
  * 
- * Constraints:
- *   - General validation (ID, signature, size, timestamp, PoW) is already done
- *   - Handler should NOT broadcast; caller will decide based on should_broadcast
- *   - Should NOT send response to client; caller will send OK/NOTICE
+ * Important:
+ *   - General validation (ID, signature, size, timestamp, PoW) is done before listeners are called
+ *   - Listener should NOT broadcast; caller decides based on should_broadcast
+ *   - Listener should NOT send response to client; caller sends OK/NOTICE
+ *   - Multiple listeners can be registered for the same kind
  */
-typedef nip01_process_result_t (*nip01_kind_handler_t)(
+typedef nip01_process_result_t (*nip01_event_listener_t)(
     struct mg_connection *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url
 );
+
+/* nip01_register_listener - Register a listener for a range of event kinds
+ * 
+ * Allows NIPs to subscribe to events of their kind(s). When an event whose
+ * kind falls within [kind_min, kind_max] arrives, the listener is called.
+ * Use kind_min == kind_max to register for a single kind. Multiple listeners
+ * (from different NIPs) can overlap the same kind/range.
+ * 
+ * Args:
+ *   kind_min - lowest kind (inclusive) this listener handles
+ *   kind_max - highest kind (inclusive) this listener handles
+ *   listener - function to call when a matching event arrives
+ * 
+ * Returns: true if listener registered successfully, false if table is full
+ */
+bool nip01_register_listener(int kind_min, int kind_max, nip01_event_listener_t listener);
+
+/* nip01_init_listeners - Initialize built-in NIP listeners
+ * 
+ * Calls each NIP module's own nipXX_register_listeners() function so it can
+ * subscribe to the kinds it cares about. Should be called once during server
+ * initialization. Adding a new NIP means adding one call here to its own
+ * registration function - the dispatcher itself never needs to change.
+ * 
+ * Kinds with no registered listener fall back to default NIP-01 behavior:
+ * store the event and broadcast it (except ephemeral kinds 20000-29999,
+ * which are broadcast without storage per NIP-01).
+ */
+void nip01_init_listeners(void);
 
 /* nip01_process_event - Main entry point for event processing
  * 
@@ -126,8 +161,7 @@ typedef nip01_process_result_t (*nip01_kind_handler_t)(
  * 2. Checks content size limit
  * 3. Checks timestamp limits
  * 4. Checks proof-of-work difficulty
- * 5. Checks for auth-required tag
- * 6. Dispatches to kind-specific handler
+ * 5. Dispatches to registered listeners for this kind
  * 
  * Args:
  *   connection                  - WebSocket connection

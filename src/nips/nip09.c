@@ -1,8 +1,10 @@
 #include <mongoose.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "nip09.h"
 #include "nip_event.h"
+#include "nip01.h"
 
 /* NIP-09 permits an author to delete only their own referenced events. */
 bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
@@ -33,4 +35,37 @@ bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
         free(name);
     }
     return !failed;
+}
+
+/* Listener for kind 5 (Event Deletion) events. */
+static nip01_process_result_t nip09_listener(
+    struct mg_connection *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url) {
+
+    (void)connection;
+    (void)relay_url;
+
+    nip01_process_result_t result = {0};
+
+    if (!storage) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "error: storage unavailable");
+        return result;
+    }
+
+    bool deleted = nip09_delete_targets(event, storage);
+    result.accepted = true;
+    result.should_broadcast = false;  /* Deletion events are typically not broadcast */
+    snprintf(result.response_msg, sizeof(result.response_msg), "%s",
+            deleted ? "" : "deletion failed");
+
+    return result;
+}
+
+/* Auto-register this NIP's listener at program startup */
+__attribute__((constructor)) static void nip09_register_at_startup(void) {
+    nip01_register_listener(5, 5, nip09_listener);
 }

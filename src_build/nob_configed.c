@@ -31,11 +31,13 @@ int main(void)
                    "-I"THIRD_PARTY_FOLDER"secp256k1/src");
     nob_cc_output(&cmd, output_path);
     nob_cc_inputs(&cmd, SRC_FOLDER"main.c", SRC_FOLDER"server.c",
-                  SRC_FOLDER"nips/nip11.c",
+                  SRC_FOLDER"nips/nip01.c", SRC_FOLDER"nips/nip11.c",
                   SRC_FOLDER"nips/nip_event.c", SRC_FOLDER"nips/nip09.c",
                   SRC_FOLDER"nips/nip13.c", SRC_FOLDER"nips/nip16.c",
-                  SRC_FOLDER"nips/nip17.c", SRC_FOLDER"nips/nip33.c",
-                  SRC_FOLDER"nips/nip42.c", SRC_FOLDER"nips/nip62.c",
+                  SRC_FOLDER"nips/nip17.c", SRC_FOLDER"nips/nip26.c",
+                  SRC_FOLDER"nips/nip33.c", SRC_FOLDER"nips/nip40.c",
+                  SRC_FOLDER"nips/nip42.c", SRC_FOLDER"nips/nip45.c",
+                  SRC_FOLDER"nips/nip62.c", SRC_FOLDER"nips/nip67.c",
                   SRC_FOLDER"crypto.c",
                   SRC_FOLDER"storage.c", SRC_FOLDER"cagliostr.c",
                   SRC_FOLDER"json_util.c", THIRD_PARTY_FOLDER"sqlite3.c",

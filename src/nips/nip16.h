@@ -4,4 +4,6 @@
 #include "storage.h"
 /* Remove older replaceable events before storing the newer NIP-16 event. */
 bool nip16_replace_event(const event_t *event, storage_context_t *storage);
+/* Register this NIP's event listener(s) with the NIP-01 dispatcher. */
+void nip16_register_listeners(void);
 #endif /* NIP16_H_ */
