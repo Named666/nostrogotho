@@ -4,12 +4,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#ifdef _WIN32
-#include <bcrypt.h>
-#endif
-
 #include "crypto.h"
 #include "json_util.h"
+#include "nips/nip_event.h"
+#include "nips/nip01.h"
+#include "nips/nip09.h"
+#include "nips/nip11.h"
+#include "nips/nip13.h"
+#include "nips/nip16.h"
+#include "nips/nip17.h"
+#include "nips/nip33.h"
+#include "nips/nip40.h"
+#include "nips/nip42.h"
+#include "nips/nip45.h"
+#include "nips/nip62.h"
+#include "nips/nip67.h"
 #include "server.h"
 
 #define MAX_SUBSCRIPTIONS 20
@@ -26,18 +35,10 @@ typedef struct subscription {
     struct subscription *next;
 } subscription_t;
 
-typedef struct client_state {
-    struct mg_connection *connection;
-    char challenge[17];
-    char pubkey[MAX_PUBKEY_SIZE + 1];
-    struct client_state *next;
-} client_state_t;
-
 static struct mg_mgr manager;
 static volatile sig_atomic_t stop_requested;
 static storage_context_t *storage_ctx;
 static subscription_t *subscriptions;
-static client_state_t *clients;
 static struct mg_connection *query_connection;
 static filter_t *query_filters;
 static size_t query_filters_count;
@@ -57,45 +58,6 @@ static bool mg_str_contains(struct mg_str haystack, const char *needle) {
 
 static void send_json(struct mg_connection *connection, const char *json) {
     mg_ws_send(connection, json, strlen(json), WEBSOCKET_OP_TEXT);
-}
-
-static client_state_t *client_state(struct mg_connection *connection, bool create) {
-    for (client_state_t *state = clients; state; state = state->next) {
-        if (state->connection == connection) return state;
-    }
-    if (!create) return NULL;
-    client_state_t *state = (client_state_t *) calloc(1, sizeof(*state));
-    if (!state) return NULL;
-    state->connection = connection;
-#ifdef _WIN32
-    unsigned char random[8];
-    if (BCryptGenRandom(NULL, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-        free(state);
-        return NULL;
-    }
-    for (size_t i = 0; i < sizeof(random); i++) {
-        snprintf(state->challenge + i * 2, 3, "%02x", random[i]);
-    }
-#else
-    free(state);
-    return NULL;
-#endif
-    state->next = clients;
-    clients = state;
-    return state;
-}
-
-static void remove_client(struct mg_connection *connection) {
-    client_state_t **link = &clients;
-    while (*link) {
-        if ((*link)->connection == connection) {
-            client_state_t *state = *link;
-            *link = state->next;
-            free(state);
-            return;
-        }
-        link = &(*link)->next;
-    }
 }
 
 static char *tag_element(struct mg_str tag, size_t index) {
@@ -221,9 +183,8 @@ static void broadcast_event(const event_t *event) {
     for (subscription_t *subscription = subscriptions; subscription; subscription = subscription->next) {
         bool matched = false;
         for (size_t i = 0; i < subscription->filters_count; i++) if (matches_filter(&subscription->filters[i], event)) matched = true;
-        client_state_t *state = client_state(subscription->connection, false);
-        if (matched && ((event->kind != 1059 && event->kind != 21059) ||
-                (state && event_has_tag(event, "p", state->pubkey)))) {
+        const char *pubkey = nip42_authenticated_pubkey(subscription->connection);
+        if (matched && nip17_can_deliver(event, pubkey)) {
             json_builder_t builder;
             json_builder_start(&builder);
             json_builder_append_string(&builder, "EVENT");
@@ -239,7 +200,6 @@ static void query_sender(const char *json) {
     size_t count;
     event_t event;
     bool matched = false;
-    client_state_t *state;
 
     if (!query_connection) return;
     count = json_array_parse(json, values, MAX_JSON_ARRAY_ELEMENTS);
@@ -250,9 +210,7 @@ static void query_sender(const char *json) {
         for (size_t i = 0; i < query_filters_count; i++) {
             if (matches_filter(&query_filters[i], &event)) matched = true;
         }
-        state = client_state(query_connection, false);
-        if (matched && ((event.kind != 1059 && event.kind != 21059) ||
-                        (state && event_has_tag(&event, "p", state->pubkey)))) {
+        if (matched && nip17_can_deliver(&event, nip42_authenticated_pubkey(query_connection))) {
             send_json(query_connection, json);
         }
         event_free(&event);
@@ -275,14 +233,11 @@ static void query_events(struct mg_connection *connection, const char *sub,
     query_filters = NULL;
     query_filters_count = 0;
     if (!do_count) {
-        json_builder_t builder;
-        json_builder_start(&builder);
-        json_builder_append_string(&builder, "EOSE");
-        json_builder_append_string(&builder, sub);
-        json_builder_start_array(&builder);
-        json_builder_append_string(&builder, has_more ? "more" : "finish");
-        json_builder_end_array(&builder);
-        send_json(connection, json_builder_finish(&builder));
+        char *eose_response = nip67_build_eose_response(sub, has_more);
+        if (eose_response) {
+            send_json(connection, eose_response);
+            free(eose_response);
+        }
     }
 }
 
@@ -321,121 +276,52 @@ static void handle_req(struct mg_connection *connection, json_value_t *values, s
     }
 }
 
-static bool parse_address(const char *coordinate, int *kind, char *pubkey,
-                          size_t pubkey_size, char **dtag) {
-    char *end;
-    const char *first, *second;
-    long parsed_kind;
-    if (!coordinate || !(first = strchr(coordinate, ':')) ||
-        !(second = strchr(first + 1, ':')) || second == first + 1 ||
-        (size_t) (second - first) != MAX_PUBKEY_SIZE + 1 ||
-        (size_t) (second - first - 1) >= pubkey_size) return false;
-    parsed_kind = strtol(coordinate, &end, 10);
-    if (end != first || parsed_kind < INT_MIN || parsed_kind > INT_MAX) return false;
-    memcpy(pubkey, first + 1, MAX_PUBKEY_SIZE);
-    pubkey[MAX_PUBKEY_SIZE] = '\0';
-    *dtag = string_dup(second + 1);
-    if (!*dtag) return false;
-    *kind = (int) parsed_kind;
-    return true;
-}
-
-static void delete_event_targets(const event_t *event, bool *failed) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t tag_offset = 0;
-    while ((tag_offset = mg_json_next(tags, tag_offset, &key, &tag)) != 0) {
-        char *name = tag_element(tag, 0);
-        if (name && strcmp(name, "e") == 0) {
-            for (size_t i = 1;; i++) {
-                char *id = tag_element(tag, i);
-                event_t *target;
-                if (!id) break;
-                target = storage_ctx->get_event_by_id(id);
-                if (target) {
-                    int result;
-                    if (target->kind == 1059) {
-                        tag_t recipient = {(char *[]) {"p", (char *) event->pubkey}, 2, 2};
-                        result = storage_ctx->delete_record_by_id_and_kind_and_ptag(id, 1059, &recipient);
-                    } else result = storage_ctx->delete_record_by_id_and_pubkey(id, event->pubkey);
-                    if (result <= 0) *failed = true;
-                    event_free(target);
-                }
-                free(id);
-            }
-        } else if (name && strcmp(name, "a") == 0) {
-            char *coordinate = tag_element(tag, 1);
-            int kind;
-            char pubkey[MAX_PUBKEY_SIZE + 1];
-            char *dtag = NULL;
-            if (coordinate && parse_address(coordinate, &kind, pubkey, sizeof(pubkey), &dtag) &&
-                strcmp(pubkey, event->pubkey) == 0) {
-                tag_t d_tag = {(char *[]) {"d", dtag}, 2, 2};
-                if (storage_ctx->delete_record_by_kind_and_pubkey_and_dtag(kind, event->pubkey, &d_tag, event->created_at + 1) < 0) *failed = true;
-            }
-            free(dtag);
-            free(coordinate);
-        }
-        free(name);
-    }
-}
-
-static bool replace_addressable_event(const event_t *event) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = tag_element(tag, 0);
-        if (name && strcmp(name, "d") == 0) {
-            char *value = tag_element(tag, 1);
-            tag_t d_tag = {(char *[]) {"d", value ? value : ""}, 2, 2};
-            free(name);
-            if (!value || storage_ctx->delete_record_by_kind_and_pubkey_and_dtag(event->kind, event->pubkey, &d_tag, event->created_at) < 0) { free(value); return false; }
-            free(value);
-            return true;
-        }
-        free(name);
-    }
-    return true;
-}
-
-static bool should_vanish(const event_t *event) {
-    if (event_has_tag(event, "relay", "ALL_RELAYS")) return true;
-    if (!service_url[0]) return false;
-    return event_has_relay_tag(event, service_url);
-}
-
 static void handle_event(struct mg_connection *connection, json_value_t *values, size_t count) {
     event_t event;
     time_t now = time(NULL);
-    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) { send_status(connection, "NOTICE", NULL, false, "error: invalid event"); return; }
-    if (event.content_len > MAX_EVENT_CONTENT_LENGTH) send_status(connection, "OK", event.id, false, "invalid: content too large");
-    else if (!check_event(&event)) send_status(connection, "OK", event.id, false, "invalid: event id, signature or delegation is invalid");
-    else if ((created_at_lower_limit && event.created_at < now - created_at_lower_limit) || (created_at_upper_limit && event.created_at > now + created_at_upper_limit)) send_status(connection, "OK", event.id, false, "invalid: created_at is out of the acceptable range");
-    else if (min_pow_difficulty && count_leading_zero_bits(event.id) < min_pow_difficulty) send_status(connection, "OK", event.id, false, "pow: insufficient difficulty");
-    else if (event_has_tag(&event, "-", NULL) && (!client_state(connection, false) || strcmp(client_state(connection, false)->pubkey, event.pubkey) != 0)) send_status(connection, "OK", event.id, false, "auth-required: authentication required");
-    else if (event.kind == 5) {
-        bool failed = false;
-        delete_event_targets(&event, &failed);
-        send_status(connection, "OK", event.id, !failed, failed ? "deletion failed" : "");
-    } else if (event.kind == 62) {
-        if (should_vanish(&event) && storage_ctx->delete_all_events_by_pubkey(event.pubkey, event.created_at) < 0) send_status(connection, "OK", event.id, false, "error: failed to vanish events");
-        else if (!storage_ctx->insert_record(&event)) send_status(connection, "OK", event.id, false, "duplicate: event already exists");
-        else { send_status(connection, "OK", event.id, true, ""); broadcast_event(&event); }
-    } else if (event.kind >= 20000 && event.kind < 30000) { send_status(connection, "OK", event.id, true, ""); broadcast_event(&event); }
-    else if ((event.kind == 0 || event.kind == 3 || (event.kind >= 10000 && event.kind < 20000)) && storage_ctx->delete_record_by_kind_and_pubkey(event.kind, event.pubkey, event.created_at) < 0) send_status(connection, "OK", event.id, false, "error: failed to replace event");
-    else if (event.kind >= 30000 && event.kind < 40000 && !replace_addressable_event(&event)) send_status(connection, "OK", event.id, false, "error: failed to replace event");
-    else if (!storage_ctx->insert_record(&event)) send_status(connection, "OK", event.id, false, "duplicate: event already exists");
-    else { send_status(connection, "OK", event.id, true, ""); broadcast_event(&event); }
+    
+    /* Parse event */
+    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) {
+        send_status(connection, "NOTICE", NULL, false, "error: invalid event");
+        return;
+    }
+    
+    /* Check for auth-required tag (must be authenticated) */
+    if (event_has_tag(&event, "-", NULL)) {
+        const char *auth_pubkey = nip42_authenticated_pubkey(connection);
+        if (!auth_pubkey || strcmp(auth_pubkey, event.pubkey) != 0) {
+            send_status(connection, "OK", event.id, false, "auth-required: authentication required");
+            event_free(&event);
+            return;
+        }
+    }
+    
+    /* Process event through kind dispatcher */
+    nip01_process_result_t result = nip01_process_event(
+        connection, &event, storage_ctx, service_url,
+        MAX_EVENT_CONTENT_LENGTH,
+        created_at_lower_limit,
+        created_at_upper_limit,
+        min_pow_difficulty
+    );
+    
+    /* Send response to client */
+    send_status(connection, "OK", event.id, result.accepted, result.response_msg);
+    
+    /* Broadcast event if accepted and should broadcast */
+    if (result.accepted && result.should_broadcast) {
+        broadcast_event(&event);
+    }
+    
     event_free(&event);
 }
 
 static void handle_auth(struct mg_connection *connection, json_value_t *values, size_t count) {
     event_t event;
-    client_state_t *state = client_state(connection, false);
     time_t now = time(NULL);
-    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !state || !json_parse_event(values[1].value.string_val, &event)) { send_status(connection, "NOTICE", NULL, false, "error: invalid auth"); return; }
-    if (event.kind != 22242 || !check_event(&event) || llabs((long long) now - (long long) event.created_at) > 600 ||
-        !event_has_tag(&event, "challenge", state->challenge) || !event_has_relay_tag(&event, service_url)) send_status(connection, "OK", event.id, false, "error: failed to authenticate");
-    else { strcpy(state->pubkey, event.pubkey); send_status(connection, "OK", event.id, true, ""); }
+    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) { send_status(connection, "NOTICE", NULL, false, "error: invalid auth"); return; }
+    if (!nip42_authenticate(connection, &event, service_url, now)) send_status(connection, "OK", event.id, false, "error: failed to authenticate");
+    else send_status(connection, "OK", event.id, true, "");
     event_free(&event);
 }
 
@@ -463,19 +349,19 @@ static void nostr_event_handler(struct mg_connection *connection, int event, voi
         struct mg_http_message *request = event_data;
         struct mg_str *accept = mg_http_get_header(request, "Accept");
         if (accept && mg_str_contains(*accept, "application/nostr+json")) {
-            mg_http_reply(connection, 200, "Content-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\n", "{\"name\":\"nostrogotho\",\"supported_nips\":[1,9,11,13,16,26,33,40,62,67],\"limitation\":{\"max_message_length\":5242880,\"max_subscriptions\":20,\"max_filters\":10,\"max_limit\":500}}");
+            mg_http_reply(connection, 200, "Content-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", nip11_information_document());
         } else mg_ws_upgrade(connection, request, NULL);
     } else if (event == MG_EV_WS_OPEN) {
-        client_state_t *state = client_state(connection, true);
-        if (state) {
+        char challenge[17];
+        if (nip42_open(connection, challenge)) {
             json_builder_t builder;
             json_builder_start(&builder);
             json_builder_append_string(&builder, "AUTH");
-            json_builder_append_string(&builder, state->challenge);
+            json_builder_append_string(&builder, challenge);
             send_json(connection, json_builder_finish(&builder));
         }
     } else if (event == MG_EV_WS_MSG) handle_message(connection, event_data);
-    else if (event == MG_EV_CLOSE) { remove_subscriptions(connection, NULL); remove_client(connection); }
+    else if (event == MG_EV_CLOSE) { remove_subscriptions(connection, NULL); nip42_close(connection); }
 }
 
 void server_configure(storage_context_t *storage, const char *relay_url, int min_pow,

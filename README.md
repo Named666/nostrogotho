@@ -109,6 +109,16 @@ Runtime configuration supports the database path, listener port, public service
 URL, proof-of-work difficulty, and accepted `created_at` window through
 command-line arguments or environment variables.
 
+## Protocol Modules
+
+Protocol policy is isolated under [src/nips](src/nips). `server.c` owns the
+Mongoose event loop, WebSocket framing, subscription lifecycle, and dispatch;
+NIP modules own protocol-specific decisions. Every supported server-side NIP
+has its own implementation and header: `nip09`, `nip11`, `nip13`, `nip16`,
+`nip17`, `nip33`, and `nip62`. Shared event-tag inspection lives in
+`nip_event`. Add new NIP behavior in this directory and expose a small,
+documented interface rather than growing the transport loop.
+
 ## Social Network Roadmap
 
 The following items would make the relay a stronger foundation for a
