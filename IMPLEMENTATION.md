@@ -1,4 +1,55 @@
-# Cagliostr C99 Port
+# Implementation Guide
+
+## Architecture
+
+| Module | Responsibility |
+| --- | --- |
+| [src/main.c](src/main.c) | Parses runtime configuration; initializes crypto, storage, and the server. |
+| [src/server.c](src/server.c) | HTTP metadata, WebSocket protocol frames, subscription state, authentication, and event lifecycle rules. |
+| [src/json_util.c](src/json_util.c) | Bounded JSON parsing for protocol arrays, filters, and events; JSON serialization. |
+| [src/crypto.c](src/crypto.c) | SHA-256, Schnorr signatures, NIP-26 delegation, and NIP-13 PoW validation. |
+| [src/storage.c](src/storage.c) | SQLite schema, retrieval, queries, replacement, deletion, and expiration. |
+| [src/cagliostr.c](src/cagliostr.c) | Owned event/filter/tag allocation utilities. |
+
+The event loop and SQLite context are single-threaded. Do not call the storage
+context concurrently without adding synchronization and testing it.
+
+## Event Flow
+
+1. `server.c` parses a WebSocket JSON array and dispatches its command.
+2. `json_util.c` validates the event shape and preserves tag JSON.
+3. `crypto.c` verifies the event ID, signature, and delegation tags.
+4. `server.c` enforces size, timestamp, PoW, authorization, and event-kind
+   lifecycle rules.
+5. `storage.c` persists/query events; `server.c` sends matching subscriptions.
+
+Keep the stored-query and live-subscription paths behaviorally aligned,
+especially for NIP-17 gift wraps and filter matching.
+
+## Contribution Rules
+
+- Preserve C99 compatibility.
+- Treat all network data and SQLite text as length-bounded, untrusted input.
+- Use JSON serializers for protocol strings; do not interpolate event content
+  into a JSON frame.
+- Keep schema/index migrations explicit and backward-compatible.
+- Update [README.md](README.md), [API_REFERENCE.md](API_REFERENCE.md), and
+  [NOSTR.md](NOSTR.md) when externally visible behavior changes.
+- Do not edit vendored `thirdparty/` code for relay behavior without documenting
+  the upstream version and local patch rationale.
+
+## Validation
+
+Run this after source changes:
+
+```powershell
+gcc -std=c99 -Wall -Wextra -Wpedantic -I. -Isrc -Ithirdparty -Ithirdparty/mongoose -fsyntax-only src/main.c src/server.c src/storage.c src/json_util.c src/crypto.c src/cagliostr.c
+git diff --check
+```
+
+Then rebuild with `gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe`
+and `.\nob.exe`. The vendored secp256k1 build can emit warnings; investigate
+new warnings from project `src/` files before accepting a change.# Cagliostr C99 Port
 
 A complete rewrite of the Nostr relay storage and cryptographic operations from C++ to C99.
 

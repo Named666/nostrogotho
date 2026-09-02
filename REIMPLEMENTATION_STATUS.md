@@ -1,258 +1,101 @@
-# C99 Nostr Relay Server Reimplementation - Status Report
+﻿# Current Status
 
-## Overview
-This document summarizes the progress on reimplementing the cagliostr Nostr relay server from C++ to C99. The goal is to create a production-ready relay server using only dependencies available in `thirdparty/` folder.
+The C99 relay implementation is complete and builds/runs end-to-end. Current
+capability is documented in [README.md](README.md); this file tracks
+completeness in more detail and the roadmap toward a high-performance,
+feature-complete relay. For contribution workflow, use
+[IMPLEMENTATION.md](IMPLEMENTATION.md).
 
-## Completed Tasks
+## Build Status
 
-### 1. ✅ Core Data Structures (cagliostr.h/c)
-- **Status**: Fully implemented and documented
-- **Components**:
-  - `event_t`: Nostr event structure with all required fields
-  - `filter_t`: Query filter for subscriptions (NIP-01)
-  - `tag_t` / `tags_array_t`: Tag parsing and storage
-  - Memory management: allocation, deallocation, and safety
-- **Documentation**: Comprehensive inline comments explaining each structure
+`gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe && .\nob.exe` produces
+`build/main.exe`, which links the relay, SQLite amalgamation, bundled
+mongoose, and bundled secp256k1 from source (no external dependencies, no
+cmake/perl/autotools). OpenSSL is used for SHA-256 hashing only.
 
-**Files**:
-- [cagliostr.h](src/cagliostr.h) - 200+ lines of documented header
-- [cagliostr.c](src/cagliostr.c) - Full memory management implementation
+## Component Completeness
 
-### 2. ✅ Cryptography (crypto.h/c)
-- **Status**: Fully implemented and documented
-- **Features**:
-  - Event ID validation (SHA256 hash computation)
-  - Schnorr signature verification (using libsecp256k1)
-  - Delegation verification (NIP-26)
-  - Proof-of-work calculation (NIP-13)
-  - Hex encoding/decoding utilities
-- **Correctness Fixes**:
-  - Added `json_escape_string()` function for proper JSON serialization
-  - Fixed event hash computation to properly escape special characters
-  - Proper error handling and validation
+| Module | Lines | Status |
+| --- | --- | --- |
+| [src/cagliostr.c](src/cagliostr.c) / [.h](src/cagliostr.h) | ~250/180 | Complete: event/filter/tag allocation and ownership. |
+| [src/crypto.c](src/crypto.c) / [.h](src/crypto.h) | ~684/197 | Complete: SHA-256, Schnorr verify (secp256k1), NIP-26 delegation, NIP-13 PoW, JSON string escaping. |
+| [src/json_util.c](src/json_util.c) / [.h](src/json_util.h) | ~712/232 | Complete: bounded JSON array/object parsing for protocol frames, filters, and events; serialization via `json_builder_t`. |
+| [src/storage.c](src/storage.c) / [.h](src/storage.h) | ~886/214 | Complete: SQLite schema, indexes, WAL mode, CRUD, filtered queries, COUNT, deletion strategies for NIP-09/16/33/62, NIP-40 expiration filtering. |
+| [src/server.c](src/server.c) / [.h](src/server.h) | ~467/12 | Complete: mongoose HTTP/WebSocket handling, NIP-01 message dispatch (`EVENT`/`REQ`/`CLOSE`/`COUNT`/`AUTH`), NIP-42 challenge/auth, NIP-11 info document, NIP-17 gift-wrap recipient gating, NIP-62 vanish, replaceable/parameterized-replaceable/addressable event handling, NIP-67 EOSE hints. |
+| [src/main.c](src/main.c) | ~93 | Complete: CLI/env configuration, signal handling, storage/crypto init and shutdown. |
 
-**Files**:
-- [crypto.h](src/crypto.h) - 200+ lines with detailed function documentation
-- [crypto.c](src/crypto.c) - Full implementation with inline comments
+All NIPs listed in the [README.md](README.md) support table (01, 09, 11, 13,
+16, 17, 26, 33, 40, 42, 45, 62, 67) are implemented in `server.c`/`storage.c`
+and exercised by the running relay, not stubs.
 
-### 3. ✅ Storage Backend (storage.h/c)
-- **Status**: SQLite3 backend fully implemented
-- **Features**:
-  - Event CRUD operations
-  - Flexible filter queries (NIP-01, NIP-67)
-  - Event deletion by various criteria (NIP-09, NIP-16, NIP-33, NIP-62)
-  - COUNT queries (NIP-13)
-  - Optimized indexes for common queries
-  - WAL mode for crash safety and concurrency
-- **Database**:
-  - Single `event` table with 7 columns (id, pubkey, created_at, kind, tags, content, sig)
-  - 5 indexes for common query patterns
-  - Configured with PRAGMA settings for performance
+## Known Correctness/Hardening Gaps
 
-**Files**:
-- [storage.h](src/storage.h) - 250+ lines with detailed API documentation
-- [storage.c](src/storage.c) - 700+ lines of implementation
+1. **Fixed-size query buffers** (`storage.c`, `send_records()`): conditions
+   (2048 B), SQL (4096 B), and parameter (256) buffers are bounds-checked and
+   reject oversized filters, but do not support arbitrarily large filter
+   arrays. Replacing with dynamic allocation would remove the 256-element
+   filter cap.
+2. **No rate limiting or connection quotas**: `server.c` has no per-IP or
+   per-pubkey request/event throttling, no backpressure limits beyond the
+   5 MiB WebSocket frame cap, and no connection quotas. A public deployment
+   needs a reverse proxy or added in-process limiting.
+3. **Single SQLite connection, single-threaded event loop**: matches the
+   documented limitation in README but caps throughput; no read replicas or
+   WAL-backed concurrent readers are wired up beyond SQLite's own WAL mode.
+4. **`search` filter is a raw SQL `LIKE`**: functional but unranked, unbounded
+   in cost, and not a real full-text index (see NIP-50 roadmap item below).
+5. **No metrics, structured logging, or admin API**: operational visibility is
+   limited to stderr messages.
 
-### 4. ✅ Documentation and Inline Comments
-- **Added comprehensive documentation to ALL functions**:
-  - Purpose and behavior
-  - Parameter descriptions
-  - Return values and error conditions
-  - Memory management requirements
-  - NIP references where applicable
-  - Thread safety notes
-  - Limitations and known issues
+## Roadmap
 
-## Known Issues and Limitations
+Prioritized future work, mirroring [README.md](README.md)'s Social Network
+Roadmap table:
 
-### Buffer Overflow Risks (MEDIUM PRIORITY)
-1. **send_records() string building**: Uses `strcat()` without bounds checking
-   - Fixed buffer sizes: 2048 bytes (conditions), 4096 bytes (sql)
-   - Added validation to reject filters with >256 elements
-   - **TODO**: Replace fixed buffers with dynamic allocation
-   
-2. **Addressed**: Proper null-termination after `strncpy()` calls
-   - Fixed in `get_event_by_id()` - now adds explicit null terminators
+### High priority
+- Social graph, thread, reaction, list, and relay-list indexing (NIP-02,
+  NIP-10, NIP-25, NIP-51, NIP-65) to support feed construction and profiles.
+- Replace `LIKE`-based search with a bounded full-text index, ranking, query
+  limits, and abuse controls (NIP-50).
+- Bounded approximate counts and Negentropy sync for efficient client refresh
+  and relay migration (NIP-45, NIP-77).
+- Relay operations: per-IP/per-pubkey rate limits, connection quotas,
+  backpressure limits, event retention policies, metrics, structured logs,
+  backups, and database migrations.
 
-### JSON Serialization (FIXED)
-- ✅ Added `json_escape_string()` for proper character escaping
-- ✅ Updated `check_event()` to escape content before hashing
-- **Remaining**: send_records() response JSON should also be escaped (currently unescaped)
+### Medium priority
+- Group/community events and an authenticated relay-management API with
+  audit logging (NIP-29, NIP-72, NIP-86).
+- Identifier/entity/URI/reference-aware indexing for discovery and link
+  resolution (NIP-05, NIP-19, NIP-21, NIP-27).
+- Relay-side support for modern encrypted payload, remote signer,
+  wallet-connect, and HTTP-auth workflows where applicable (NIP-44, NIP-46,
+  NIP-47, NIP-98).
+- Liveness/discovery metadata and protected-event access enforcement
+  (NIP-66, NIP-70).
 
-### Database Considerations
-- Indexes optimized for common query patterns
-- No full-text search beyond LIKE pattern matching
-- Single SQLite connection (thread-unsafe at application level)
+### Later
+- PostgreSQL support, read replicas, durable job queues,
+  sharding/partitioning, multi-relay replication, and a documented
+  operational deployment model.
 
-## Work Remaining
+## Testing Recommendations
 
-### 1. ❌ Server Implementation (server.c)
-**Current State**: Skeleton using mongoose (incomplete)
-
-**What's Needed**:
-- Complete WebSocket server using mongoose
-- Implement Nostr protocol message handling:
-  - `["REQ", subscription_id, ...filters]` - subscription requests
-  - `["CLOSE", subscription_id]` - close subscription
-  - `["EVENT", event]` - event publication
-  - `["COUNT", subscription_id, ...filters]` - count query
-  - `["AUTH", event]` - NIP-42 authentication
-- Subscriber connection management
-- Event routing to subscriptions
-- NIP-42 authentication support
-- NIP-11 relay info metadata
-- NIP-67 EOSE (End of Stored Events) completeness hints
-- Rate limiting and DDoS protection
-
-**Estimated Effort**: 500-800 lines of code
-
-### 2. ❌ Main Entry Point (main.c)
-**Current State**: Hello world stub
-
-**What's Needed**:
-- Command-line argument parsing:
-  - `-database` or `DATABASE_URL` for connection string
-  - `-port` or `PORT` for listen port (default 7447)
-  - `-loglevel` for logging level
-  - `-service-url` for relay URL
-  - Configuration options from environment variables
-- Signal handlers (SIGINT, SIGTERM)
-- Initialize crypto subsystem
-- Initialize storage subsystem
-- Start WebSocket server
-- Graceful shutdown
-
-**Estimated Effort**: 200-300 lines of code
-
-### 3. ⚠️ Output Formatting
-**Issue**: Response JSON needs proper escaping for client compatibility
-- Currently building JSON responses with raw event content
-- Could contain unescaped quotes, backslashes, newlines
-- **Fix**: Apply `json_escape_string()` to all string fields in responses
-
-### 4. ⚠️ Protocol Message Parsing
-**Need to implement**: JSON parsing for incoming Nostr messages
-- Options:
-  1. Simple handwritten parser (error-prone, ~300 lines)
-  2. Lightweight JSON library (need to evaluate options in thirdparty/)
-  3. Use available libraries in thirdparty/
-
-## Architecture Summary
-
-```
-┌─────────────────────────────────────────┐
-│         main.c (Entry Point)            │
-│  - Parse args, Initialize subsystems    │
-└──────────┬──────────────────────────────┘
-           │
-    ┌──────┼──────┬──────────┐
-    │      │      │          │
-    ▼      ▼      ▼          ▼
-  ┌─────┐ ┌──────┐ ┌────────┐ ┌────────┐
-  │     │ │      │ │        │ │        │
-  │server│ │crypto│ │storage │ │cagliostr
-  │.c   │ │.c    │ │.c      │ │.h/c   │
-  │     │ │      │ │        │ │        │
-  └─────┘ └──────┘ └────────┘ └────────┘
-           │         │
-           │      ┌──▼──────────┐
-           │      │  SQLite3    │
-           │      │  Database   │
-           │      └─────────────┘
-           │
-    ┌──────▼──────────────┐
-    │ libsecp256k1        │
-    │ Signature Verify    │
-    └─────────────────────┘
-```
-
-## Testing Strategy
-
-### Unit Tests Needed
-1. **Crypto**:
-   - Event hash computation (compare with reference implementation)
-   - Signature verification (valid and invalid sigs)
-   - Delegation verification with various conditions
-   - Proof-of-work calculation
-
-2. **Storage**:
-   - Insert and retrieve events
-   - Filter queries (ids, authors, kinds, tags, time ranges)
-   - Event deletion scenarios
-   - Expiration tag handling
-
-3. **Server**:
-   - WebSocket connection handling
-   - Message parsing and validation
-   - Subscription management
-   - Event broadcasting to subscribers
-
-### Integration Tests
-1. Full relay protocol flow
-2. Multiple concurrent subscribers
-3. Large event payload handling
-4. Special character handling in content
-
-## Dependencies
-
-### Required from thirdparty/
-- ✅ libsecp256k1 - Schnorr signature verification
-- ✅ sqlite3 - Event storage
-- ✅ mongoose - WebSocket server framework
-- ? JSON parsing library (need to identify)
-
-### Standard Library
-- openssl/evp.h - SHA256 hashing
-- string.h, stdlib.h - Memory/string operations
-- time.h - Timestamp handling
-- signal.h - Signal handling
-
-## Performance Considerations
-
-### Database Optimization
-- ✅ WAL mode: Better concurrency, crash-safe
-- ✅ Indexes: created_at (DESC), pubkey, kind, composite (kind, created_at)
-- ✅ PRAGMA cache_size: 256MB for frequently accessed data
-- ⚠️ No sharding: Single process, single database
-
-### Server Scalability
-- Single-threaded WebSocket event loop
-- Connection-per-subscriber model
-- Event broadcasting has O(N) complexity per event
-- **Future**: Consider thread pool or async model
-
-## Building and Running
-
-```bash
-# Build
-mkdir build && cd build
-cmake ..
-make
-
-# Run
-./cagliostr -database file:relay.db -port 7447
-
-# With options
-./cagliostr \
-  -database file:relay.db \
-  -port 8080 \
-  -service-url https://relay.example.com \
-  -loglevel debug
-```
-
-## Next Steps (Priority Order)
-
-1. **CRITICAL**: Complete server.c WebSocket implementation
-2. **HIGH**: Implement message parsing in server.c
-3. **HIGH**: Complete main.c with proper initialization
-4. **MEDIUM**: Add JSON escaping to response generation
-5. **MEDIUM**: Improve error handling and logging
-6. **LOW**: Performance optimization and scaling
+1. Compare event hash/signature verification against a reference Nostr
+   client for special characters (quotes, backslashes, UTF-8/emoji content).
+2. Load-test with large filter arrays (near the 256-element and 10-filter
+   caps) to validate the fixed-buffer limits in `send_records()`.
+3. Exercise NIP-09/16/33/62 deletion and replacement paths for regressions
+   before schema or query changes.
+4. Run the relay under a WebSocket fuzzer/stress client to validate the
+   5 MiB frame limit and 20-subscription cap under load.
+5. Run valgrind/ASan over a full event lifecycle (insert, query, delete) to
+   catch memory issues before enabling higher-throughput code paths.
 
 ## References
 
 - [Nostr Protocol (NIP-01)](https://github.com/nostr-protocol/nips/blob/master/01.md)
-- [Event Filtering (NIP-13, NIP-16, NIP-17, NIP-26, NIP-40, NIP-42, NIP-62, NIP-67)](https://github.com/nostr-protocol/nips)
+- [Nostr NIPs index](https://github.com/nostr-protocol/nips)
 - [mongoose Documentation](https://mongoose.ws/)
 - [secp256k1 GitHub](https://github.com/bitcoin-core/secp256k1)
 - [SQLite Documentation](https://www.sqlite.org/docs.html)
@@ -260,4 +103,5 @@ make
 ---
 
 **Last Updated**: 2026-09-01
-**Status**: ~60% Complete (Core functionality + documentation done, server/main pending)
+**Status**: Feature-complete relay per README's supported-NIP table; hardening
+and social-network-scale features are the remaining roadmap.

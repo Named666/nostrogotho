@@ -1,4 +1,60 @@
-# Quick Start Guide - Cagliostr C99
+# Quick Start
+
+## Requirements
+
+Use Windows with GCC/MinGW. The build compiles vendored sources and links
+`bcrypt`, `ws2_32`, and `winpthread`; it is not currently a portable Unix build
+recipe. Clone the repository with its `thirdparty/` directory present.
+
+## Build
+
+From the repository root:
+
+```powershell
+gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
+.\nob.exe
+```
+
+The relay executable is `build\main.exe`. The first build creates
+`build\config.h`; it contains optional build switches.
+
+## Start Locally
+
+```powershell
+.\build\main.exe -database .\relay.sqlite -port 7447 -service-url ws://localhost:7447
+```
+
+Inspect the relay information document from another terminal:
+
+```powershell
+curl.exe -H "Accept: application/nostr+json" http://localhost:7447/
+```
+
+## Public Deployment
+
+Use a reverse proxy to terminate TLS and expose a `wss://` URL. Pass exactly
+that public URL through `-service-url`; it is required for clients using
+NIP-42 authentication and relay-targeted NIP-62 vanish requests. Persist the
+database outside transient directories and include it in backups.
+
+Example environment configuration:
+
+```powershell
+$env:DATABASE_URL = "C:\relay-data\nostr.sqlite"
+$env:SERVICE_URL = "wss://relay.example.com"
+$env:MIN_POW_DIFFICULTY = "16"
+$env:CREATED_AT_UPPER_LIMIT = "900"
+.\build\main.exe
+```
+
+## Validate A Change
+
+```powershell
+gcc -std=c99 -Wall -Wextra -Wpedantic -I. -Isrc -Ithirdparty -Ithirdparty/mongoose -fsyntax-only src/main.c src/server.c src/storage.c src/json_util.c src/crypto.c src/cagliostr.c
+git diff --check
+```
+
+See [README.md](README.md) for all runtime controls and NIP support.# Quick Start Guide - Cagliostr C99
 
 ## Installation
 

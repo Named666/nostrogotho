@@ -1,4 +1,84 @@
 # nostrogotho
+
+`nostrogotho` is a C99 Nostr relay with SQLite persistence. It uses bundled
+Mongoose for HTTP/WebSocket transport and bundled libsecp256k1 for Schnorr
+signature verification. The current build targets Windows with GCC/MinGW.
+
+## Run A Relay
+
+1. Clone the repository with `thirdparty/` intact.
+2. From the repository root, build the two-stage `nob` driver and relay:
+
+   ```powershell
+   gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
+   .\nob.exe
+   ```
+
+3. Run the generated executable:
+
+   ```powershell
+   .\build\main.exe -service-url wss://relay.example.com
+   ```
+
+The default listener is `0.0.0.0:7447`; the default database is
+`./cagliostr.sqlite`. Put public relays behind a TLS-terminating reverse proxy
+and configure the external `wss://` address with `-service-url`.
+
+See [QUICKSTART.md](QUICKSTART.md) for local setup and deployment guidance.
+
+## Configuration
+
+| Option | Environment | Default | Description |
+| --- | --- | --- | --- |
+| `-database PATH`, `--db PATH` | `DATABASE_URL` | `./cagliostr.sqlite` | SQLite database path or URI. |
+| `-port PORT`, `--port PORT` | None | `7447` | Listener TCP port. |
+| `-service-url URL` | `SERVICE_URL` | Empty | Public URL used by NIP-42 and NIP-62. |
+| `-min-pow BITS` | `MIN_POW_DIFFICULTY` | `0` | Required NIP-13 difficulty; `0` disables it. |
+| `-created-at-lower-limit SECONDS` | `CREATED_AT_LOWER_LIMIT` | `0` | Maximum accepted event age; `0` disables it. |
+| `-created-at-upper-limit SECONDS` | `CREATED_AT_UPPER_LIMIT` | `900` | Maximum allowed future timestamp; `0` disables it. |
+
+Run `.\build\main.exe --help` for the built executable's options.
+
+## NIP Support
+
+| NIP | Status | Behavior |
+| --- | --- | --- |
+| NIP-01 | Supported | Validates signed events and supports `EVENT`, `REQ`, `CLOSE`, `NOTICE`, `OK`, `EVENT`, and `EOSE` frames. |
+| NIP-09 | Supported | Processes event-ID and addressable-event deletion requests, including gift-wrap recipient authorization. |
+| NIP-11 | Supported | Serves relay metadata for requests accepting `application/nostr+json`. |
+| NIP-13 | Supported | Enforces configurable proof of work. |
+| NIP-16 | Supported | Replaces older replaceable events. |
+| NIP-17 | Supported | Restricts gift-wrap delivery to NIP-42-authenticated `p`-tag recipients. |
+| NIP-26 | Supported | Verifies delegation signatures and supported conditions. |
+| NIP-33 | Supported | Replaces parameterized replaceable events by `d` tag. |
+| NIP-40 | Supported | Omits expired events from stored queries. |
+| NIP-42 | Supported | Issues random challenges and validates signed client authentication events. |
+| NIP-45 | Supported | Handles `COUNT` queries. |
+| NIP-62 | Supported | Processes vanish events targeting this relay or `ALL_RELAYS`. |
+| NIP-67 | Supported | Adds `more` or `finish` EOSE completeness hints. |
+
+## Limits And Operations
+
+- WebSocket frames: 5 MiB maximum.
+- Events: 100 tags and 16 KiB content maximum.
+- Client subscriptions: 20 maximum, with 10 filters per subscription.
+- Query limit: 500 events per filter by default.
+- Storage: one process and one SQLite connection. Back up the database and test
+  retention, reverse-proxy, rate-limit, and monitoring policies before a public
+  deployment.
+
+## Development
+
+| Guide | Use it for |
+| --- | --- |
+| [QUICKSTART.md](QUICKSTART.md) | Building and operating a local relay. |
+| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Architecture, behavior boundaries, and contribution workflow. |
+| [API_REFERENCE.md](API_REFERENCE.md) | Public C data structures and interfaces. |
+| [NOSTR.md](NOSTR.md) | Nostr message types and supported-NIP reference. |
+
+The build definition is [src_build/nob_configed.c](src_build/nob_configed.c).
+Before submitting a change, run the validation command in
+[IMPLEMENTATION.md](IMPLEMENTATION.md).# nostrogotho
 A Nostr relay server written in C99 using bundled mongoose, secp256k1,
 SQLite, and OpenSSL sources.
 

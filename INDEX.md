@@ -1,4 +1,14 @@
-# Cagliostr C99 - Complete Index
+# Documentation Index
+
+- [README.md](README.md): relay capabilities, supported NIPs, limits, and all runtime options.
+- [QUICKSTART.md](QUICKSTART.md): Windows build, local execution, deployment, and validation.
+- [IMPLEMENTATION.md](IMPLEMENTATION.md): architecture and contributor workflow.
+- [API_REFERENCE.md](API_REFERENCE.md): public C interfaces and ownership rules.
+- [NOSTR.md](NOSTR.md): Nostr protocol message types and relay applicability.
+
+Historical completion and reimplementation reports were consolidated into these
+current guides because they described an earlier, incomplete C99 port and a
+nonexistent CMake build.# Cagliostr C99 - Complete Index
 
 ## 📚 Documentation
 
