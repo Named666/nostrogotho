@@ -3,7 +3,7 @@
 
 #include <stdbool.h>
 #include <mongoose.h>
-#include "cagliostr.h"
+#include "nostrogotho.h"
 
 /* Shared event-tag queries used by independent NIP policy modules. */
 bool nip_event_has_tag(const event_t *event, const char *name, const char *value);

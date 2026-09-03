@@ -1,7 +1,7 @@
 #ifndef STORAGE_H_
 #define STORAGE_H_
 
-#include "cagliostr.h"
+#include "nostrogotho.h"
 #include <stdbool.h>
 
 /* ============================================================================
@@ -57,7 +57,7 @@ typedef struct {
     
     /* init - Initialize storage backend
      * Args: dsn - connection string (varies by backend)
-     *             SQLite: "file:cagliostr.sqlite" or ":memory:"
+     *             SQLite: "file:nostrogotho.sqlite" or ":memory:"
      *             PostgreSQL: "postgresql://user:pass@host/db"
      * Returns: true on success, false on connection failure
      * Must be called exactly once before other operations
@@ -187,7 +187,7 @@ typedef struct {
  * Usage:
  *   storage_context_t ctx = {0};
  *   storage_context_init_sqlite3(&ctx);
- *   ctx.init("file:cagliostr.sqlite");
+ *   ctx.init("file:nostrogotho.sqlite");
  */
 void storage_context_init_sqlite3(storage_context_t *ctx);
 

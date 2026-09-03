@@ -2,7 +2,7 @@
 #define NIP26_H_
 
 #include <stdbool.h>
-#include "cagliostr.h"
+#include "nostrogotho.h"
 
 /* ============================================================================
  * NIP-26: Delegated Event Signing

@@ -32,7 +32,7 @@ static bool init_storage(const char *db_path) {
 
     storage_context_init_sqlite3(&storage_ctx);
     if (!storage_ctx.init ||
-        !storage_ctx.init(db_path ? db_path : "./cagliostr.sqlite")) {
+        !storage_ctx.init(db_path ? db_path : "./nostrogotho.sqlite")) {
         fprintf(stderr, "Failed to initialize SQLite storage\n");
         crypto_deinit();
         return false;
@@ -79,7 +79,7 @@ int main(int argc, const char **argv) {
             if (!parse_int(argv[++i], &upper_limit) || upper_limit < 0) return 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [-database path] [-port num] [-service-url url] [--help]\n", argv[0]);
-            printf("  -database path                 SQLite database (default: ./cagliostr.sqlite)\n");
+            printf("  -database path                 SQLite database (default: ./nostrogotho.sqlite)\n");
             printf("  -port num                      WebSocket port (default: 7447)\n");
             printf("  -service-url url               Public relay URL for NIP-42/NIP-62\n");
             printf("  -min-pow bits                  Minimum NIP-13 difficulty\n");

@@ -2,7 +2,7 @@
 #define NIP40_H_
 
 #include <stdbool.h>
-#include "cagliostr.h"
+#include "nostrogotho.h"
 
 /* ============================================================================
  * NIP-40: Expiration Timestamp

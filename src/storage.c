@@ -778,8 +778,8 @@ static bool send_records(send_records_callback_t sender, const char *sub,
  * 
  * Args: dsn - data source name / connection string
  *             Examples:
- *             - "file:cagliostr.sqlite" -> file database
- *             - "file:cagliostr.sqlite?mode=memory&cache=shared" -> memory
+ *             - "file:nostrogotho.sqlite" -> file database
+ *             - "file:nostrogotho.sqlite?mode=memory&cache=shared" -> memory
  *             - ":memory:" -> transient in-memory database
  * 
  * Returns: true on success, false if:
@@ -879,7 +879,7 @@ static void storage_deinit_sqlite3(void) {
  * 
  *   storage_context_t ctx = {0};
  *   storage_context_init_sqlite3(&ctx);
- *   ctx.init("file:cagliostr.sqlite");  // opens database
+ *   ctx.init("file:nostrogotho.sqlite");  // opens database
  *   // ... use ctx.get_event_by_id(), ctx.insert_record(), etc.
  *   ctx.deinit();  // closes database
  * 

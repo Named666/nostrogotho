@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
-#include "cagliostr.h"
+#include "nostrogotho.h"
 
 /* ============================================================================
  * JSON Utilities for Nostr Protocol

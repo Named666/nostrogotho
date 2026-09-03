@@ -4,7 +4,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <mongoose.h>
-#include "cagliostr.h"
+#include "nostrogotho.h"
 
 /* Create and track a NIP-42 challenge for a newly opened connection. */
 bool nip42_open(struct mg_connection *connection, char challenge[17]);

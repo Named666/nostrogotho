@@ -1,5 +1,5 @@
-#ifndef CAGLIOSTR_H_
-#define CAGLIOSTR_H_
+#ifndef NOSTROGOTHO_H_
+#define NOSTROGOTHO_H_
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -7,7 +7,7 @@
 #include <time.h>
 
 /* ============================================================================
- * CAGLIOSTR - C99 Nostr Relay Server
+ * NOSTROGOTHO - C99 Nostr Relay Server
  * 
  * Core data structures and memory management utilities for Nostr events,
  * filters, and tags. All structures using malloc'd memory require explicit
@@ -205,4 +205,4 @@ char *string_dup(const char *str);
  * Args: str - pointer to malloc'd string (NULL-safe) */
 void string_free(char *str);
 
-#endif /* CAGLIOSTR_H_ */
+#endif /* NOSTROGOTHO_H_ */

@@ -2,7 +2,7 @@
 #define NIP45_H_
 
 #include <stdbool.h>
-#include "cagliostr.h"
+#include "nostrogotho.h"
 
 /* ============================================================================
  * NIP-45: COUNT Request / Response
