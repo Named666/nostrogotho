@@ -26,16 +26,15 @@ event_t *event_alloc(void) {
     return ev;
 }
 
-/* event_free - Free an event and all its dynamically allocated memory
+/* event_release - Release an event's dynamically allocated fields
  * 
- * Safely releases an event_t structure and its contents:
- * - Frees tags_json if allocated
- * - Frees content if allocated
- * - Frees the event structure itself
+ * Frees the heap-allocated fields of an event_t (tags_json and content)
+ * and nulls them out. Does NOT free the event_t struct itself, so it is
+ * safe to call on stack-allocated events.
  * 
  * Args: ev - pointer to event (NULL-safe, does nothing if NULL)
  */
-void event_free(event_t *ev) {
+void event_release(event_t *ev) {
     if (!ev) return;
     
     if (ev->tags_json) {
@@ -46,7 +45,23 @@ void event_free(event_t *ev) {
         free(ev->content);
         ev->content = NULL;
     }
+}
+
+/* event_free - Free an event and all its dynamically allocated memory
+ * 
+ * Safely releases an event_t structure and its contents:
+ * - Frees tags_json if allocated
+ * - Frees content if allocated
+ * - Frees the event structure itself
+ * 
+ * Args: ev - pointer to event (NULL-safe, does nothing if NULL)
+ * Note: Only use for heap-allocated events (from event_alloc()).
+ *       For stack-allocated events, use event_release() instead.
+ */
+void event_free(event_t *ev) {
+    if (!ev) return;
     
+    event_release(ev);
     free(ev);
 }
 

@@ -2,3 +2,6 @@ nob
 nob.old
 build/
 thirdparty/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

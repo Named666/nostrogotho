@@ -147,9 +147,17 @@ typedef struct {
  * Caller: must call event_free() to release */
 event_t *event_alloc(void);
 
+/* event_release - Release an event's dynamically allocated fields
+ * Args: ev - pointer to event (NULL-safe)
+ * Note: Frees tags_json and content if allocated, but does NOT free the
+ *       event_t struct itself. Use this for stack-allocated events.
+ *       For heap-allocated events (from event_alloc()), use event_free(). */
+void event_release(event_t *ev);
+
 /* event_free - Free an event and its dynamically allocated fields
  * Args: ev - pointer to event (NULL-safe)
- * Note: Frees tags_json and content if allocated */
+ * Note: Frees tags_json and content if allocated, then frees the struct.
+ *       Only use for heap-allocated events (from event_alloc()). */
 void event_free(event_t *ev);
 
 /* filter_alloc - Allocate and zero-initialize a filter structure

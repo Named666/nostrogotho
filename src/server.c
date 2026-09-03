@@ -1,5 +1,6 @@
 #include <mongoose.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,6 +59,42 @@ static bool mg_str_contains(struct mg_str haystack, const char *needle) {
 
 static void send_json(struct mg_connection *connection, const char *json) {
     mg_ws_send(connection, json, strlen(json), WEBSOCKET_OP_TEXT);
+}
+
+/* ---------------------------------------------------------------------------
+ * Debug logging helpers.
+ *
+ * Every log line is prefixed with a timestamp and the remote address of the
+ * connection it relates to (when available), so the console output can be
+ * correlated with a specific client. These are intentionally plain stdio
+ * calls rather than pulling nob.h into the runtime binary.
+ * ------------------------------------------------------------------------- */
+
+static void log_timestamp(void) {
+    time_t now = time(NULL);
+    struct tm *tm = localtime(&now);
+    char stamp[32];
+    if (tm && strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", tm)) {
+        fprintf(stdout, "[%s] ", stamp);
+    }
+}
+
+static void log_peer(struct mg_connection *connection) {
+    if (!connection) return;
+    char peer[64];
+    mg_snprintf(peer, sizeof(peer), "%M", mg_print_ip_port, &connection->rem);
+    fprintf(stdout, "peer=%s ", peer);
+}
+
+static void log_message(struct mg_connection *connection, const char *fmt, ...) {
+    va_list args;
+    log_timestamp();
+    log_peer(connection);
+    va_start(args, fmt);
+    vfprintf(stdout, fmt, args);
+    va_end(args);
+    fputc('\n', stdout);
+    fflush(stdout);
 }
 
 static char *tag_element(struct mg_str tag, size_t index) {
@@ -213,7 +250,7 @@ static void query_sender(const char *json) {
         if (matched && nip17_can_deliver(&event, nip42_authenticated_pubkey(query_connection))) {
             send_json(query_connection, json);
         }
-        event_free(&event);
+        event_release(&event);
     } else if (count == 3 && values[0].type == JSON_TYPE_STRING &&
                strcmp(values[0].value.string_val, "COUNT") == 0) {
         send_json(query_connection, json);
@@ -243,10 +280,37 @@ static void query_events(struct mg_connection *connection, const char *sub,
 
 static bool collect_filters(json_value_t *values, size_t count, filter_t **out,
                             size_t *out_count) {
-    filter_t *filters = (filter_t *) calloc(count - 2, sizeof(*filters));
-    if (!filters) return false;
-    for (size_t i = 2; i < count && *out_count < MAX_FILTERS; i++) {
-        if (values[i].type == JSON_TYPE_OBJECT && json_parse_filter(values[i].value.string_val, &filters[*out_count])) (*out_count)++;
+    filter_t *filters = NULL;
+    size_t filter_capacity = 0;
+
+    /* Two accepted layouts:
+     *   nostr-tools: ["REQ"/"COUNT", id, {filter1}, {filter2}, ...]  (unwrapped)
+     *   standard:    ["REQ"/"COUNT", id, [{filter1}, {filter2}]]     (wrapped array)
+     */
+    if (count >= 3 && values[2].type == JSON_TYPE_ARRAY) {
+        json_value_t inner[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
+        size_t inner_count = json_array_parse(values[2].value.string_val, inner,
+                                              MAX_JSON_ARRAY_ELEMENTS);
+        filter_capacity = inner_count;
+        filters = (filter_t *) calloc(filter_capacity, sizeof(*filters));
+        if (!filters) return false;
+        for (size_t i = 0; i < inner_count && *out_count < MAX_FILTERS; i++) {
+            if (inner[i].type == JSON_TYPE_OBJECT &&
+                json_parse_filter(inner[i].value.string_val, &filters[*out_count])) {
+                (*out_count)++;
+            }
+        }
+        json_array_free(inner, inner_count);
+    } else {
+        filter_capacity = count > 2 ? count - 2 : 0;
+        filters = (filter_t *) calloc(filter_capacity, sizeof(*filters));
+        if (!filters) return false;
+        for (size_t i = 2; i < count && *out_count < MAX_FILTERS; i++) {
+            if (values[i].type == JSON_TYPE_OBJECT &&
+                json_parse_filter(values[i].value.string_val, &filters[*out_count])) {
+                (*out_count)++;
+            }
+        }
     }
     if (*out_count == 0) { free(filters); return false; }
     *out = filters;
@@ -284,13 +348,18 @@ static void handle_event(struct mg_connection *connection, json_value_t *values,
         send_status(connection, "NOTICE", NULL, false, "error: invalid event");
         return;
     }
+
+    log_message(connection, "event kind=%d id=%.*s pubkey=%.*s created_at=%lld",
+                event.kind, (int) sizeof(event.id), event.id,
+                (int) sizeof(event.pubkey), event.pubkey,
+                (long long) event.created_at);
     
     /* Check for auth-required tag (must be authenticated) */
     if (event_has_tag(&event, "-", NULL)) {
         const char *auth_pubkey = nip42_authenticated_pubkey(connection);
         if (!auth_pubkey || strcmp(auth_pubkey, event.pubkey) != 0) {
             send_status(connection, "OK", event.id, false, "auth-required: authentication required");
-            event_free(&event);
+            event_release(&event);
             return;
         }
     }
@@ -312,7 +381,7 @@ static void handle_event(struct mg_connection *connection, json_value_t *values,
         broadcast_event(&event);
     }
     
-    event_free(&event);
+    event_release(&event);
 }
 
 static void handle_auth(struct mg_connection *connection, json_value_t *values, size_t count) {
@@ -321,7 +390,7 @@ static void handle_auth(struct mg_connection *connection, json_value_t *values, 
     if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) { send_status(connection, "NOTICE", NULL, false, "error: invalid auth"); return; }
     if (!nip42_authenticate(connection, &event, service_url, now)) send_status(connection, "OK", event.id, false, "error: failed to authenticate");
     else send_status(connection, "OK", event.id, true, "");
-    event_free(&event);
+    event_release(&event);
 }
 
 static void handle_message(struct mg_connection *connection, struct mg_ws_message *message) {
@@ -331,6 +400,7 @@ static void handle_message(struct mg_connection *connection, struct mg_ws_messag
     payload = (char *) malloc(message->data.len + 1);
     if (!payload) return;
     memcpy(payload, message->data.buf, message->data.len); payload[message->data.len] = '\0';
+    log_message(connection, "recv: %s", payload);
     count = json_array_parse(payload, values, MAX_JSON_ARRAY_ELEMENTS);
     method = json_array_get_string(values, count, 0);
     if (!method || count < 2) send_status(connection, "NOTICE", NULL, false, "error: invalid request");
@@ -352,6 +422,7 @@ static void nostr_event_handler(struct mg_connection *connection, int event, voi
         } else mg_ws_upgrade(connection, request, NULL);
     } else if (event == MG_EV_WS_OPEN) {
         char challenge[17];
+        log_message(connection, "client connected (websocket open)");
         if (nip42_open(connection, challenge)) {
             json_builder_t builder;
             json_builder_start(&builder);
@@ -360,7 +431,11 @@ static void nostr_event_handler(struct mg_connection *connection, int event, voi
             send_json(connection, json_builder_finish(&builder));
         }
     } else if (event == MG_EV_WS_MSG) handle_message(connection, event_data);
-    else if (event == MG_EV_CLOSE) { remove_subscriptions(connection, NULL); nip42_close(connection); }
+    else if (event == MG_EV_CLOSE) {
+        log_message(connection, "client disconnected");
+        remove_subscriptions(connection, NULL);
+        nip42_close(connection);
+    }
 }
 
 void server_configure(storage_context_t *storage, const char *relay_url, int min_pow,
@@ -374,7 +449,7 @@ void server_configure(storage_context_t *storage, const char *relay_url, int min
 bool server_run(int port) {
     char listen_url[64];
     if (!storage_ctx || port < 1 || port > 65535) return false;
-    snprintf(listen_url, sizeof(listen_url), "http://0.0.0.0:%d", port);
+    snprintf(listen_url, sizeof(listen_url), "ws://0.0.0.0:%d", port);
     stop_requested = 0; mg_mgr_init(&manager);
     if (!mg_http_listen(&manager, listen_url, nostr_event_handler, NULL)) { mg_mgr_free(&manager); return false; }
     while (!stop_requested) mg_mgr_poll(&manager, 1000);

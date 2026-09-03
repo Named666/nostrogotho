@@ -639,9 +639,10 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
     object = mg_str(json_str);
     if (object.len < 2 || object.buf[0] != '{') return false;
 
-    while ((offset = mg_json_next(object, offset, &key, &value)) != 0) {
+    bool ok = true;
+    while (ok && (offset = mg_json_next(object, offset, &key, &value)) != 0) {
         char *field = json_raw_string(key);
-        bool ok = field != NULL;
+        ok = field != NULL;
         if (!ok) break;
         if (strcmp(field, "ids") == 0) {
             ok = parse_string_array(value, &filter->ids, &filter->ids_count, 256);
@@ -689,10 +690,7 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
         free(field);
         if (!ok) break;
     }
-    if (!offset && object.len != 2) return false;
-    if (offset == 0 && object.len == 2) return true;
-    if (offset == 0) return false;
-    return true;
+    return ok;
 }
 
 bool json_parse_event(const char *json_str, event_t *event) {
@@ -728,7 +726,7 @@ bool json_parse_event(const char *json_str, event_t *event) {
     event->tags_json_len = tags.len;
     free(id); free(pubkey); free(sig);
     if (!event->tags_json) {
-        event_free(event);
+        event_release(event);
         return false;
     }
     return true;
