@@ -4,12 +4,14 @@
 #include <string.h>
 #include "nip_event.h"
 
+/* The tag slice yielded by mg_json_next is itself a complete JSON array
+ * (e.g. ["d","<identifier>"]), so element extraction is a plain $[index]
+ * lookup on it. Wrapping the slice in another bracket pair would make
+ * $[index] resolve to an array, which mg_json_get_str rejects with NULL. */
 char *nip_tag_element(struct mg_str tag, size_t index) {
-    size_t length = tag.len + 3; char *json = malloc(length); char path[32]; char *value;
-    if (!json) return NULL;
-    json[0] = '['; memcpy(json + 1, tag.buf, tag.len); json[tag.len + 1] = ']'; json[tag.len + 2] = '\0';
+    char path[16];
     snprintf(path, sizeof(path), "$[%llu]", (unsigned long long) index);
-    value = mg_json_get_str(mg_str(json), path); free(json); return value;
+    return mg_json_get_str(tag, path);
 }
 
 bool nip_event_has_tag(const event_t *event, const char *name, const char *value) {

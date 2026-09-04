@@ -8,6 +8,9 @@
 
 /* Create and track a NIP-42 challenge for a newly opened connection. */
 bool nip42_open(struct mg_connection *connection, char challenge[17]);
+/* Generate a fresh challenge for an already-tracked connection (NIP-67 auth
+ * hint path). Returns false when the connection has no client record. */
+bool nip42_open_challenge(struct mg_connection *connection, char challenge[17]);
 /* Discard all authentication state when a connection closes. */
 void nip42_close(struct mg_connection *connection);
 /* Return the authenticated pubkey for a connection, or NULL when unauthenticated. */

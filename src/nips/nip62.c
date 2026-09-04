@@ -20,6 +20,15 @@ static nip01_process_result_t nip62_listener(
 
     nip01_process_result_t result = {0};
 
+    /* NIP-62: "The tag list MUST include at least one `relay` value."
+     * Reject kind-62 events that tag no relay at all. */
+    if (!nip_event_has_tag(event, "relay", NULL)) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "invalid: kind 62 requires at least one relay tag");
+        return result;
+    }
+
     if (!storage) {
         result.accepted = false;
         snprintf(result.response_msg, sizeof(result.response_msg),

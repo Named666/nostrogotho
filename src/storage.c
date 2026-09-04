@@ -1,5 +1,6 @@
 #include "storage.h"
 #include "json_util.h"
+#include "nips/nip40.h"
 #include <sqlite3.h>
 #include <string.h>
 #include <stdio.h>
@@ -59,6 +60,9 @@ typedef struct {
  */
 char *escape_like(const char *str, size_t len) {
     if (!str) return NULL;
+    
+    /* Cap reasonable length to prevent allocation attacks */
+    if (len > 1024 * 1024) return NULL;  /* 1MB max */
     
     /* Count how many characters need escaping */
     size_t count = 0;
@@ -162,6 +166,10 @@ static event_t *get_event_by_id(const char *id) {
                 ev->tags_json = (char *)malloc(ev->tags_json_len + 1);
                 if (ev->tags_json) {
                     strcpy(ev->tags_json, tags_json);
+                } else {
+                    sqlite3_finalize(stmt);
+                    free(ev);
+                    return NULL;
                 }
             }
             
@@ -169,9 +177,13 @@ static event_t *get_event_by_id(const char *id) {
             if (content) {
                 ev->content_len = strlen(content);
                 ev->content = (char *)malloc(ev->content_len + 1);
-                if (ev->content) {
-                    strcpy(ev->content, content);
+                if (!ev->content) {
+                    free(ev->tags_json);
+                    sqlite3_finalize(stmt);
+                    free(ev);
+                    return NULL;
                 }
+                strcpy(ev->content, content);
             }
             
             strncpy(ev->sig, (const char *)sqlite3_column_text(stmt, 6), MAX_SIG_SIZE);
@@ -293,17 +305,31 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
         return -1;
     }
     
-    /* Build tag search pattern */
-    char tag_pattern[512] = "";
+    /* Build tag search pattern: the exact JSON element ["name","value"]
+     * (comma only between elements — a trailing comma would never match). */
+    char tag_pattern[1100] = {0};
     if (tag->count > 0) {
-        strcat(tag_pattern, "[");
-        for (size_t i = 0; i < tag->count && i < 2; i++) {
-            strcat(tag_pattern, "\"");
-            strcat(tag_pattern, tag->elements[i]);
-            strcat(tag_pattern, "\"");
-            if (i < tag->count - 1) strcat(tag_pattern, ",");
+        size_t pos = 0;
+        bool ok = true;
+        tag_pattern[pos++] = '[';
+        for (size_t i = 0; ok && i < tag->count && i < 2; i++) {
+            int written;
+            if (!tag->elements[i]) { ok = false; break; }
+            if (i > 0) tag_pattern[pos++] = ',';
+            written = snprintf(tag_pattern + pos, sizeof(tag_pattern) - pos,
+                               "\"%s\"", tag->elements[i]);
+            if (written < 0 || (size_t) written >= sizeof(tag_pattern) - pos) {
+                ok = false;
+                break;
+            }
+            pos += (size_t) written;
         }
-        strcat(tag_pattern, "]");
+        if (!ok || pos + 2 > sizeof(tag_pattern)) {
+            sqlite3_finalize(stmt);
+            return -1;
+        }
+        tag_pattern[pos++] = ']';
+        tag_pattern[pos] = '\0';
     }
     
     char *escaped = escape_like(tag_pattern, strlen(tag_pattern));
@@ -503,6 +529,125 @@ static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at) {
  * Event Query and Streaming
  * ============================================================================ */
 
+/* purge_expired_sqlite3 - Garbage-collect NIP-40 expired events (background)
+ *
+ * Deletes every stored row whose `tags` column carries an
+ * ["expiration","<timestamp>"] tag with a timestamp <= now. Expired events
+ * are never served (matches_filter() in server.c drops them) and never
+ * accepted on publication (nip01_process_event), but without this sweep the
+ * rows would accumulate indefinitely in the database.
+ *
+ * The bundled SQLite build has no JSON1 functions, so we can't use
+ * json_extract(). Instead we narrow the candidate set cheaply in SQL with a
+ * LIKE on the tags column and a created_at bound, then load each candidate
+ * with get_event_by_id() and confirm expiry via nip40_event_is_expired().
+ * Re-checking in C keeps the decision exact (a bare JSON substring could
+ * otherwise match inside content or another tag's element, and a LIKE on
+ * created_at alone is only a heuristic, not proof the row has expired).
+ *
+ * Args: now - reference timestamp (time(NULL)) used as the expiry threshold.
+ *
+ * Returns: number of rows deleted, or -1 if the database is unusable.
+ */
+static int purge_expired_sqlite3(time_t now) {
+    if (!db_conn) return -1;
+
+    sqlite3_stmt *select;
+    const char *find_sql =
+        "SELECT id FROM event WHERE tags LIKE '%\"expiration\"%' AND created_at <= ?";
+    int deleted = 0;
+
+    if (sqlite3_prepare_v2(db_conn, find_sql, -1, &select, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        return -1;
+    }
+    sqlite3_bind_int(select, 1, (int) now);
+
+    int rc;
+    int iterations = 0;
+    const int MAX_PURGE_ITERATIONS = 10000;
+    while ((rc = sqlite3_step(select)) == SQLITE_ROW && iterations < MAX_PURGE_ITERATIONS) {
+        const char *id = (const char *) sqlite3_column_text(select, 0);
+        /* get_event_by_id() prepares its own statement, so the candidate
+         * step is safe to interleave with it here. */
+        event_t *ev = get_event_by_id(id);
+        if (ev) {
+            if (nip40_event_is_expired(ev)) {
+                if (delete_record_by_id_and_pubkey(ev->id, ev->pubkey) > 0) deleted++;
+            }
+            event_free(ev);
+        }
+        iterations++;
+    }
+    if (iterations >= MAX_PURGE_ITERATIONS) {
+        fprintf(stderr, "Purge hit iteration limit (%d), some events may remain expired\n", MAX_PURGE_ITERATIONS);
+    }
+    sqlite3_finalize(select);
+    return deleted;
+}
+
+/* conditions_append - strcat with overflow guard for the fixed WHERE buffer */
+static bool conditions_append(char *conditions, size_t size, const char *text) {
+    if (strlen(conditions) + strlen(text) + 1 > size) return false;
+    strcat(conditions, text);
+    return true;
+}
+
+/* append_tag_like_condition - Add one exact tag-element match to a WHERE
+ *
+ * Emits "tags LIKE ? ESCAPE '\'" once per JSON spacing variant so that an
+ * exact ["name","value"] element inside the stored tags JSON is matched
+ * whether the publishing client sent compact or spaced JSON. The name and
+ * value are LIKE-escaped; both bind parameters are string_dup'd, matching
+ * the ownership convention of the delegation patterns above. Returns false
+ * when the conditions buffer or the parameter table would overflow, in
+ * which case the caller fails the whole query.
+ */
+static bool append_tag_like_condition(char *conditions, size_t conditions_size,
+                                      param_t *params, size_t *param_count,
+                                      const char *name, const char *value) {
+    static const char *const formats[] = {
+        "%%[\"%s\",\"%s\"]%%",   /* compact:  ...%["p","<hex>"]%...  */
+        "%%[\"%s\", \"%s\"]%%",  /* spaced:   ...%["p", "<hex>"]%... */
+    };
+    char *name_escaped = escape_like(name, strlen(name));
+    char *value_escaped = escape_like(value, strlen(value));
+    bool ok = name_escaped != NULL && value_escaped != NULL;
+
+    for (size_t i = 0; ok && i < sizeof(formats) / sizeof(formats[0]); i++) {
+        size_t length = strlen(formats[i]) + strlen(name_escaped) +
+                        strlen(value_escaped) + 2;
+        char *pattern = (char *) malloc(length);
+        if (!pattern) { ok = false; break; }
+        snprintf(pattern, length, formats[i], name_escaped, value_escaped);
+        if (i > 0 && !conditions_append(conditions, conditions_size, " OR ")) {
+            free(pattern);
+            ok = false;
+            break;
+        }
+        if (*param_count >= 256 ||
+            strlen(conditions) + 32 >= conditions_size) {
+            free(pattern);
+            ok = false;
+            break;
+        }
+        if (!conditions_append(conditions, conditions_size,
+                               "tags LIKE ? ESCAPE '\\'")) {
+            free(pattern);
+            ok = false;
+            break;
+        }
+        params[*param_count].type = PARAM_TYPE_STRING;
+        params[*param_count].value.string = string_dup(pattern);
+        (*param_count)++;
+        free(pattern);
+    }
+
+    free(name_escaped);
+    free(value_escaped);
+    return ok;
+}
+
 /* send_records - Query database and stream matching events (NIP-01, NIP-67)
  * 
  * Primary query interface. Searches for events matching filter criteria and
@@ -550,9 +695,10 @@ static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at) {
  */
 static bool send_records(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more) {
+                        bool do_count, bool *has_more, int *out_count) {
     if (!db_conn || !sender) return false;
     if (has_more) *has_more = false;
+    if (do_count && out_count) *out_count = 0;
     
     /* Validate input sizes to prevent buffer overflows */
     if (filters_count > 256) {
@@ -617,23 +763,39 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         if (filter->authors_count > 0) {
             if (!first) strcat(conditions, " AND ");
             first = false;
-            
-            if (filter->authors_count == 1) {
-                strcat(conditions, "pubkey = ?");
+
+            /* NIP-26: relays should answer {authors: [A]} by matching both
+             * the event pubkey and the delegation tag's [1] value (delegator).
+             * SQL tags are stored as JSON text; delegation[1] is matched with
+             * LIKE on a bounded pattern built from the author hex (safe: hex
+             * only, fixed 64 chars). */
+            strcat(conditions, "(pubkey IN (");
+            for (size_t i = 0; i < filter->authors_count; i++) {
+                strcat(conditions, "?");
+                if (i < filter->authors_count - 1) strcat(conditions, ",");
                 params[param_count].type = PARAM_TYPE_STRING;
-                params[param_count].value.string = filter->authors[0];
+                params[param_count].value.string = filter->authors[i];
                 param_count++;
-            } else {
-                strcat(conditions, "pubkey IN (");
-                for (size_t i = 0; i < filter->authors_count; i++) {
-                    strcat(conditions, "?");
-                    if (i < filter->authors_count - 1) strcat(conditions, ",");
-                    params[param_count].type = PARAM_TYPE_STRING;
-                    params[param_count].value.string = filter->authors[i];
-                    param_count++;
-                }
-                strcat(conditions, ")");
             }
+            strcat(conditions, ") OR ");
+            /* One LIKE per author: ["delegation","<pubkey> — the leading
+             * quote on the value prevents matching a longer pubkey prefix.
+             * Author values are validated 64-char lowercase hex, so the
+             * pattern is injection-safe. Cap the expansion to keep the
+             * conditions buffer bounded. */
+            size_t delegation_authors = filter->authors_count;
+            if (delegation_authors > 32) delegation_authors = 32;
+            for (size_t i = 0; i < delegation_authors; i++) {
+                char pattern[160];
+                snprintf(pattern, sizeof(pattern),
+                         "%%[\"delegation\",\"%s\",%%", filter->authors[i]);
+                strcat(conditions, "tags LIKE ?");
+                if (i < delegation_authors - 1) strcat(conditions, " OR ");
+                params[param_count].type = PARAM_TYPE_STRING;
+                params[param_count].value.string = string_dup(pattern);
+                param_count++;
+            }
+            strcat(conditions, ")");
         }
         
         if (filter->kinds_count > 0) {
@@ -676,6 +838,36 @@ static bool send_records(send_records_callback_t sender, const char *sub,
             snprintf(until_str, sizeof(until_str), "created_at <= %lld",
                      (long long) filter->until);
             strcat(conditions, until_str);
+        }
+        
+        if (filter->tags_count > 0) {
+            bool tags_ok = true;
+            if (!first) strcat(conditions, " AND ");
+            first = false;
+            
+            if (!conditions_append(conditions, sizeof(conditions), "(")) tags_ok = false;
+            for (size_t t = 0; tags_ok && t < filter->tags_count; t++) {
+                const tag_t *tag = &filter->tags[t];
+                if (t > 0 && !conditions_append(conditions, sizeof(conditions), " AND ")) { tags_ok = false; break; }
+                if (!conditions_append(conditions, sizeof(conditions), "(")) { tags_ok = false; break; }
+                for (size_t v = 1; v < tag->count; v++) {
+                    if (v > 1 && !conditions_append(conditions, sizeof(conditions), " OR ")) { tags_ok = false; break; }
+                    if (!append_tag_like_condition(conditions, sizeof(conditions),
+                                                   params, &param_count,
+                                                   tag->elements[0], tag->elements[v])) {
+                        tags_ok = false;
+                        break;
+                    }
+                }
+                if (tags_ok && !conditions_append(conditions, sizeof(conditions), ")")) tags_ok = false;
+            }
+            if (tags_ok) {
+                if (!conditions_append(conditions, sizeof(conditions), ")")) tags_ok = false;
+            }
+            if (!tags_ok) {
+                fprintf(stderr, "Error: tag filter conditions too large\n");
+                return false;
+            }
         }
         
         if (filter->search && strlen(filter->search) > 0) {
@@ -758,10 +950,9 @@ static bool send_records(send_records_callback_t sender, const char *sub,
     }
     
     if (do_count) {
-        char count_json[256];
-        snprintf(count_json, sizeof(count_json),
-                "[\"COUNT\",\"%s\",{\"count\":%d}]", sub, total_count);
-        sender(count_json);
+        /* NIP-45: report the aggregated count to the caller, which builds
+         * the ["COUNT", sub, {"count": N}] response via nip45. */
+        if (out_count) *out_count = total_count;
     }
     
     return true;
@@ -810,9 +1001,9 @@ static bool storage_init_sqlite3(const char *dsn) {
     }
     
     int ret = sqlite3_open_v2(dsn, &db_conn,
-                             SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE |
-                             SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX,
-                             NULL);
+                         SQLITE_OPEN_URI | SQLITE_OPEN_READWRITE |
+                         SQLITE_OPEN_CREATE,
+                         NULL);
     
     if (ret != SQLITE_OK) {
         fprintf(stderr, "Unable to connect to database: %s\n", sqlite3_errmsg(db_conn));
@@ -905,4 +1096,5 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->delete_record_by_id_and_kind_and_ptag = delete_record_by_id_and_kind_and_ptag;
     ctx->delete_all_events_by_pubkey = delete_all_events_by_pubkey;
     ctx->send_records = send_records;
+    ctx->purge_expired = purge_expired_sqlite3;
 }

@@ -54,4 +54,22 @@
  */
 char *nip67_build_eose_response(const char *sub_id, bool has_more);
 
+/* nip67_build_eose_response_ex - Build an EOSE response with an "auth" hint.
+ *
+ * NIP-67 defines a third hint value "auth": the relay may have more stored
+ * events matching the subscription's filters if the user performs AUTH
+ * (NIP-42). Relays MUST ensure an AUTH message (containing a challenge) is
+ * sent before the EOSE containing an "auth" hint — the caller is responsible
+ * for that ordering.
+ *
+ * Args:
+ *   sub_id    - subscription ID from client's REQ (must not be NULL)
+ *   has_more  - true if more events exist beyond the relay's limit
+ *   auth_hint - true to include the "auth" hint in the hint array
+ *
+ * Returns: malloc'd JSON string, or NULL if memory allocation fails
+ */
+char *nip67_build_eose_response_ex(const char *sub_id, bool has_more,
+                                   bool auth_hint);
+
 #endif /* NIP67_H_ */

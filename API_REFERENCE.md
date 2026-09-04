@@ -1,6 +1,6 @@
 # C API Reference
 
-Public headers live in [src/cagliostr.h](src/cagliostr.h),
+Public headers live in [src/nostrogotho.h](src/nostrogotho.h),
 [src/crypto.h](src/crypto.h), [src/storage.h](src/storage.h), and
 [src/server.h](src/server.h). Headers are authoritative when this guide and
 implementation differ.

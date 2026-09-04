@@ -816,9 +816,9 @@ NOBDEF char *nob_temp_running_executable_path(void);
 #  if defined(_MSC_VER) && !defined(__clang__)
 #    define nob_cc_flags(cmd) nob_cmd_append(cmd, "/W4", "/nologo", "/D_CRT_SECURE_NO_WARNINGS")
 #  else
-#    define nob_cc_flags(cmd) nob_cmd_append(cmd, "-Wall", "-Wextra")
+#    define nob_cc_flags(cmd) nob_cmd_append(cmd, "-Wall", "-Wextra", "-Wno-unused-function")
 #  endif
-#endif // nob_cc_flags
+#endif // nob_cc_flagsd
 
 #ifndef nob_cc_output
 #  if defined(_MSC_VER) && !defined(__clang__)

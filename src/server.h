@@ -9,6 +9,9 @@ void server_configure(storage_context_t *storage, const char *relay_url,
 					  int min_pow_difficulty, time_t created_at_lower_limit,
 					  time_t created_at_upper_limit);
 
+/* Enable or disable console debug logging (connect/disconnect/event traces). */
+void server_set_debug(bool enabled);
+
 /* Run the relay listener until it is stopped or its event loop exits. */
 bool server_run(int port);
 

@@ -141,6 +141,22 @@ typedef struct {
      */
     int (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at);
     
+    /* purge_expired - Delete NIP-40 expired events (background GC)
+     * 
+     * Deletes every stored event whose ["expiration", "<timestamp>"] tag has
+     * a timestamp <= now. Intended to be driven by a periodic background task
+     * (the server event loop) so that already-accepted events don't linger in
+     * the database forever.
+     * 
+     * Args: now - reference timestamp (time(NULL)); events expiring on or
+     *             before this instant are removed.
+     * Returns: number of rows deleted, or -1 on error. May be NULL if the
+     *          backend does not implement expiration GC.
+     * 
+     * Thread safety: same as the rest of the storage context (NOT thread-safe).
+     */
+    int (*purge_expired)(time_t now);
+    
     /* ====================================================================
      * Event Query and Streaming
      * ==================================================================== */
@@ -155,21 +171,26 @@ typedef struct {
      *   sub - subscription ID (included in response)
      *   filters - array of filter structures
      *   filters_count - number of filters in array
-     *   do_count - if true, count matching events instead of streaming
+     *   do_count - if true, count matching events instead of streaming.
+     *              When counting, the sender is NOT invoked; the total is
+     *              returned via out_count (NIP-45) and the caller builds the
+     *              COUNT response.
      *   has_more - if not NULL, set to true if more events exist beyond limit
+     *   out_count - when do_count is true, receives the aggregated count.
+     *               May be NULL when do_count is false.
      * 
      * Returns: true on success, false on database error
      * 
      * Behavior:
      *   - Multiple filters are OR'd (send if ANY filter matches)
      *   - Within a filter, criteria are AND'd
-     *   - If do_count is true, returns COUNT response instead of events
+     *   - If do_count is true, reports the count via out_count instead of
+     *     emitting a COUNT response (NIP-45)
      *   - Fetches limit+1 events to determine has_more flag (NIP-67)
-     *   - Events with expiration tags past current time are skipped
      */
     bool (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more);
+                        bool do_count, bool *has_more, int *out_count);
 } storage_context_t;
 
 /* ============================================================================

@@ -50,11 +50,11 @@ $env:CREATED_AT_UPPER_LIMIT = "900"
 ## Validate A Change
 
 ```powershell
-gcc -std=c99 -Wall -Wextra -Wpedantic -I. -Isrc -Ithirdparty -Ithirdparty/mongoose -fsyntax-only src/main.c src/server.c src/storage.c src/json_util.c src/crypto.c src/cagliostr.c
+gcc -std=c99 -Wall -Wextra -Wpedantic -I. -Isrc -Ithirdparty -Ithirdparty/mongoose -fsyntax-only src/main.c src/server.c src/storage.c src/json_util.c src/crypto.c src/nostrogotho.c
 git diff --check
 ```
 
-See [README.md](README.md) for all runtime controls and NIP support.# Quick Start Guide - Cagliostr C99
+See [README.md](README.md) for all runtime controls and NIP support.# Quick Start Guide - NOSTROGOTHO C99
 
 ## Installation
 
@@ -99,7 +99,7 @@ its dependencies.
 ### Creating an Event
 
 ```c
-#include "cagliostr.h"
+#include "nostrogotho.h"
 #include "storage.h"
 
 // Create event
@@ -162,7 +162,7 @@ crypto_deinit();
 ```
 nostrogotho/
 ├── src/
-│   ├── cagliostr.h/c     # Core data structures
+│   ├── nostrogotho.h/c     # Core data structures
 │   ├── crypto.h/c        # Cryptographic operations
 │   ├── storage.h/c       # SQLite3 database layer
 │   ├── server.c          # WebSocket server

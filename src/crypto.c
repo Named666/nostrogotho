@@ -482,8 +482,8 @@ bool check_event(const event_t *ev) {
     
     char buffer[65536];
     int written = snprintf(buffer, sizeof(buffer),
-                          "[0,\"%s\",%ld,%d,%s,\"%s\"]",
-                          escaped_pubkey, ev->created_at, ev->kind,
+                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
+                          escaped_pubkey, (long long)ev->created_at, ev->kind,
                           ev->tags_json ? ev->tags_json : "[]",
                           escaped_content);
     
@@ -510,24 +510,28 @@ bool check_event(const event_t *ev) {
     }
     
     /* Check delegation tags if present */
-    tags_array_t *tags = parse_tags_json(ev->tags_json);
-    if (tags) {
-        for (size_t i = 0; i < tags->count; i++) {
-            tag_t *tag = &tags->tags[i];
-            
-            if (tag->count >= 4 && strcmp(tag->elements[0], "delegation") == 0) {
-                const char *delegator_pubkey = tag->elements[1];
-                const char *conditions = tag->elements[2];
-                const char *delegation_sig = tag->elements[3];
+    if (!ev->tags_json) {
+        /* No tags, skip delegation check */
+    } else {
+        tags_array_t *tags = parse_tags_json(ev->tags_json);
+        if (tags) {
+            for (size_t i = 0; i < tags->count; i++) {
+                tag_t *tag = &tags->tags[i];
                 
-                if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
-                    tags_array_free(tags);
-                    return false;
+                if (tag->elements && tag->count >= 4 && strcmp(tag->elements[0], "delegation") == 0) {
+                    const char *delegator_pubkey = tag->elements[1];
+                    const char *conditions = tag->elements[2];
+                    const char *delegation_sig = tag->elements[3];
+                    
+                    if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
+                        tags_array_free(tags);
+                        return false;
+                    }
                 }
             }
+            
+            tags_array_free(tags);
         }
-        
-        tags_array_free(tags);
     }
     
     return true;
@@ -568,12 +572,15 @@ bool check_event(const event_t *ev) {
 int count_leading_zero_bits(const char *hex) {
     if (!hex) return 0;
     
+    /* Validate that all characters are valid hex digits */
+    for (const char *p = hex; *p; p++) {
+        if (hex_value(*p) < 0) return 0;  /* Invalid hex, return 0 */
+    }
+    
     int count = 0;
     
     for (const char *p = hex; *p; p++) {
         int nibble = hex_value(*p);
-        
-        if (nibble < 0) break;
         
         if (nibble == 0) {
             count += 4;

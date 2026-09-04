@@ -1,8 +1,12 @@
 #include "nip01.h"
 #include "../crypto.h"
 #include "../storage.h"
+#include "nip_event.h"
+#include "nip_plugin.h"
 #include <time.h>
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * NIP-01: Basic Protocol Flow, Events and Signatures
@@ -10,6 +14,13 @@
  * Implementation of core event validation and event listener system.
  * Each NIP registers listeners for the event kinds it cares about.
  * When an event arrives, registered listeners are called to process it.
+ *
+ * Consolidated here per the reference specs:
+ *   - NIP-16 (Event Treatment) is `final mandatory` and "Moved to NIP-01":
+ *     replaceable-event handling for kinds 0, 3, 10000-19999 lives here.
+ *   - NIP-33 (Parameterized Replaceable Events) is `final mandatory` and
+ *     "Moved to NIP-01": addressable-event handling for kinds 30000-39999
+ *     (with the "d" tag) lives here.
  * ============================================================================ */
 
 bool nip01_validate_event(const event_t *ev) {
@@ -43,7 +54,11 @@ bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
         return false;
     }
     
-    /* Check proof-of-work (NIP-13) */
+    /* Check proof-of-work (NIP-13)
+     * Note: this is a config-driven acceptance gate (min_pow_difficulty),
+     * not NIP-module state, so it stays here. NIP-module policies (e.g.
+     * NIP-40 expiry) are applied by the server via plugin accept_publish
+     * hooks, keeping this module NIP-agnostic. */
     if (min_pow_difficulty > 0) {
         extern bool nip13_meets_difficulty(const event_t *ev, int difficulty);
         if (!nip13_meets_difficulty(ev, min_pow_difficulty)) {
@@ -60,9 +75,10 @@ bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
  * Purely mechanical: stores (kind range -> listener) entries. It has no
  * knowledge of any specific NIP; each NIP module registers itself via
  * __attribute__((constructor)) in its own .c file.
+ * 
+ * The registry grows dynamically as listeners are registered, so there is no
+ * fixed ceiling on the number of NIPs that can be supported.
  * ============================================================================ */
-
-#define MAX_LISTENERS 64
 
 typedef struct {
     int kind_min;
@@ -70,12 +86,22 @@ typedef struct {
     nip01_event_listener_t listener;
 } listener_entry_t;
 
-static listener_entry_t listener_registry[MAX_LISTENERS];
-static int registry_size = 0;
+static listener_entry_t *listener_registry;
+static size_t registry_size = 0;
+static size_t registry_capacity = 0;
 
 bool nip01_register_listener(int kind_min, int kind_max, nip01_event_listener_t listener) {
     if (!listener || kind_min > kind_max) return false;
-    if (registry_size >= MAX_LISTENERS) return false;
+
+    /* Grow the registry when full (start at 16, double as needed). */
+    if (registry_size >= registry_capacity) {
+        size_t new_capacity = registry_capacity ? registry_capacity * 2 : 16;
+        listener_entry_t *resized = (listener_entry_t *) realloc(
+            listener_registry, new_capacity * sizeof(*resized));
+        if (!resized) return false;
+        listener_registry = resized;
+        registry_capacity = new_capacity;
+    }
 
     listener_registry[registry_size].kind_min = kind_min;
     listener_registry[registry_size].kind_max = kind_max;
@@ -145,10 +171,14 @@ nip01_process_result_t nip01_process_event(
         }
     }
     
+    /* Step 4b: NIP-module publish policies (e.g. NIP-40 expiry, NIP-42
+     * auth-required tags) are enforced by the server before dispatch via
+     * plugin accept_publish() hooks, so this dispatcher stays NIP-agnostic. */
+
     /* Step 5: Call every registered listener whose range covers this kind,
      * in registration order. The first listener to accept wins. */
     bool any_listener_matched = false;
-    for (int i = 0; i < registry_size; i++) {
+    for (size_t i = 0; i < registry_size; i++) {
         if (event->kind < listener_registry[i].kind_min ||
             event->kind > listener_registry[i].kind_max) {
             continue;
@@ -197,5 +227,147 @@ nip01_process_result_t nip01_process_event(
     result.response_msg[0] = '\0';
     
     return result;
+}
+
+/* ============================================================================
+ * NIP-16 (moved to NIP-01): Replaceable Events
+ *
+ * Kinds 0, 3 and 10000-19999 are replaceable: for each (kind, pubkey) only
+ * the latest event is retained. When a newer event arrives, the previous
+ * record is deleted before the new one is stored. On equal created_at the
+ * storage layer performs the lexical id tie-break (lowest id wins).
+ * ============================================================================ */
+
+static bool nip01_replace_event(const event_t *event, storage_context_t *storage) {
+    return storage->delete_record_by_kind_and_pubkey(event->kind, event->pubkey,
+                                                     event->created_at) >= 0;
+}
+
+static nip01_process_result_t nip01_replaceable_listener(
+    struct mg_connection *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url) {
+
+    (void)connection;
+    (void)relay_url;
+
+    nip01_process_result_t result = {0};
+
+    if (!storage) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "error: storage unavailable");
+        return result;
+    }
+
+    if (!nip01_replace_event(event, storage)) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "error: failed to replace event");
+        return result;
+    }
+
+    if (!storage->insert_record(event)) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "duplicate: event already exists");
+        return result;
+    }
+
+    result.accepted = true;
+    result.should_broadcast = true;
+    result.response_msg[0] = '\0';
+
+    return result;
+}
+
+/* ============================================================================
+ * NIP-33 (moved to NIP-01): Addressable (Parameterized Replaceable) Events
+ *
+ * Kinds 30000-39999 are addressable: for each (kind, pubkey, "d" tag value)
+ * only the latest event is stored. The "d" tag value is the addressable
+ * identifier; an event without a "d" tag is treated as having an empty one.
+ * ============================================================================ */
+
+static bool nip01_replace_addressable_event(const event_t *event,
+                                            storage_context_t *storage) {
+    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    size_t offset = 0;
+    char *dvalue = NULL;
+    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+        char *name = nip_tag_element(tag, 0);
+        bool is_d = name && strcmp(name, "d") == 0;
+        free(name);
+        if (is_d) {
+            dvalue = nip_tag_element(tag, 1);
+            break;
+        }
+    }
+    /* NIP-01: an event without a "d" tag is treated as having an empty one. */
+    tag_t dtag = {(char *[]) {"d", dvalue ? dvalue : ""}, 2, 2};
+    bool replaced = storage->delete_record_by_kind_and_pubkey_and_dtag(
+                        event->kind, event->pubkey, &dtag,
+                        event->created_at) >= 0;
+    free(dvalue);
+    return replaced;
+}
+
+static nip01_process_result_t nip01_addressable_listener(
+    struct mg_connection *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url) {
+
+    (void)connection;
+    (void)relay_url;
+
+    nip01_process_result_t result = {0};
+
+    if (!storage) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "error: storage unavailable");
+        return result;
+    }
+
+    if (!nip01_replace_addressable_event(event, storage)) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "error: failed to replace event");
+        return result;
+    }
+
+    if (!storage->insert_record(event)) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "duplicate: event already exists");
+        return result;
+    }
+
+    result.accepted = true;
+    result.should_broadcast = true;
+    result.response_msg[0] = '\0';
+
+    return result;
+}
+
+/* ============================================================================
+ * Built-in listener registration (NIP-16 / NIP-33 consolidated into NIP-01)
+ * ============================================================================ */
+
+void nip01_init_listeners(void) {
+    /* NIP-16 replaceable events (kinds 0, 3, 10000-19999). */
+    nip01_register_listener(0, 0, nip01_replaceable_listener);
+    nip01_register_listener(3, 3, nip01_replaceable_listener);
+    nip01_register_listener(10000, 19999, nip01_replaceable_listener);
+    /* NIP-33 addressable events (kinds 30000-39999). */
+    nip01_register_listener(30000, 39999, nip01_addressable_listener);
+}
+
+/* Auto-register the built-in NIP-16 / NIP-33 listeners at program startup,
+ * matching the self-registration pattern used by every other NIP module. */
+__attribute__((constructor)) static void nip01_register_at_startup(void) {
+    nip01_init_listeners();
 }
 

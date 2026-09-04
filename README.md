@@ -21,7 +21,7 @@ signature verification. The current build targets Windows with GCC/MinGW.
    ```
 
 The default listener is `0.0.0.0:7447`; the default database is
-`./cagliostr.sqlite`. Put public relays behind a TLS-terminating reverse proxy
+`./nostrogotho.sqlite`. Put public relays behind a TLS-terminating reverse proxy
 and configure the external `wss://` address with `-service-url`.
 
 See [QUICKSTART.md](QUICKSTART.md) for local setup and deployment guidance.
@@ -30,7 +30,7 @@ See [QUICKSTART.md](QUICKSTART.md) for local setup and deployment guidance.
 
 | Option | Environment | Default | Description |
 | --- | --- | --- | --- |
-| `-database PATH`, `--db PATH` | `DATABASE_URL` | `./cagliostr.sqlite` | SQLite database path or URI. |
+| `-database PATH`, `--db PATH` | `DATABASE_URL` | `./nostrogotho.sqlite` | SQLite database path or URI. |
 | `-port PORT`, `--port PORT` | None | `7447` | Listener TCP port. |
 | `-service-url URL` | `SERVICE_URL` | Empty | Public URL used by NIP-42 and NIP-62. |
 | `-min-pow BITS` | `MIN_POW_DIFFICULTY` | `0` | Required NIP-13 difficulty; `0` disables it. |
@@ -134,7 +134,7 @@ large-scale social network. They are future work, not current support claims.
 | Medium | NIP-05, NIP-19, NIP-21, NIP-27 | Add identifier, entity, URI, and reference-aware indexing to improve discovery and link resolution. |
 | Medium | NIP-44, NIP-46, NIP-47, NIP-98 | Support modern encrypted payload, remote signer, wallet-connect, and HTTP authentication workflows where relay-side handling is appropriate. |
 | Medium | NIP-66, NIP-70 | Publish liveness/discovery metadata and enforce protected-event access rules. |
-| Later | Scale and federation | Add PostgreSQL support, read replicas, durable job queues, sharding/partitioning, multi-relay replication, and a documented operational deployment model. |
+| Later | Scale and federation | Read replicas, durable job queues, sharding/partitioning, multi-relay replication, and a documented operational deployment model. |
 
 ## Build
 

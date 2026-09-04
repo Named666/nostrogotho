@@ -8,7 +8,7 @@
 
 Historical completion and reimplementation reports were consolidated into these
 current guides because they described an earlier, incomplete C99 port and a
-nonexistent CMake build.# Cagliostr C99 - Complete Index
+nonexistent CMake build.
 
 ## 📚 Documentation
 
@@ -21,7 +21,7 @@ Start here based on your needs:
 
 ### For Developers
 1. **[API_REFERENCE.md](API_REFERENCE.md)** - Complete API documentation
-2. **[COMPLETION_SUMMARY.md](COMPLETION_SUMMARY.md)** - Project details
+- [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) - Project details
 3. Source code in `src/` directory
 
 ### For Integration
@@ -39,7 +39,7 @@ nostrogotho/
 │   ├── QUICKSTART.md           ← Start here!
 │   ├── API_REFERENCE.md        ← Complete API
 │   ├── IMPLEMENTATION.md       ← Architecture
-│   ├── COMPLETION_SUMMARY.md   ← Project overview
+│   ├── PROJECT_SUMMARY.md   ← Project overview
 │   └── README.md              ← Original project
 │
 ├── 🔨 Build System
@@ -49,7 +49,7 @@ nostrogotho/
 │   └── nob.h                  ← Nob header
 │
 ├── 📁 Source Code (src/)
-│   ├── cagliostr.h/c          ← Core data structures
+│   ├── nostrogotho.h/c          ← Core data structures
 │   ├── crypto.h/c             ← Cryptographic ops
 │   ├── storage.h/c            ← SQLite3 layer
 │   ├── server.c               ← WebSocket server
@@ -71,7 +71,7 @@ nostrogotho/
 
 | Module | Purpose | Lines | Key Functions |
 |--------|---------|-------|---|
-| **cagliostr.h/c** | Data structures | 229 | `event_alloc`, `filter_alloc`, memory management |
+| **nostrogotho.h/c** | Data structures | 229 | `event_alloc`, `filter_alloc`, memory management |
 | **crypto.h/c** | Cryptography | 358 | `sha256`, `signature_verify`, `check_event` |
 | **storage.h/c** | Database | 476 | `insert_record`, `send_records`, SQLite ops |
 | **server.c** | WebSocket | 295 | mongoose event handler, event loop |
@@ -127,7 +127,7 @@ QUICKSTART.md
 └── Common Tasks
 
 API_REFERENCE.md
-├── Core Modules (cagliostr, crypto, storage)
+├── Core Modules (nostrogotho, crypto, storage)
 ├── Function Reference
 ├── Usage Examples
 ├── Constants
@@ -141,11 +141,10 @@ IMPLEMENTATION.md
 ├── Nostr Protocol
 └── Limitations
 
-COMPLETION_SUMMARY.md
+PROJECT_SUMMARY.md
 ├── Project Status
 ├── Deliverables
-├── Key Features
-├── Statistics
+├── Milestones
 └── Next Steps
 ```
 
@@ -165,7 +164,7 @@ COMPLETION_SUMMARY.md
 ## 🔧 Development Workflow
 
 ### Adding a New Feature
-1. Identify which module to modify (cagliostr, crypto, storage, server)
+1. Identify which module to modify (nostrogotho, crypto, storage, server)
 2. Update header file (.h) with new declarations
 3. Implement in source file (.c)
 4. Add examples to examples/example.c
@@ -180,7 +179,7 @@ make
 ./test_main
 
 # Or build custom tests
-gcc -std=c99 -o mytest mytest.c -lcagliostr -lsqlite3 -lcrypto -lsecp256k1
+gcc -std=c99 -o mytest mytest.c -lnostrogotho -lsqlite3 -lcrypto -lsecp256k1
 ```
 
 ### Performance Profiling

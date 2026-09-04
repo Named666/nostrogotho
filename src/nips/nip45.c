@@ -1,4 +1,5 @@
 #include "nip45.h"
+#include "nip_plugin.h"
 #include "../json_util.h"
 #include <stdlib.h>
 
@@ -26,4 +27,17 @@ char *nip45_build_count_response(const char *sub_id, unsigned long count) {
     /* json_builder_finish returns a pointer to internal buffer,
      * so we need to duplicate it for caller to own */
     return string_dup(result);
+}
+
+static char *nip45_plugin_build_count(const char *sub, unsigned long count) {
+    return nip45_build_count_response(sub, count);
+}
+
+static nip_plugin_t nip45_plugin = {
+    .name = "nip45",
+    .build_count = nip45_plugin_build_count,
+};
+
+__attribute__((constructor)) static void nip45_register_at_startup(void) {
+    nip_plugin_register(&nip45_plugin);
 }

@@ -370,15 +370,19 @@ void json_builder_append_number(json_builder_t *builder, long long value) {
     }
 }
 
-void json_builder_append_string(json_builder_t *builder, const char *value) {
-    json_builder_add_comma(builder);
-    
-    if (!json_builder_ensure_space(builder, 2)) return;
-    builder->buffer[builder->pos++] = '"';
-    
-    for (size_t i = 0; value[i]; i++) {
+/* json_builder_escape_string - Append a JSON-escaped string value
+ *
+ * Writes the escaped contents of `value` (without surrounding quotes) into
+ * the builder. Escapes all characters required by the JSON spec: `"`, `\`,
+ * `/`, `\b`, `\f`, `\n`, `\r`, `\t`, and any other control character as a
+ * `\uXXXX` sequence. This is the single source of truth for string escaping
+ * so that every serialized field (including event `content`) is emitted
+ * correctly regardless of its contents.
+ */
+static void json_builder_escape_string(json_builder_t *builder, const char *value) {
+    for (size_t i = 0; value && value[i]; i++) {
         unsigned char c = (unsigned char)value[i];
-        
+
         if (c == '"' || c == '\\' || c == '/') {
             if (!json_builder_ensure_space(builder, 2)) return;
             builder->buffer[builder->pos++] = '\\';
@@ -411,7 +415,16 @@ void json_builder_append_string(json_builder_t *builder, const char *value) {
             builder->buffer[builder->pos++] = c;
         }
     }
-    
+}
+
+void json_builder_append_string(json_builder_t *builder, const char *value) {
+    json_builder_add_comma(builder);
+
+    if (!json_builder_ensure_space(builder, 2)) return;
+    builder->buffer[builder->pos++] = '"';
+
+    json_builder_escape_string(builder, value);
+
     if (json_builder_ensure_space(builder, 1)) {
         builder->buffer[builder->pos++] = '"';
     }
@@ -444,28 +457,11 @@ void json_builder_object_key_string(json_builder_t *builder, const char *key, co
     builder->buffer[builder->pos++] = '"';
     builder->pos += snprintf(&builder->buffer[builder->pos], 128, "%s\":", key);
     
-    /* Append string value with escaping */
+    /* Append string value with full escaping */
     if (!json_builder_ensure_space(builder, 2)) return;
     builder->buffer[builder->pos++] = '"';
     
-    for (size_t i = 0; value && value[i]; i++) {
-        unsigned char c = (unsigned char)value[i];
-        if (c == '"' || c == '\\') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = c;
-        } else if (c == '\n') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = 'n';
-        } else if (c < 0x20) {
-            if (!json_builder_ensure_space(builder, 6)) return;
-            builder->pos += snprintf(&builder->buffer[builder->pos], 6, "\\u%04x", c);
-        } else {
-            if (!json_builder_ensure_space(builder, 1)) return;
-            builder->buffer[builder->pos++] = c;
-        }
-    }
+    json_builder_escape_string(builder, value);
     
     if (json_builder_ensure_space(builder, 1)) {
         builder->buffer[builder->pos++] = '"';
@@ -535,26 +531,69 @@ static char *json_raw_string(struct mg_str value) {
     return result;
 }
 
-static bool append_string(char ***items, size_t *count, const char *value) {
-    char **resized = (char **) realloc(*items, (*count + 1) * sizeof(**items));
-    if (!resized) return false;
-    resized[*count] = string_dup(value);
-    if (!resized[*count]) return false;
-    *items = resized;
+/* is_hex_64 - Check that a string is exactly 64 lowercase hex characters
+ *
+ * NIP-01 requires the values in the `ids`, `authors`, `#e` and `#p` filter
+ * lists to be exact 64-character lowercase hex strings. This rejects short
+ * prefixes (which would otherwise match via prefix comparison) and any
+ * non-hex or uppercase characters.
+ */
+static bool is_hex_64(const char *s) {
+    if (!s) return false;
+    for (size_t i = 0; i < 64; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return s[64] == '\0';
+}
+
+static bool append_string(char ***items, size_t *count, size_t alloc_size, const char *value) {
+    if (*count >= alloc_size) {
+        alloc_size = alloc_size == 0 ? 16 : alloc_size * 2;
+        *items = (char **) realloc(*items, alloc_size * sizeof(**items));
+        if (!*items) return false;
+    }
+    (*items)[*count] = string_dup(value);
+    if (!(*items)[*count]) return false;
     (*count)++;
     return true;
 }
 
 static bool parse_string_array(struct mg_str raw, char ***items, size_t *count,
-                               size_t max_items) {
+                               size_t max_items, bool require_hex64) {
     struct mg_str key, value;
     size_t offset = 0;
+    size_t alloc_size = 16;
+    *items = (char **) calloc(alloc_size, sizeof(**items));
+    if (!*items) return false;
+    
     while ((offset = mg_json_next(raw, offset, &key, &value)) != 0) {
         char *string;
-        if (*count >= max_items || key.buf != NULL) return false;
+        if (*count >= max_items || key.buf != NULL) {
+            /* Free previously allocated strings on error */
+            for (size_t i = 0; i < *count; i++) free((*items)[i]);
+            free(*items);
+            *items = NULL;
+            *count = 0;
+            return false;
+        }
         string = json_raw_string(value);
-        if (!string || !append_string(items, count, string)) {
+        if (!string || (require_hex64 && !is_hex_64(string))) {
             free(string);
+            /* Free previously allocated strings on error */
+            for (size_t i = 0; i < *count; i++) free((*items)[i]);
+            free(*items);
+            *items = NULL;
+            *count = 0;
+            return false;
+        }
+        if (!append_string(items, count, alloc_size, string)) {
+            free(string);
+            /* Free previously allocated strings on error */
+            for (size_t i = 0; i < *count; i++) free((*items)[i]);
+            free(*items);
+            *items = NULL;
+            *count = 0;
             return false;
         }
         free(string);
@@ -577,6 +616,8 @@ static bool append_filter_tag(filter_t *filter, const char *name,
         tag_free(tag);
         return false;
     }
+    /* NIP-01: values in #e and #p filters must be exact 64-char lowercase hex */
+    bool require_hex64 = (strcmp(name, "e") == 0 || strcmp(name, "p") == 0);
     while ((offset = mg_json_next(raw, offset, &key, &value)) != 0) {
         char *string;
         if (key.buf != NULL || tag->count >= tag->capacity) {
@@ -584,7 +625,8 @@ static bool append_filter_tag(filter_t *filter, const char *name,
             return false;
         }
         string = json_raw_string(value);
-        if (!string) {
+        if (!string || (require_hex64 && !is_hex_64(string))) {
+            free(string);
             tag_free(tag);
             return false;
         }
@@ -645,9 +687,9 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
         ok = field != NULL;
         if (!ok) break;
         if (strcmp(field, "ids") == 0) {
-            ok = parse_string_array(value, &filter->ids, &filter->ids_count, 256);
+            ok = parse_string_array(value, &filter->ids, &filter->ids_count, 256, true);
         } else if (strcmp(field, "authors") == 0) {
-            ok = parse_string_array(value, &filter->authors, &filter->authors_count, 256);
+            ok = parse_string_array(value, &filter->authors, &filter->authors_count, 256, true);
         } else if (strcmp(field, "kinds") == 0) {
             struct mg_str array_key, array_value;
             size_t array_offset = 0;
@@ -710,7 +752,7 @@ bool json_parse_event(const char *json_str, event_t *event) {
         strlen(id) != MAX_ID_SIZE || strlen(pubkey) != MAX_PUBKEY_SIZE ||
         strlen(sig) != MAX_SIG_SIZE || tags.len > MAX_TAGS_SIZE ||
         strlen(content) > MAX_CONTENT_SIZE || !mg_json_get_num(json, "$.created_at", &created_at) ||
-        !mg_json_get_num(json, "$.kind", &kind) || created_at != (time_t) created_at || kind != (int) kind ||
+        !mg_json_get_num(json, "$.kind", &kind) || created_at != (double)(time_t)created_at || kind != (int) kind ||
         !validate_event_tags(tags)) {
         free(id); free(pubkey); free(content); free(sig);
         return false;

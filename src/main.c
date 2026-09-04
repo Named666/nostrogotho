@@ -69,8 +69,14 @@ int main(int argc, const char **argv) {
             db_path = argv[++i];
         } else if ((strcmp(argv[i], "--port") == 0 || strcmp(argv[i], "-port") == 0) && i + 1 < argc) {
             if (!parse_int(argv[++i], &port)) return 1;
+            if (port < 1 || port > 65535) {
+                fprintf(stderr, "Invalid port number: %d (must be 1-65535)\n", port);
+                return 1;
+            }
         } else if (strcmp(argv[i], "-service-url") == 0 && i + 1 < argc) {
             service_url = argv[++i];
+        } else if (strcmp(argv[i], "--debug") == 0) {
+            server_set_debug(true);
         } else if (strcmp(argv[i], "-min-pow") == 0 && i + 1 < argc) {
             if (!parse_int(argv[++i], &min_pow) || min_pow < 0) return 1;
         } else if (strcmp(argv[i], "-created-at-lower-limit") == 0 && i + 1 < argc) {
@@ -78,10 +84,11 @@ int main(int argc, const char **argv) {
         } else if (strcmp(argv[i], "-created-at-upper-limit") == 0 && i + 1 < argc) {
             if (!parse_int(argv[++i], &upper_limit) || upper_limit < 0) return 1;
         } else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [-database path] [-port num] [-service-url url] [--help]\n", argv[0]);
+            printf("Usage: %s [-database path] [-port num] [-service-url url] [--debug] [--help]\n", argv[0]);
             printf("  -database path                 SQLite database (default: ./nostrogotho.sqlite)\n");
             printf("  -port num                      WebSocket port (default: 7447)\n");
             printf("  -service-url url               Public relay URL for NIP-42/NIP-62\n");
+            printf("  --debug                        Print connects, disconnects and events to console\n");
             printf("  -min-pow bits                  Minimum NIP-13 difficulty\n");
             printf("  -created-at-lower-limit sec    Maximum accepted age, 0 disables\n");
             printf("  -created-at-upper-limit sec    Maximum accepted future offset, 0 disables\n");
