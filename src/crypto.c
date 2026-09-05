@@ -385,6 +385,11 @@ static tags_array_t *parse_tags_json(const char *json_str) {
         if (*p == '[') {
             /* Start of a tag */
             p++;
+            /* Bounds check: reject events with more tags than capacity */
+            if (tags->count >= MAX_TAG_ELEMENTS) {
+                tags_array_free(tags);
+                return NULL;
+            }
             tag_t *tag = tag_alloc(MAX_TAG_ELEMENTS);
             if (!tag) {
                 tags_array_free(tags);
@@ -400,6 +405,12 @@ static tags_array_t *parse_tags_json(const char *json_str) {
                 if (*p == '"') {
                     /* Parse string */
                     p++;
+                    /* Bounds check: reject tags with more elements than capacity */
+                    if (tag->count >= tag->capacity) {
+                        tag_free(tag);
+                        tags_array_free(tags);
+                        return NULL;
+                    }
                     char *str_start = (char *)p;
                     size_t str_len = 0;
                     
@@ -428,10 +439,15 @@ static tags_array_t *parse_tags_json(const char *json_str) {
                 } else {
                     tag_free(tag);
                 }
+            } else {
+                /* Unterminated tag: free partially filled tag */
+                tag_free(tag);
+                tags_array_free(tags);
+                return NULL;
             }
         }
     }
-    
+
     return tags;
 }
 
@@ -467,33 +483,62 @@ bool check_event(const event_t *ev) {
     if (!ev) return false;
     
     /* Build the event hash input: [0, pubkey, created_at, kind, tags, content]
-     * Content and pubkey must be JSON-escaped for proper serialization
+     * Content and pubkey must be JSON-escaped for proper serialization.
+     *
+     * Stack usage is kept minimal: the content escape buffer and the
+     * serialization buffer are heap-allocated because this function runs on
+     * every incoming event (possibly concurrently). Worst case for JSON
+     * escaping is 6 output bytes per input byte (\u00XX for control chars).
      */
     char escaped_pubkey[MAX_PUBKEY_SIZE * 2 + 1];
-    char escaped_content[MAX_CONTENT_SIZE * 2 + 1];
     
-    /* Escape pubkey and content for JSON */
+    /* Escape pubkey for JSON (64 hex chars -> 129-byte stack buffer, safe) */
     if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
         return false;
     }
-    if (!json_escape_string(ev->content ? ev->content : "", escaped_content, sizeof(escaped_content))) {
+    
+    /* Escape content for JSON - heap allocated, sized for worst-case escaping */
+    const char *content = ev->content ? ev->content : "";
+    size_t content_len = strlen(content);
+    
+    size_t escaped_content_cap = content_len * 6 + 1;
+    char *escaped_content = (char *)malloc(escaped_content_cap);
+    if (!escaped_content) {
+        return false;
+    }
+    if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
+        free(escaped_content);
         return false;
     }
     
-    char buffer[65536];
-    int written = snprintf(buffer, sizeof(buffer),
+    /* Size the serialization buffer: fixed overhead + tags + escaped content */
+    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
+    size_t tags_len = strlen(tags_json);
+    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
+    char *buffer = (char *)malloc(buffer_cap);
+    if (!buffer) {
+        free(escaped_content);
+        return false;
+    }
+    
+    int written = snprintf(buffer, buffer_cap,
                           "[0,\"%s\",%lld,%d,%s,\"%s\"]",
                           escaped_pubkey, (long long)ev->created_at, ev->kind,
-                          ev->tags_json ? ev->tags_json : "[]",
+                          tags_json,
                           escaped_content);
+    free(escaped_content);
+    escaped_content = NULL;
     
-    if (written < 0 || written >= (int)sizeof(buffer)) {
+    if (written < 0 || (size_t)written >= buffer_cap) {
+        free(buffer);
         return false;
     }
     
     /* Compute SHA256 hash */
     uint8_t digest[32];
     sha256((const uint8_t *)buffer, strlen(buffer), digest);
+    free(buffer);
+    buffer = NULL;
     
     /* Convert digest to hex and compare with event ID */
     char *id_hex = bytes_to_hex(digest, 32);

@@ -35,6 +35,7 @@ bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
                             time_t created_at_lower_limit,
                             time_t created_at_upper_limit,
                             int min_pow_difficulty) {
+    (void) min_pow_difficulty; /* PoW is enforced by the nip13 plugin hook. */
     if (!ev) return false;
     
     /* Validate event ID and signature */
@@ -53,19 +54,10 @@ bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
     if (created_at_upper_limit > 0 && ev->created_at > now + created_at_upper_limit) {
         return false;
     }
-    
-    /* Check proof-of-work (NIP-13)
-     * Note: this is a config-driven acceptance gate (min_pow_difficulty),
-     * not NIP-module state, so it stays here. NIP-module policies (e.g.
-     * NIP-40 expiry) are applied by the server via plugin accept_publish
-     * hooks, keeping this module NIP-agnostic. */
-    if (min_pow_difficulty > 0) {
-        extern bool nip13_meets_difficulty(const event_t *ev, int difficulty);
-        if (!nip13_meets_difficulty(ev, min_pow_difficulty)) {
-            return false;
-        }
-    }
-    
+
+    /* Proof-of-work (NIP-13) is enforced by the nip13 plugin's
+     * accept_publish hook before dispatch, so it is not re-checked here. */
+
     return true;
 }
 
@@ -124,7 +116,8 @@ nip01_process_result_t nip01_process_event(
     time_t created_at_lower_limit,
     time_t created_at_upper_limit,
     int min_pow_difficulty) {
-    
+
+    (void) min_pow_difficulty; /* PoW is enforced by the nip13 plugin hook. */
     nip01_process_result_t result = {0};
     
     if (!event) {
@@ -160,17 +153,9 @@ nip01_process_result_t nip01_process_event(
         return result;
     }
     
-    /* Step 4: Check proof-of-work */
-    if (min_pow_difficulty > 0) {
-        extern bool nip13_meets_difficulty(const event_t *ev, int difficulty);
-        if (!nip13_meets_difficulty(event, min_pow_difficulty)) {
-            result.accepted = false;
-            snprintf(result.response_msg, sizeof(result.response_msg),
-                    "pow: insufficient difficulty");
-            return result;
-        }
-    }
-    
+    /* Step 4: Proof-of-work (NIP-13) is enforced by the nip13 plugin's
+     * accept_publish hook, which the server runs before dispatching here. */
+
     /* Step 4b: NIP-module publish policies (e.g. NIP-40 expiry, NIP-42
      * auth-required tags) are enforced by the server before dispatch via
      * plugin accept_publish() hooks, so this dispatcher stays NIP-agnostic. */
