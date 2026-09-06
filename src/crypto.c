@@ -403,7 +403,9 @@ static tags_array_t *parse_tags_json(const char *json_str) {
                 if (*p == ']') break;
                 
                 if (*p == '"') {
-                    /* Parse string */
+                    /* Parse string with proper unescaping (mirrors
+                     * parse_json_string in json_util.c): scan the raw span,
+                     * then decode escape sequences into the output buffer. */
                     p++;
                     /* Bounds check: reject tags with more elements than capacity */
                     if (tag->count >= tag->capacity) {
@@ -411,20 +413,44 @@ static tags_array_t *parse_tags_json(const char *json_str) {
                         tags_array_free(tags);
                         return NULL;
                     }
-                    char *str_start = (char *)p;
-                    size_t str_len = 0;
-                    
+                    const char *str_start = p;
+                    size_t raw_len = 0;
+
+                    /* Find the raw (escaped) span of the string */
                     while (*p && *p != '"') {
-                        if (*p == '\\') p++;  /* Skip escaped characters */
+                        if (*p == '\\' && p[1]) p++;  /* Skip escaped character */
                         p++;
-                        str_len++;
+                        raw_len++;
                     }
-                    
+
                     if (*p == '"') {
-                        char *element = (char *)malloc(str_len + 1);
+                        /* Unescape into output buffer; output is never longer
+                         * than the raw span, so raw_len + 1 always suffices */
+                        char *element = (char *)malloc(raw_len + 1);
                         if (element) {
-                            strncpy(element, str_start, str_len);
-                            element[str_len] = '\0';
+                            size_t out_idx = 0;
+                            size_t in_idx = 0;
+                            while (in_idx < raw_len) {
+                                if (str_start[in_idx] == '\\' && in_idx + 1 < raw_len) {
+                                    in_idx++;
+                                    char c = str_start[in_idx];
+                                    switch (c) {
+                                        case '"':  element[out_idx++] = '"'; break;
+                                        case '\\': element[out_idx++] = '\\'; break;
+                                        case '/':  element[out_idx++] = '/'; break;
+                                        case 'b':  element[out_idx++] = '\b'; break;
+                                        case 'f':  element[out_idx++] = '\f'; break;
+                                        case 'n':  element[out_idx++] = '\n'; break;
+                                        case 'r':  element[out_idx++] = '\r'; break;
+                                        case 't':  element[out_idx++] = '\t'; break;
+                                        default:   element[out_idx++] = c; break;
+                                    }
+                                } else {
+                                    element[out_idx++] = str_start[in_idx];
+                                }
+                                in_idx++;
+                            }
+                            element[out_idx] = '\0';
                             tag->elements[tag->count++] = element;
                         }
                         p++;

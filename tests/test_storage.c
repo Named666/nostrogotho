@@ -16,8 +16,8 @@ void test_escape_like_normal() {
 
 /* Test escape_like with special characters */
 void test_escape_like_special() {
-    char *result = escape_like("100%+50%", 9);
-    if (result && strcmp(result, "100\\%+50%") == 0) {
+    char *result = escape_like("100%+50%", 8);
+    if (result && strcmp(result, "100\\%+50\\%") == 0) {
         printf("PASS: escape_like special chars\n");
     } else {
         printf("FAIL: escape_like special chars (got: %s)\n", result ? result : "(null)");
@@ -53,16 +53,15 @@ void test_get_event_by_id_memory() {
     printf("INFO: test_get_event_by_id_memory - requires database\n");
 }
 
-/* Test filter_release doesn't double-free */
-void test_filter_release_no_double_free() {
+/* Test filter_free doesn't crash */
+void test_filter_free_no_double_free() {
     filter_t *f = filter_alloc();
     if (f) {
         f->ids_count = 1;
         f->ids = (char **)malloc(sizeof(char *));
         f->ids[0] = strdup("test");
-        filter_release(f);
-        printf("PASS: filter_release no double-free\n");
-        free(f);
+        filter_free(f);
+        printf("PASS: filter_free succeeds\n");
     } else {
         printf("FAIL: filter_alloc returned NULL\n");
     }
@@ -75,7 +74,7 @@ int main(void) {
     test_escape_like_null();
     test_escape_like_large();
     test_get_event_by_id_memory();
-    test_filter_release_no_double_free();
+    test_filter_free_no_double_free();
     printf("Storage tests complete.\n");
     return 0;
 }

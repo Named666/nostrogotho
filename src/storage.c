@@ -441,8 +441,18 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
         return 0;
     }
     
-    /* Delete the found events */
-    char delete_sql[1024] = "DELETE FROM event WHERE id IN (";
+    /* Delete the found events. The id list is unbounded (one entry per
+     * matching row), so size the SQL buffer dynamically instead of a fixed
+     * "... IN (?,..." placeholder list that could overflow the stack. */
+    size_t delete_sql_len = strlen("DELETE FROM event WHERE id IN (") +
+                            ids_count * 2 + 2;
+    char *delete_sql = (char *) malloc(delete_sql_len);
+    if (!delete_sql) {
+        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
+        free(ids);
+        return -1;
+    }
+    snprintf(delete_sql, delete_sql_len, "DELETE FROM event WHERE id IN (");
     for (size_t i = 0; i < ids_count; i++) {
         strcat(delete_sql, "?");
         if (i < ids_count - 1) strcat(delete_sql, ",");
@@ -452,6 +462,7 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
     stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, delete_sql, -1, &stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        free(delete_sql);
         for (size_t i = 0; i < ids_count; i++) free(ids[i]);
         free(ids);
         return -1;
@@ -464,12 +475,14 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
         sqlite3_finalize(stmt);
+        free(delete_sql);
         for (size_t i = 0; i < ids_count; i++) free(ids[i]);
         free(ids);
         return -1;
     }
     
     sqlite3_finalize(stmt);
+    free(delete_sql);
     
     int changes = sqlite3_changes(db_conn);
     for (size_t i = 0; i < ids_count; i++) free(ids[i]);
@@ -532,8 +545,18 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
         return 0;
     }
     
-    /* Delete the found events */
-    char delete_sql[1024] = "DELETE FROM event WHERE id IN (";
+    /* Delete the found events. The id list is unbounded (one entry per
+     * matching row), so size the SQL buffer dynamically instead of a fixed
+     * "... IN (?,..." placeholder list that could overflow the stack. */
+    size_t delete_sql_len = strlen("DELETE FROM event WHERE id IN (") +
+                            ids_count * 2 + 2;
+    char *delete_sql = (char *) malloc(delete_sql_len);
+    if (!delete_sql) {
+        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
+        free(ids);
+        return -1;
+    }
+    snprintf(delete_sql, delete_sql_len, "DELETE FROM event WHERE id IN (");
     for (size_t i = 0; i < ids_count; i++) {
         strcat(delete_sql, "?");
         if (i < ids_count - 1) strcat(delete_sql, ",");
@@ -543,6 +566,7 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
     stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, delete_sql, -1, &stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        free(delete_sql);
         for (size_t i = 0; i < ids_count; i++) free(ids[i]);
         free(ids);
         return -1;
@@ -555,12 +579,14 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
         sqlite3_finalize(stmt);
+        free(delete_sql);
         for (size_t i = 0; i < ids_count; i++) free(ids[i]);
         free(ids);
         return -1;
     }
     
     sqlite3_finalize(stmt);
+    free(delete_sql);
     
     int changes = sqlite3_changes(db_conn);
     for (size_t i = 0; i < ids_count; i++) free(ids[i]);
@@ -818,34 +844,52 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         param_t params[256];
         size_t param_count = 0;
         char conditions[2048] = "";
-        
-        /* Build WHERE clause */
+
+        /* Build WHERE clause. Every write to `conditions` and `params` below
+         * is bounds-checked: the per-field caps (<=256 each) multiply across
+         * fields and both buffers are shared, so each append must fail
+         * safely instead of assuming the caps guarantee enough room. */
         bool first = true;
-        
+
         if (filter->ids_count > 0) {
-            if (!first) strcat(conditions, " AND ");
+            bool ids_ok = true;
+            if (!first) ids_ok = conditions_append(conditions, sizeof(conditions), " AND ");
             first = false;
-            
+
             if (filter->ids_count == 1) {
-                strcat(conditions, "id = ?");
-                params[param_count].type = PARAM_TYPE_STRING;
-                params[param_count].value.string = filter->ids[0];
-                param_count++;
+                if (!conditions_append(conditions, sizeof(conditions), "id = ?")) ids_ok = false;
+                if (param_count >= 256) ids_ok = false;
+                if (ids_ok) {
+                    params[param_count].type = PARAM_TYPE_STRING;
+                    params[param_count].value.string = filter->ids[0];
+                    param_count++;
+                }
             } else {
-                strcat(conditions, "id IN (");
-                for (size_t i = 0; i < filter->ids_count; i++) {
-                    strcat(conditions, "?");
-                    if (i < filter->ids_count - 1) strcat(conditions, ",");
+                if (!conditions_append(conditions, sizeof(conditions), "id IN (")) ids_ok = false;
+                for (size_t i = 0; ids_ok && i < filter->ids_count; i++) {
+                    if (!conditions_append(conditions, sizeof(conditions),
+                                           i < filter->ids_count - 1 ? "?," : "?")) {
+                        ids_ok = false;
+                        break;
+                    }
+                    if (param_count >= 256) { ids_ok = false; break; }
                     params[param_count].type = PARAM_TYPE_STRING;
                     params[param_count].value.string = filter->ids[i];
                     param_count++;
                 }
-                strcat(conditions, ")");
+                if (ids_ok &&
+                    !conditions_append(conditions, sizeof(conditions), ")")) ids_ok = false;
+            }
+            if (!ids_ok) {
+                fprintf(stderr, "Error: ids filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
             }
         }
-        
+
         if (filter->authors_count > 0) {
-            if (!first) strcat(conditions, " AND ");
+            bool authors_ok = true;
+            if (!first) authors_ok = conditions_append(conditions, sizeof(conditions), " AND ");
             first = false;
 
             /* NIP-26: relays should answer {authors: [A]} by matching both
@@ -853,76 +897,113 @@ static bool send_records(send_records_callback_t sender, const char *sub,
              * SQL tags are stored as JSON text; delegation[1] is matched with
              * LIKE on a bounded pattern built from the author hex (safe: hex
              * only, fixed 64 chars). */
-            strcat(conditions, "(pubkey IN (");
-            for (size_t i = 0; i < filter->authors_count; i++) {
-                strcat(conditions, "?");
-                if (i < filter->authors_count - 1) strcat(conditions, ",");
+            if (!authors_ok ||
+                !conditions_append(conditions, sizeof(conditions), "(pubkey IN (")) authors_ok = false;
+            for (size_t i = 0; authors_ok && i < filter->authors_count; i++) {
+                if (!conditions_append(conditions, sizeof(conditions),
+                                       i < filter->authors_count - 1 ? "?," : "?")) {
+                    authors_ok = false;
+                    break;
+                }
+                if (param_count >= 256) { authors_ok = false; break; }
                 params[param_count].type = PARAM_TYPE_STRING;
                 params[param_count].value.string = filter->authors[i];
                 param_count++;
             }
-            strcat(conditions, ") OR id IN (SELECT event_id FROM delegation "
-                                  "WHERE delegator IN (");
+            if (authors_ok &&
+                !conditions_append(conditions, sizeof(conditions),
+                                   ") OR id IN (SELECT event_id FROM delegation "
+                                   "WHERE delegator IN (")) authors_ok = false;
             /* NIP-26: delegated events are resolved via the normalized
              * delegation table (indexed by delegator) instead of LIKE scans
              * over tags JSON. SQLite handles arbitrarily large author lists
              * in O(authors * log n); no cap is needed for scalability, and
              * the subquery adds no full-table scans. */
-            for (size_t i = 0; i < filter->authors_count; i++) {
-                strcat(conditions, "?");
-                if (i < filter->authors_count - 1) strcat(conditions, ",");
+            for (size_t i = 0; authors_ok && i < filter->authors_count; i++) {
+                if (!conditions_append(conditions, sizeof(conditions),
+                                       i < filter->authors_count - 1 ? "?," : "?")) {
+                    authors_ok = false;
+                    break;
+                }
+                if (param_count >= 256) { authors_ok = false; break; }
                 params[param_count].type = PARAM_TYPE_STRING;
                 params[param_count].value.string = filter->authors[i];
                 param_count++;
             }
-            strcat(conditions, "))");
+            if (authors_ok &&
+                !conditions_append(conditions, sizeof(conditions), "))")) authors_ok = false;
+            if (!authors_ok) {
+                fprintf(stderr, "Error: authors filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
+            }
         }
         
         if (filter->kinds_count > 0) {
-            if (!first) strcat(conditions, " AND ");
+            bool kinds_ok = true;
+            if (!first) kinds_ok = conditions_append(conditions, sizeof(conditions), " AND ");
             first = false;
-            
+
             if (filter->kinds_count == 1) {
-                strcat(conditions, "kind = ?");
-                params[param_count].type = PARAM_TYPE_NUMBER;
-                params[param_count].value.number = filter->kinds[0];
-                param_count++;
+                if (!conditions_append(conditions, sizeof(conditions), "kind = ?")) kinds_ok = false;
+                if (param_count >= 256) kinds_ok = false;
+                if (kinds_ok) {
+                    params[param_count].type = PARAM_TYPE_NUMBER;
+                    params[param_count].value.number = filter->kinds[0];
+                    param_count++;
+                }
             } else {
-                strcat(conditions, "kind IN (");
-                for (size_t i = 0; i < filter->kinds_count; i++) {
-                    strcat(conditions, "?");
-                    if (i < filter->kinds_count - 1) strcat(conditions, ",");
+                if (!conditions_append(conditions, sizeof(conditions), "kind IN (")) kinds_ok = false;
+                for (size_t i = 0; kinds_ok && i < filter->kinds_count; i++) {
+                    if (!conditions_append(conditions, sizeof(conditions),
+                                           i < filter->kinds_count - 1 ? "?," : "?")) {
+                        kinds_ok = false;
+                        break;
+                    }
+                    if (param_count >= 256) { kinds_ok = false; break; }
                     params[param_count].type = PARAM_TYPE_NUMBER;
                     params[param_count].value.number = filter->kinds[i];
                     param_count++;
                 }
-                strcat(conditions, ")");
+                if (kinds_ok &&
+                    !conditions_append(conditions, sizeof(conditions), ")")) kinds_ok = false;
+            }
+            if (!kinds_ok) {
+                fprintf(stderr, "Error: kinds filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
             }
         }
         
         if (filter->since > 0) {
-            if (!first) strcat(conditions, " AND ");
-            first = false;
-            
             char since_str[32];
             snprintf(since_str, sizeof(since_str), "created_at >= %lld",
                      (long long) filter->since);
-            strcat(conditions, since_str);
+            if ((!first && !conditions_append(conditions, sizeof(conditions), " AND ")) ||
+                !conditions_append(conditions, sizeof(conditions), since_str)) {
+                fprintf(stderr, "Error: since filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
+            }
+            first = false;
         }
         
         if (filter->until > 0) {
-            if (!first) strcat(conditions, " AND ");
-            first = false;
-            
             char until_str[32];
             snprintf(until_str, sizeof(until_str), "created_at <= %lld",
                      (long long) filter->until);
-            strcat(conditions, until_str);
+            if ((!first && !conditions_append(conditions, sizeof(conditions), " AND ")) ||
+                !conditions_append(conditions, sizeof(conditions), until_str)) {
+                fprintf(stderr, "Error: until filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
+            }
+            first = false;
         }
         
         if (filter->tags_count > 0) {
             bool tags_ok = true;
-            if (!first) strcat(conditions, " AND ");
+            if (!first && !conditions_append(conditions, sizeof(conditions), " AND ")) tags_ok = false;
             first = false;
             
             if (!conditions_append(conditions, sizeof(conditions), "(")) tags_ok = false;
@@ -952,10 +1033,24 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         }
         
         if (filter->search && strlen(filter->search) > 0) {
-            if (!first) strcat(conditions, " AND ");
+            if (param_count >= 256) {
+                fprintf(stderr, "Error: too many query parameters for search filter\n");
+                params_release(params, param_count);
+                return false;
+            }
+            if (!first && !conditions_append(conditions, sizeof(conditions), " AND ")) {
+                fprintf(stderr, "Error: search filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
+            }
+            if (!conditions_append(conditions, sizeof(conditions),
+                                   "content LIKE ? ESCAPE '\\'")) {
+                fprintf(stderr, "Error: search filter too large for query buffers\n");
+                params_release(params, param_count);
+                return false;
+            }
             first = false;
-            
-            strcat(conditions, "content LIKE ? ESCAPE '\\'");
+
             params[param_count].type = PARAM_TYPE_OWNED_STRING;
             char *escaped = escape_like(filter->search, strlen(filter->search));
             char pattern[512];
@@ -966,12 +1061,26 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         }
         
         if (strlen(conditions) > 0) {
-            strcat(sql, " WHERE ");
-            strcat(sql, conditions);
+            if (snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql),
+                         " WHERE %s", conditions) >= (int) sizeof(sql)) {
+                fprintf(stderr, "Error: query too large for SQL buffer\n");
+                params_release(params, param_count);
+                return false;
+            }
         }
         
         if (!do_count) {
-            strcat(sql, " ORDER BY created_at DESC LIMIT ?");
+            if (param_count >= 256) {
+                fprintf(stderr, "Error: too many query parameters\n");
+                params_release(params, param_count);
+                return false;
+            }
+            if (snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql),
+                         " ORDER BY created_at DESC LIMIT ?") >= (int) sizeof(sql)) {
+                fprintf(stderr, "Error: query too large for SQL buffer\n");
+                params_release(params, param_count);
+                return false;
+            }
             params[param_count].type = PARAM_TYPE_NUMBER;
             params[param_count].value.number = limit + 1;  /* Fetch one extra */
             param_count++;

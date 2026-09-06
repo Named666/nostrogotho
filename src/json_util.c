@@ -547,6 +547,22 @@ static bool is_hex_64(const char *s) {
     return s[64] == '\0';
 }
 
+/* is_lower_hex - Check that a string is exactly `len` lowercase hex characters
+ *
+ * Defense-in-depth at the json_parse_event trust boundary: NIP-01 requires
+ * `id`/`pubkey` to be 64-char and `sig` to be 128-char lowercase hex. Even
+ * though downstream hex_to_bytes/strcmp fail safely on malformed input,
+ * validate here so malformed events are rejected at parse time.
+ */
+static bool is_lower_hex(const char *s, size_t len) {
+    if (!s) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
 static bool append_string(char ***items, size_t *count, size_t alloc_size, const char *value) {
     if (*count >= alloc_size) {
         alloc_size = alloc_size == 0 ? 16 : alloc_size * 2;
@@ -751,6 +767,8 @@ bool json_parse_event(const char *json_str, event_t *event) {
     if (!id || !pubkey || !content || !sig || !tags.buf ||
         strlen(id) != MAX_ID_SIZE || strlen(pubkey) != MAX_PUBKEY_SIZE ||
         strlen(sig) != MAX_SIG_SIZE || tags.len > MAX_TAGS_SIZE ||
+        !is_lower_hex(id, MAX_ID_SIZE) || !is_lower_hex(pubkey, MAX_PUBKEY_SIZE) ||
+        !is_lower_hex(sig, MAX_SIG_SIZE) ||
         strlen(content) > MAX_CONTENT_SIZE || !mg_json_get_num(json, "$.created_at", &created_at) ||
         !mg_json_get_num(json, "$.kind", &kind) || created_at != (double)(time_t)created_at || kind != (int) kind ||
         !validate_event_tags(tags)) {
