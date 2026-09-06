@@ -86,6 +86,53 @@ filter_t *filter_alloc(void) {
     return f;
 }
 
+/* filter_release - Release a filter's dynamically allocated fields
+ *
+ * Frees ids/authors/kinds/tags/search and nulls them out. Does NOT free the
+ * filter_t struct itself, so it is safe for stack-allocated filters.
+ */
+void filter_release(filter_t *f) {
+    if (!f) return;
+
+    if (f->ids) {
+        for (size_t i = 0; i < f->ids_count; i++) {
+            free(f->ids[i]);
+        }
+        free(f->ids);
+        f->ids = NULL;
+        f->ids_count = 0;
+    }
+
+    if (f->authors) {
+        for (size_t i = 0; i < f->authors_count; i++) {
+            free(f->authors[i]);
+        }
+        free(f->authors);
+        f->authors = NULL;
+        f->authors_count = 0;
+    }
+
+    if (f->kinds) {
+        free(f->kinds);
+        f->kinds = NULL;
+        f->kinds_count = 0;
+    }
+
+    if (f->tags) {
+        for (size_t i = 0; i < f->tags_count; i++) {
+            tag_release(&f->tags[i]);
+        }
+        free(f->tags);
+        f->tags = NULL;
+        f->tags_count = 0;
+    }
+
+    if (f->search) {
+        free(f->search);
+        f->search = NULL;
+    }
+}
+
 /* filter_free - Free a filter and all its dynamically allocated memory
  * 
  * Recursively frees all arrays and strings within a filter:
@@ -100,36 +147,8 @@ filter_t *filter_alloc(void) {
  */
 void filter_free(filter_t *f) {
     if (!f) return;
-    
-    if (f->ids) {
-        for (size_t i = 0; i < f->ids_count; i++) {
-            free(f->ids[i]);
-        }
-        free(f->ids);
-    }
-    
-    if (f->authors) {
-        for (size_t i = 0; i < f->authors_count; i++) {
-            free(f->authors[i]);
-        }
-        free(f->authors);
-    }
-    
-    if (f->kinds) {
-        free(f->kinds);
-    }
-    
-    if (f->tags) {
-        for (size_t i = 0; i < f->tags_count; i++) {
-            tag_release(&f->tags[i]);
-        }
-        free(f->tags);
-    }
-    
-    if (f->search) {
-        free(f->search);
-    }
-    
+
+    filter_release(f);
     free(f);
 }
 

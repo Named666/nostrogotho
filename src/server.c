@@ -125,19 +125,6 @@ static void send_status(struct mg_connection *connection, const char *type,
     send_json(connection, json_builder_finish(&builder));
 }
 
-static void filter_release(filter_t *filter) {
-    if (!filter) return;
-    for (size_t i = 0; i < filter->ids_count; i++) free(filter->ids[i]);
-    for (size_t i = 0; i < filter->authors_count; i++) free(filter->authors[i]);
-    for (size_t i = 0; i < filter->tags_count; i++) {
-        for (size_t j = 0; j < filter->tags[i].count; j++) free(filter->tags[i].elements[j]);
-        free(filter->tags[i].elements);
-    }
-    free(filter->ids); free(filter->authors); free(filter->kinds);
-    free(filter->tags); free(filter->search);
-    memset(filter, 0, sizeof(*filter));
-}
-
 static void remove_subscriptions(struct mg_connection *connection, const char *id) {
     subscription_t **link = &subscriptions;
     while (*link) {

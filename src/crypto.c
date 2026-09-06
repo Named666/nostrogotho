@@ -74,29 +74,31 @@ static int hex_value(char c) {
 }
 
 /* json_escape_string - Escape a string for use in JSON
- * 
+ *
  * Escapes special JSON characters in a string so it can be safely
  * included in a JSON string literal (within double quotes).
- * 
+ *
  * Characters escaped:
  *   "  -> \"
  *   \  -> \\
- *   /  -> \/
  *   \b -> (backspace)
  *   \f -> (formfeed)
  *   \n -> (newline)
  *   \r -> (carriage return)
  *   \t -> (tab)
- * 
+ *
+ * NOTE: '/' is deliberately NOT escaped. This escaper produces the input to
+ * the event-id hash, which per NIP-01 must be the canonical serialization
+ * clients compute (JSON.stringify semantics: '/' stays literal). Escaping
+ * it made every event whose content contains '/' fail id verification.
+ *
  * Args:
  *   src - source string (must not be NULL)
  *   dst - destination buffer (must not be NULL)
  *   dst_size - size of destination buffer
- * 
+ *
  * Returns: number of bytes written (including null terminator),
  *          0 if buffer too small to fit escaped string
- * 
- * Note: Safe to use for event hashing as it doesn't change semantics
  */
 static size_t json_escape_string(const char *src, char *dst, size_t dst_size) {
     if (!src || !dst || dst_size == 0) return 0;
@@ -111,7 +113,6 @@ static size_t json_escape_string(const char *src, char *dst, size_t dst_size) {
         switch (c) {
             case '"':  escape = "\\\""; escape_len = 2; break;
             case '\\': escape = "\\\\"; escape_len = 2; break;
-            case '/':  escape = "\\/"; escape_len = 2; break;
             case '\b': escape = "\\b"; escape_len = 2; break;
             case '\f': escape = "\\f"; escape_len = 2; break;
             case '\n': escape = "\\n"; escape_len = 2; break;
@@ -585,7 +586,14 @@ bool check_event(const event_t *ev) {
         /* No tags, skip delegation check */
     } else {
         tags_array_t *tags = parse_tags_json(ev->tags_json);
-        if (tags) {
+        if (!tags) {
+            /* Fail closed: an unparseable tags blob must not skip
+             * delegation verification. Tags accepted by the parse-time
+             * gate always parse here, so this rejects only genuinely
+             * malformed input. */
+            return false;
+        }
+        {
             for (size_t i = 0; i < tags->count; i++) {
                 tag_t *tag = &tags->tags[i];
                 

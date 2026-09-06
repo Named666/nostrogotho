@@ -165,6 +165,14 @@ void event_free(event_t *ev);
  * Caller: must call filter_free() to release */
 filter_t *filter_alloc(void);
 
+/* filter_release - Release a filter's dynamically allocated fields
+ * Args: f - pointer to filter (NULL-safe)
+ * Note: Frees ids/authors/kinds/tags/search but does NOT free the filter_t
+ *       struct itself. Use this for stack-allocated filters (e.g. those
+ *       filled by json_parse_filter()). For heap-allocated filters from
+ *       filter_alloc(), use filter_free(). */
+void filter_release(filter_t *f);
+
 /* filter_free - Free a filter and all its dynamically allocated fields
  * Args: f - pointer to filter (NULL-safe)
  * Note: Recursively frees all string arrays and tag arrays */

@@ -23,6 +23,11 @@
 /* Maximum length for a single JSON string value */
 #define MAX_JSON_STRING_VALUE 65536
 
+/* Size of json_builder_t's internal buffer. Responses larger than this are
+ * impossible to render, so events whose serialization would exceed it must
+ * be rejected before they are stored or broadcast. */
+#define JSON_BUILDER_BUFFER_SIZE 65536
+
 /* ============================================================================
  * JSON Value Types
  * ============================================================================ */
@@ -256,11 +261,20 @@ bool json_parse_event(const char *json_str, event_t *event);
  * ============================================================================ */
 
 /* Serialize an event to JSON
- * 
+ *
  * Args:
  *   event - Event to serialize
  *   builder - JSON builder to append to
  */
 void json_serialize_event(const event_t *event, json_builder_t *builder);
+
+/* Exact size in bytes json_serialize_event() writes for this event
+ * (excluding the enclosing ["EVENT", sub, ...] wrapper).
+ *
+ * Callers can use this to reject, before storing or broadcasting, any event
+ * whose serialization could never fit JSON_BUILDER_BUFFER_SIZE -- such
+ * events would otherwise be truncated mid-JSON on delivery.
+ */
+size_t json_serialized_event_size(const event_t *event);
 
 #endif /* JSON_UTIL_H_ */

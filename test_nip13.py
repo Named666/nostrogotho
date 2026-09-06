@@ -25,7 +25,7 @@ from coincurve import PrivateKey
 
 PORT = 7449
 URI = f"ws://127.0.0.1:{PORT}"
-DIFFICULTY = 20
+DIFFICULTY = 16
 
 
 def leading_zero_bits(hex_str: str) -> int:

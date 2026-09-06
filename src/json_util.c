@@ -374,16 +374,23 @@ void json_builder_append_number(json_builder_t *builder, long long value) {
  *
  * Writes the escaped contents of `value` (without surrounding quotes) into
  * the builder. Escapes all characters required by the JSON spec: `"`, `\`,
- * `/`, `\b`, `\f`, `\n`, `\r`, `\t`, and any other control character as a
- * `\uXXXX` sequence. This is the single source of truth for string escaping
- * so that every serialized field (including event `content`) is emitted
- * correctly regardless of its contents.
+ * `\b`, `\f`, `\n`, `\r`, `\t`, and any other control character as a
+ * `\uXXXX` sequence.
+ *
+ * '/' is deliberately NOT escaped: it requires no escaping per RFC 8259,
+ * the canonical NIP-01 serialization (JSON.stringify) leaves it literal,
+ * and emitting "\/" breaks delivery because the bundled Mongoose
+ * mg_json_get_str() returns NULL for strings containing that escape.
+ *
+ * This is the single source of truth for string escaping so that every
+ * serialized field (including event `content`) is emitted correctly
+ * regardless of its contents.
  */
 static void json_builder_escape_string(json_builder_t *builder, const char *value) {
     for (size_t i = 0; value && value[i]; i++) {
         unsigned char c = (unsigned char)value[i];
 
-        if (c == '"' || c == '\\' || c == '/') {
+        if (c == '"' || c == '\\') {
             if (!json_builder_ensure_space(builder, 2)) return;
             builder->buffer[builder->pos++] = '\\';
             builder->buffer[builder->pos++] = c;
@@ -452,10 +459,25 @@ void json_builder_start_object(json_builder_t *builder) {
 
 void json_builder_object_key_string(json_builder_t *builder, const char *key, const char *value) {
     json_builder_add_comma(builder);
+    /* The key write must never run past the 64 KiB buffer: previously the
+     * guard only checked 4 bytes while snprintf was handed a fixed 128-byte
+     * budget, so keys written near the end of the buffer overflowed into
+     * adjacent memory (stack smash in send_records()/broadcast_event()). */
     if (!json_builder_ensure_space(builder, 4)) return;
-    
+
     builder->buffer[builder->pos++] = '"';
-    builder->pos += snprintf(&builder->buffer[builder->pos], 128, "%s\":", key);
+    if (json_builder_ensure_space(builder, 1)) {
+        int written = snprintf(&builder->buffer[builder->pos],
+                               sizeof(builder->buffer) - builder->pos,
+                               "%s\":", key);
+        if (written > 0) {
+            /* snprintf returns the would-be length, which can exceed what
+             * was actually written when truncated -- clamp so pos never
+             * passes the buffer end. */
+            size_t space = sizeof(builder->buffer) - builder->pos - 1;
+            builder->pos += ((size_t) written > space) ? space : (size_t) written;
+        }
+    }
     
     /* Append string value with full escaping */
     if (!json_builder_ensure_space(builder, 2)) return;
@@ -497,9 +519,17 @@ void json_builder_end_object(json_builder_t *builder) {
 }
 
 const char *json_builder_finish(json_builder_t *builder) {
-    if (json_builder_ensure_space(builder, 1)) {
+    if (json_builder_ensure_space(builder, 2)) {
         builder->buffer[builder->pos++] = ']';
         builder->buffer[builder->pos] = '\0';
+    } else if (json_builder_ensure_space(builder, 1)) {
+        builder->buffer[builder->pos++] = ']';
+        builder->buffer[builder->pos] = '\0';
+    } else {
+        /* Buffer completely full: overwrite the last content byte rather
+         * than returning an unterminated string (the old code could return
+         * a buffer without a NUL, causing an out-of-bounds strlen). */
+        builder->buffer[sizeof(builder->buffer) - 1] = '\0';
     }
     return builder->buffer;
 }
@@ -563,11 +593,21 @@ static bool is_lower_hex(const char *s, size_t len) {
     return true;
 }
 
-static bool append_string(char ***items, size_t *count, size_t alloc_size, const char *value) {
-    if (*count >= alloc_size) {
-        alloc_size = alloc_size == 0 ? 16 : alloc_size * 2;
-        *items = (char **) realloc(*items, alloc_size * sizeof(**items));
-        if (!*items) return false;
+/* append_string - Append `value` to a growable array of owned strings.
+ *
+ * `capacity` is in/out: the caller passes the current allocation size and it
+ * is updated here after every growth. The previous version passed it by
+ * value and recomputed it from a constant, so the array could never grow
+ * beyond 32 slots while callers allowed up to 256 entries — a heap buffer
+ * overflow reachable from a single REQ filter with >32 ids/authors.
+ */
+static bool append_string(char ***items, size_t *count, size_t *capacity, const char *value) {
+    if (*count >= *capacity) {
+        size_t new_capacity = *capacity == 0 ? 16 : *capacity * 2;
+        char **resized = (char **) realloc(*items, new_capacity * sizeof(**items));
+        if (!resized) return false;
+        *items = resized;
+        *capacity = new_capacity;
     }
     (*items)[*count] = string_dup(value);
     if (!(*items)[*count]) return false;
@@ -582,7 +622,7 @@ static bool parse_string_array(struct mg_str raw, char ***items, size_t *count,
     size_t alloc_size = 16;
     *items = (char **) calloc(alloc_size, sizeof(**items));
     if (!*items) return false;
-    
+
     while ((offset = mg_json_next(raw, offset, &key, &value)) != 0) {
         char *string;
         if (*count >= max_items || key.buf != NULL) {
@@ -603,7 +643,7 @@ static bool parse_string_array(struct mg_str raw, char ***items, size_t *count,
             *count = 0;
             return false;
         }
-        if (!append_string(items, count, alloc_size, string)) {
+        if (!append_string(items, count, &alloc_size, string)) {
             free(string);
             /* Free previously allocated strings on error */
             for (size_t i = 0; i < *count; i++) free((*items)[i]);
@@ -672,10 +712,16 @@ static bool validate_event_tags(struct mg_str tags) {
     while ((tag_offset = mg_json_next(tags, tag_offset, &key, &tag)) != 0) {
         struct mg_str element_key, element;
         size_t element_offset = 0;
+        size_t element_count = 0;
         if (key.buf != NULL || ++tag_count > 100 || tag.len < 2 || tag.buf[0] != '[') return false;
+        /* Per-tag element cap must match parse_tags_json() in crypto.c: its
+         * scanner aborts (returning NULL) beyond MAX_TAG_ELEMENTS elements,
+         * which used to silently skip delegation-tag verification while the
+         * mongoose-based tag lookups still honored the tag. Keep both
+         * parsers in lockstep so anything accepted here is fully scanned. */
         while ((element_offset = mg_json_next(tag, element_offset, &element_key, &element)) != 0) {
             char *string;
-            if (element_key.buf != NULL) return false;
+            if (element_key.buf != NULL || ++element_count > MAX_TAG_ELEMENTS) return false;
             string = json_raw_string(element);
             if (!string || strlen(string) > MAX_TAG_SIZE) {
                 free(string);
@@ -790,6 +836,46 @@ bool json_parse_event(const char *json_str, event_t *event) {
         return false;
     }
     return true;
+}
+
+/* escaped_length - Number of bytes json_builder_escape_string writes for s */
+static size_t escaped_length(const char *s) {
+    size_t n = 0;
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char) *s;
+        if (c == '"' || c == '\\' || c == '\b' || c == '\f' ||
+            c == '\n' || c == '\r' || c == '\t') {
+            n += 2;
+        } else if (c < 0x20) {
+            n += 6;
+        } else {
+            n += 1;
+        }
+    }
+    return n;
+}
+
+size_t json_serialized_event_size(const event_t *event) {
+    if (!event) return 0;
+    /* Mirror json_serialize_event() segment by segment:
+     *   {"id":"<id>","pubkey":"<pubkey>","created_at":N,"kind":N,
+     *    "tags":<tags>,"content":"<content>","sig":"<sig>"}
+     * Each segment is: comma + '"<key>":' + quotes + value length. */
+    char num[32];
+    int written;
+
+    size_t n = 1; /* '{' */
+    n += 5 + 1 + escaped_length(event->id) + 1;           /* "id": */
+    n += 1 + 9 + 1 + escaped_length(event->pubkey) + 1;   /* "pubkey": */
+    written = snprintf(num, sizeof(num), "%lld", (long long) event->created_at);
+    n += 1 + 13 + (size_t) (written > 0 ? written : 20);  /* "created_at": */
+    written = snprintf(num, sizeof(num), "%d", event->kind);
+    n += 1 + 7 + (size_t) (written > 0 ? written : 11);   /* "kind": */
+    n += 1 + 7 + (event->tags_json ? event->tags_json_len : 4); /* "tags": or null */
+    n += 1 + 10 + 1 + escaped_length(event->content ? event->content : "") + 1;
+    n += 1 + 6 + 1 + escaped_length(event->sig) + 1;      /* "sig": */
+    n += 1; /* '}' */
+    return n;
 }
 
 void json_serialize_event(const event_t *event, json_builder_t *builder) {

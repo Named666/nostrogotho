@@ -142,6 +142,18 @@ nip01_process_result_t nip01_process_event(
                 "invalid: content too large");
         return result;
     }
+
+    /* Step 2b: Reject events whose serialization can never fit the fixed
+     * 64 KiB response buffer. Without this, such events are accepted and
+     * stored but are truncated mid-JSON (i.e. delivered as garbage) on
+     * every later query or broadcast. The 160-byte margin covers the
+     * ["EVENT","<sub id up to 100 chars>",...] wrapper. */
+    if (json_serialized_event_size(event) + 160 > JSON_BUILDER_BUFFER_SIZE) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "invalid: event serialization too large");
+        return result;
+    }
     
     /* Step 3: Check timestamp limits */
     time_t now = time(NULL);

@@ -930,8 +930,12 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 params[param_count].value.string = filter->authors[i];
                 param_count++;
             }
+            /* Three closes: delegator IN-list, the delegation subquery, and
+             * the outer "(pubkey IN (...) OR ...)" group. The previous
+             * version emitted only "))", leaving the group open and making
+             * every query that used an authors filter fail to prepare. */
             if (authors_ok &&
-                !conditions_append(conditions, sizeof(conditions), "))")) authors_ok = false;
+                !conditions_append(conditions, sizeof(conditions), ")))")) authors_ok = false;
             if (!authors_ok) {
                 fprintf(stderr, "Error: authors filter too large for query buffers\n");
                 params_release(params, param_count);
