@@ -1196,7 +1196,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
  *     with {authors: [A]} resolve delegated events via index lookups
  *     instead of full-table LIKE scans over tags JSON.
  * Page size:
- *   - PRAGMA page_size = 65536 (~64KB) set before any table exists; larger
+ *   - PRAGMA page_size = 1048576 (~1MB) set before any table exists; larger
  *     pages reduce B-tree depth and I/O for big events (content + tags JSON
  *     can be tens of KB each). Existing databases keep their page size,
  *     which SQLite fixes at first table creation.
@@ -1219,13 +1219,13 @@ static bool storage_init_sqlite3(const char *dsn) {
     }
     
     /* Page size must be set before the first table is created (it is baked
-     * into the database file on creation). 64KB is the SQLite maximum and
+     * into the database file on creation). 1MB is the SQLite maximum and
      * suits large Nostr payloads; existing databases keep their page size. */
     const char *pragmas_sql =
-        "PRAGMA page_size = 65536;"
+        "PRAGMA page_size = 1048576;"
         "PRAGMA journal_mode = WAL;"
-        "PRAGMA busy_timeout = 5000;"
         "PRAGMA synchronous = NORMAL;"
+        "PRAGMA busy_timeout = 5000;"
         "PRAGMA cache_size = -262144;"
         "PRAGMA foreign_keys = true;"
         "PRAGMA temp_store = memory;";

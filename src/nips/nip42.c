@@ -1,10 +1,16 @@
+#ifdef _WIN32
 #include <winsock2.h>
 #include <windows.h>
 #include <bcrypt.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifndef _WIN32
+#include <sys/random.h>
+#include <errno.h>
+#endif
 #include "crypto.h"
 #include "nip42.h"
 #include "nip_event.h"
@@ -19,6 +25,36 @@ typedef struct nip42_client {
 
 static nip42_client_t *clients;
 
+/* nip42_random_bytes - Fill a buffer with cryptographically-strong random
+ * bytes. Uses BCryptGenRandom on Windows, getrandom(2) on Linux, and falls
+ * back to /dev/urandom. Returns false if no source is available. */
+static bool nip42_random_bytes(unsigned char *buf, size_t len) {
+#ifdef _WIN32
+    return BCryptGenRandom(NULL, buf, (ULONG)len,
+                           BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+#else
+    size_t filled = 0;
+#ifdef __linux__
+    while (filled < len) {
+        ssize_t n = getrandom(buf + filled, len - filled, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break; /* fall back to /dev/urandom */
+        }
+        filled += (size_t)n;
+    }
+#endif
+    if (filled < len) {
+        FILE *urandom = fopen("/dev/urandom", "rb");
+        if (!urandom) return false;
+        size_t got = fread(buf + filled, 1, len - filled, urandom);
+        fclose(urandom);
+        if (got != len - filled) return false;
+    }
+    return true;
+#endif
+}
+
 static nip42_client_t *find_client(struct mg_connection *connection) {
     for (nip42_client_t *client = clients; client; client = client->next) {
         if (client->connection == connection) return client;
@@ -29,7 +65,7 @@ static nip42_client_t *find_client(struct mg_connection *connection) {
 bool nip42_open(struct mg_connection *connection, char challenge[17]) {
     unsigned char random[8];
     nip42_client_t *client = calloc(1, sizeof(*client));
-    if (!client || BCryptGenRandom(NULL, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    if (!client || !nip42_random_bytes(random, sizeof(random))) {
         free(client);
         return false;
     }
@@ -67,7 +103,7 @@ const char *nip42_authenticated_pubkey(struct mg_connection *connection) {
 bool nip42_open_challenge(struct mg_connection *connection, char challenge[17]) {
     unsigned char random[8];
     nip42_client_t *client = find_client(connection);
-    if (!client || BCryptGenRandom(NULL, random, sizeof(random), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    if (!client || !nip42_random_bytes(random, sizeof(random))) {
         return false;
     }
     for (size_t index = 0; index < sizeof(random); index++) {

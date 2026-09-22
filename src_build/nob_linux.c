@@ -6,31 +6,13 @@
 #include <string.h>
 
 /* ============================================================================
- * Build configuration for the nostrogotho relay.
+ * Linux build target for the nostrogotho relay.
  *
  * The NIP set is discovered automatically: every *.c in SRC_FOLDER"nips/" is a
  * self-registering plugin (see src/nips/nip_plugin.h) and is compiled into the
  * binary. Dropping a file into that folder enables a NIP; deleting a file
  * removes it — no edits to this build script or to server.c are needed.
- *
- * Build target is selected via the NOB_TARGET environment variable or
- * compiled-in default (win on _WIN32, linux otherwise). Valid values:
- *   "win"  -> use src_build/nob_win.c
- *   "linux"-> use src_build/nob_linux.c
  * ============================================================================ */
-
-#ifndef NOB_TARGET
-/* Auto-detect based on the platform the compiled binary runs on. */
-#ifdef _WIN32
-#define NOB_TARGET "win"
-#else
-#define NOB_TARGET "linux"
-#endif /* _WIN32 */
-#endif
-
-#if NOB_TARGET != "win" && NOB_TARGET != "linux"
-#error "NOB_TARGET must be either \"win\" or \"linux\""
-#endif
 
 int main(void)
 {
@@ -38,7 +20,7 @@ int main(void)
     const char *output_path = BUILD_FOLDER"main";
     nob_cc(&cmd);
     nob_cc_flags(&cmd);
-    nob_cmd_append(&cmd, "-std=c99", "-DSECP256K1_STATIC",
+    nob_cmd_append(&cmd, "-std=c99", "-D_GNU_SOURCE", "-DSECP256K1_STATIC",
                    "-DENABLE_MODULE_ECDH=1", "-DENABLE_MODULE_EXTRAKEYS=1",
                    "-DENABLE_MODULE_SCHNORRSIG=1", "-DENABLE_MODULE_MUSIG=1",
                    "-DENABLE_MODULE_ELLSWIFT=1",
@@ -64,8 +46,7 @@ int main(void)
                   THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult_gen.c");
 
     /* NIP plugins: glob every *.c under src/nips/ so the compiled feature set
-     * always matches the files present. nip01.c is the protocol core and is
-     * required for the relay to function; the rest are optional plugins. */
+     * always matches the files present. */
     const char *nips_dir = SRC_FOLDER"nips/";
     File_Paths nips = {0};
     if (!read_entire_dir(nips_dir, &nips)) {
@@ -82,13 +63,7 @@ int main(void)
     }
     free(nips.items);
 
-    /* Link according to the selected target. */
-#if NOB_TARGET == "win"
-    nob_cmd_append(&cmd, "-lbcrypt", "-lws2_32", "-lwinpthread");
-#else
     nob_cmd_append(&cmd, "-lpthread", "-lm", "-ldl");
-#endif
-
     if (!cmd_run(&cmd)) return 1;
     return 0;
 }

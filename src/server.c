@@ -17,7 +17,7 @@
 #define MAX_FILTERS 10
 #define MAX_SUB_ID_LENGTH 100
 #define MAX_WS_MESSAGE_LENGTH (5 * 1024 * 1024)
-#define MAX_EVENT_CONTENT_LENGTH 16384
+#define MAX_EVENT_CONTENT_LENGTH (16 * 1024)
 #define MAX_EVENT_TAGS 100    /* matches validate_event_tags() in json_util.c */
 #define MAX_LIMIT 500         /* matches filter limit clamp in json_parse_filter() */
 
