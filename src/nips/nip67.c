@@ -38,7 +38,9 @@ char *nip67_build_eose_response_ex(const char *sub_id, bool has_more,
     return string_dup(result);
 }
 
-static char *nip67_plugin_build_eose(const char *sub, bool has_more, bool auth_hint) {
+static char *nip67_plugin_build_eose(const char *sub, bool has_more, bool auth_hint,
+                                     void *ctx) {
+    (void) ctx;
     return nip67_build_eose_response_ex(sub, has_more, auth_hint);
 }
 

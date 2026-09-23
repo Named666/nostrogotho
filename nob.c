@@ -2,10 +2,41 @@
 #define NOB_STRIP_PREFIX
 #include "nob.h"
 #include "src_build/folders.h"
+#include <string.h>
+
+/* ============================================================================
+ * Build dispatcher.
+ *
+ *   nob            -> auto-detect the host OS and build for it
+ *   nob win        -> force the Windows build (src_build/nob_win.c)
+ *   nob linux      -> force the Linux build   (src_build/nob_linux.c)
+ * ============================================================================ */
 
 int main(int argc, char **argv)
 {
     NOB_GO_REBUILD_URSELF_PLUS(argc, argv, "nob.h", "src_build/folders.h");
+
+    /* Parse the target argument: "win" or "linux". Anything else falls back
+     * to auto-detection based on the compiler's host target. */
+    int want_win = -1; /* -1 = auto */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "win") == 0)        want_win = 1;
+        else if (strcmp(argv[i], "linux") == 0) want_win = 0;
+        else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            nob_log(INFO, "Usage: nob [win|linux]");
+            nob_log(INFO, "  (no argument)  auto-detect host OS");
+            return 0;
+        }
+    }
+    if (want_win < 0) {
+#ifdef _WIN32
+        want_win = 1;
+#else
+        want_win = 0;
+#endif
+        nob_log(INFO, "No target specified; auto-detected: %s",
+                want_win ? "win" : "linux");
+    }
 
     if (!nob_mkdir_if_not_exists(BUILD_FOLDER)) return 1;
 
@@ -35,7 +66,10 @@ int main(int argc, char **argv)
 #else
     const char *executable_path = output_path;
 #endif
-    const char *input_path = SRC_BUILD_FOLDER"nob_configed.c";
+    const char *input_path = want_win ? SRC_BUILD_FOLDER"nob_win.c"
+                                      : SRC_BUILD_FOLDER"nob_linux.c";
+    nob_log(INFO, "Building target: %s (%s)", want_win ? "win" : "linux", input_path);
+
     nob_cc(&cmd);
     nob_cmd_append(&cmd, "-I.", "-I"BUILD_FOLDER, "-I"SRC_BUILD_FOLDER); // -I is usually the same across all compilers
     nob_cc_output(&cmd, output_path);

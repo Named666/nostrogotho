@@ -75,7 +75,9 @@ int main(void)
     for (size_t i = 0; i < nips.count; i++) {
         const char *name = path_name(nips.items[i]);
         size_t len = strlen(name);
-        if (len > 2 && strcmp(name + len - 2, ".c") == 0) {
+        /* nip_template.c is a developer scaffold, not a real plugin. */
+        if (len > 2 && strcmp(name + len - 2, ".c") == 0 &&
+            strcmp(name, "nip_template.c") != 0) {
             /* read_entire_dir returns bare names; rebuild a full path. */
             nob_cmd_append(&cmd, nob_temp_sprintf("%s%s", nips_dir, name));
         }

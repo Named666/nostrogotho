@@ -4,32 +4,76 @@
 Mongoose for HTTP/WebSocket transport and bundled libsecp256k1 for Schnorr
 signature verification. The current build targets Windows with GCC/MinGW.
 
-## Run A Relay
+## Repository Structure
 
-1. Clone the repository with `thirdparty/` intact.
-2. From the repository root, build the two-stage `nob` driver and relay:
+```
+nostrogotho/
+├── .git/                    Version control
+├── .venv/                   Python virtual environment
+├── build/                   Generated build output
+├── nob.c                    Two-stage build driver
+├── nob.h                    Nob header
+├── nostrogotho.sqlite       SQLite database (WAL mode)
+├── nob.c README.md          Nob build system documentation
+├── QUICKSTART.md            Quick start guide
+├── README.md                Project overview and NIP support
+├── NOSTR_COMPATABILITY.md   NIP implementation status (living document)
+├── INDEX.md                 Documentation index
+├── TODO.md                  TODO list
+├── src/                     Source code (C99)
+│   ├── nostrogotho.h/c      Core data structures
+│   ├── crypto.h/c           Cryptographic ops
+│   ├── storage.h/c          SQLite3 layer
+│   ├── server.c             WebSocket server + NIP plugins
+│   └── main.c               Example main entry point
+├── thirdparty/              Bundled dependencies
+│   ├── sqlite3.c/h          SQLite3 amalgamation
+│   ├── mongoose/            WebSocket library
+│   └── secp256k1/           Schnorr signature library
+└── src/nips/                NIP protocol plugins
+    ├── nip01.c/h            Basic Protocol Flow
+    ├── nip09.c/h            Event Deletion Request
+    ├── nip11.c/h            Relay Information Document
+    ├── nip13.c/h            Proof of Work
+    ├── nip17.c/h            Private Direct Messages
+    ├── nip26.c/h            Delegated Event Signing
+    ├── nip40.c/h            Expiration Timestamp
+    ├── nip42.c/h            Client Authentication
+    ├── nip45.c/h            Event Counts
+    ├── nip62.c/h            Request to Vanish
+    ├── nip67.c/h            EOSE Completeness Hint
+    ├── nip_event.c/h        Shared event-tag inspection
+    └── nip_plugin.c/h       Plugin registration architecture
+```
 
-   ```powershell
-   gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
-   .\nob.exe
-   ```
+## Quick Build & Run (Windows PowerShell)
 
-3. Run the generated executable:
+```powershell
+# Build the nob driver
+gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
 
-   ```powershell
-   .\build\main.exe -service-url wss://relay.example.com
-   ```
+# Run the nob builder
+.\nob.exe
 
-The default listener is `0.0.0.0:7447`; the default database is
-`./nostrogotho.sqlite`. Put public relays behind a TLS-terminating reverse proxy
-and configure the external `wss://` address with `-service-url`.
+# Run the relay with default settings
+.\build\main.exe
 
-See [QUICKSTART.md](QUICKSTART.md) for local setup and deployment guidance.
+# Or with custom service URL
+.\build\main.exe -service-url wss://relay.example.com
+```
+
+**Default listener:** `0.0.0.0:7447`
+**Default database:** `./nostrogotho.sqlite`
+
+Put public relays behind a TLS-terminating reverse proxy and configure the external
+`wss://` address with `-service-url`.
+
+See [QUICKSTART.md](QUICKSTART.md) for detailed local setup and deployment guidance.
 
 ## Configuration
 
-| Option | Environment | Default | Description |
-| --- | --- | --- | --- |
+| Option | Environment Variable | Default | Description |
+|--------|---------------------|---------|-------------|
 | `-database PATH`, `--db PATH` | `DATABASE_URL` | `./nostrogotho.sqlite` | SQLite database path or URI. |
 | `-port PORT`, `--port PORT` | None | `7447` | Listener TCP port. |
 | `-service-url URL` | `SERVICE_URL` | Empty | Public URL used by NIP-42 and NIP-62. |
@@ -39,23 +83,27 @@ See [QUICKSTART.md](QUICKSTART.md) for local setup and deployment guidance.
 
 Run `.\build\main.exe --help` for the built executable's options.
 
-## NIP Support
+## NIP Support Status
 
-| NIP | Status | Behavior |
-| --- | --- | --- |
-| NIP-01 | Supported | Validates signed events and supports `EVENT`, `REQ`, `CLOSE`, `NOTICE`, `OK`, `EVENT`, and `EOSE` frames. |
-| NIP-09 | Supported | Processes event-ID and addressable-event deletion requests, including gift-wrap recipient authorization. |
-| NIP-11 | Supported | Serves relay metadata for requests accepting `application/nostr+json`. |
-| NIP-13 | Supported | Enforces configurable proof of work. |
-| NIP-16 | Supported | Replaces older replaceable events. |
-| NIP-17 | Supported | Restricts gift-wrap delivery to NIP-42-authenticated `p`-tag recipients. |
-| NIP-26 | Supported | Verifies delegation signatures and supported conditions. |
-| NIP-33 | Supported | Replaces parameterized replaceable events by `d` tag. |
-| NIP-40 | Supported | Omits expired events from stored queries. |
-| NIP-42 | Supported | Issues random challenges and validates signed client authentication events. |
-| NIP-45 | Supported | Handles `COUNT` queries. |
-| NIP-62 | Supported | Processes vanish events targeting this relay or `ALL_RELAYS`. |
-| NIP-67 | Supported | Adds `more` or `finish` EOSE completeness hints. |
+The relay implements 13 NIPs. Status as of the 2026-09-03 audit:
+
+| NIP | Title | Status | Wired into server |
+|-----|-------|--------|-------------------|
+| 01 | Basic Protocol Flow | ✅ Complete | Yes |
+| 09 | Event Deletion Request | ✅ Complete | Yes |
+| 11 | Relay Information Document | ✅ Complete | Yes (HTTP) |
+| 13 | Proof of Work | ✅ Complete | Yes |
+| 16 | Event Treatment | ✅ Complete (→ NIP-01) | Yes |
+| 17 | Private Direct Messages | ✅ Complete | Yes |
+| 26 | Delegated Event Signing | ✅ Complete | Yes |
+| 33 | Parameterized Replaceable Events | ✅ Complete (→ NIP-01) | Yes |
+| 40 | Expiration Timestamp | ✅ Complete | Yes |
+| 42 | Client Authentication | ✅ Complete | Yes |
+| 45 | Event Counts | ✅ Complete | Yes |
+| 62 | Request to Vanish | ✅ Complete | Yes |
+| 67 | EOSE Completeness Hint | ✅ Complete | Yes |
+
+**Target `supported_nips`:** `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62, 67]`
 
 ## Limits And Operations
 
@@ -76,11 +124,8 @@ Run `.\build\main.exe --help` for the built executable's options.
 | [API_REFERENCE.md](API_REFERENCE.md) | Public C data structures and interfaces. |
 | [NOSTR.md](NOSTR.md) | Nostr message types and supported-NIP reference. |
 
-The build definition is [src_build/nob_configed.c](src_build/nob_configed.c).
-Before submitting a change, run the validation command in
-[IMPLEMENTATION.md](IMPLEMENTATION.md).# nostrogotho
-A Nostr relay server written in C99 using bundled mongoose, secp256k1,
-SQLite, and OpenSSL sources.
+The build definition uses [nob](nob.c). Before submitting a change, run the
+validation command in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## Capabilities
 
@@ -90,32 +135,29 @@ and creation timestamps. Filters support ID and author prefixes, kinds, tags,
 time ranges, and content search; stored events are delivered before EOSE.
 
 | NIP | Status | Relay support |
-| --- | --- | --- |
-| NIP-01 | Supported | Validates event IDs and Schnorr signatures; accepts publishes, queries, subscriptions, closes, notices, `OK`, and EOSE responses. |
-| NIP-09 | Supported | Processes deletion requests for event IDs and addressable-event coordinates, including recipient-authorized gift-wrap deletion. |
-| NIP-11 | Supported | Returns a relay information document when clients request `application/nostr+json`. |
-| NIP-13 | Supported | Enforces an optional, configurable minimum proof-of-work difficulty. |
-| NIP-16 | Supported | Replaces older events for replaceable event kinds. |
-| NIP-17 | Supported | Restricts gift-wrap delivery, including stored query replay, to authenticated `p`-tag recipients. |
-| NIP-26 | Supported | Verifies delegation signatures and delegation conditions. |
-| NIP-33 | Supported | Replaces parameterized replaceable events using their `d` tag. |
-| NIP-40 | Supported | Omits expired events from stored event queries. |
-| NIP-42 | Supported | Issues cryptographically random challenges and verifies signed client authentication events. |
-| NIP-45 | Supported | Handles `COUNT` queries. |
-| NIP-62 | Supported | Processes Request to Vanish events targeting this relay or `ALL_RELAYS`. |
-| NIP-67 | Supported | Emits an EOSE completeness hint when a query exceeds its configured limit. |
-
-Runtime configuration supports the database path, listener port, public service
-URL, proof-of-work difficulty, and accepted `created_at` window through
-command-line arguments or environment variables.
+|-----|--------|---------------|
+| 01 | Supported | Validates event IDs and Schnorr signatures; accepts publishes, queries, subscriptions, closes, notices, `OK`, and EOSE responses. |
+| 09 | Supported | Processes deletion requests for event IDs and addressable-event coordinates, including recipient-authorized gift-wrap deletion. |
+| 11 | Supported | Returns a relay information document when clients request `application/nostr+json`. |
+| 13 | Supported | Enforces an optional, configurable minimum proof-of-work difficulty. |
+| 16 | Supported | Replaces older events for replaceable event kinds. |
+| 17 | Supported | Restricts gift-wrap delivery, including stored query replay, to authenticated `p`-tag recipients. |
+| 26 | Supported | Verifies delegation signatures and delegation conditions. |
+| 33 | Supported | Replaces parameterized replaceable events using their `d` tag. |
+| 40 | Supported | Omits expired events from stored event queries. |
+| 42 | Supported | Issues cryptographically random challenges and verifies signed client authentication events. |
+| 45 | Supported | Handles `COUNT` queries. |
+| 62 | Supported | Processes Request to Vanish events targeting this relay or `ALL_RELAYS`. |
+| 67 | Supported | Emits an EOSE completeness hint when a query exceeds its configured limit. |
+| AC | Supported | Handled WebRTC signaling for peer-to-peer communication. |
 
 ## Protocol Modules
 
 Protocol policy is isolated under [src/nips](src/nips). `server.c` owns the
 Mongoose event loop, WebSocket framing, subscription lifecycle, and dispatch;
-NIP modules own protocol-specific decisions. Every supported server-side NIP
-has its own implementation and header: `nip09`, `nip11`, `nip13`, `nip16`,
-`nip17`, `nip33`, and `nip62`. Shared event-tag inspection lives in
+NIP modules own protocol-specific decisions. Every supported server-side NIP has
+its own implementation and header: `nip09`, `nip11`, `nip13`, `nip17`, `nip33`,
+`nip62`, and `nip40`/`nip45`/`nip67`. Shared event-tag inspection lives in
 `nip_event`. Add new NIP behavior in this directory and expose a small,
 documented interface rather than growing the transport loop.
 
@@ -138,8 +180,7 @@ large-scale social network. They are future work, not current support claims.
 
 ## Build
 
-The project uses [nob](nob.c) and GCC; it does not use a project CMake build.
-Build the bootstrap executable and invoke it from the repository root:
+The project uses [nob](nob.c) and GCC; it does not use a project CMake build. Build the bootstrap executable and invoke it from the repository root:
 
 ```powershell
 gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe

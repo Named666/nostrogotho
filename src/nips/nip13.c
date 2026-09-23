@@ -69,14 +69,17 @@ bool nip13_meets_difficulty(const event_t *event, int minimum_difficulty) {
  * were.
  * ============================================================================ */
 
-static void nip13_plugin_init(const relay_config_t *config) {
+static void nip13_plugin_init(const relay_config_t *config, void *ctx) {
+    (void) ctx;
     nip13_min_difficulty = config->min_pow_difficulty;
 }
 
 static bool nip13_accept_publish(struct mg_connection *connection,
                                  const event_t *event,
-                                 char *reason, size_t reason_size) {
+                                 char *reason, size_t reason_size,
+                                 void *ctx) {
     (void) connection;
+    (void) ctx;
     if (nip13_min_difficulty <= 0) return true;
 
     int committed = nip13_committed_target(event);

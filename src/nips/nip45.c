@@ -29,7 +29,8 @@ char *nip45_build_count_response(const char *sub_id, unsigned long count) {
     return string_dup(result);
 }
 
-static char *nip45_plugin_build_count(const char *sub, unsigned long count) {
+static char *nip45_plugin_build_count(const char *sub, unsigned long count, void *ctx) {
+    (void) ctx;
     return nip45_build_count_response(sub, count);
 }
 

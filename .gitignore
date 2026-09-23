@@ -7,3 +7,5 @@ build/
 *.exe
 *.dll
 *.so
+*.old
+TODO.md

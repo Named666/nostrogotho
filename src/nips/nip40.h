@@ -28,19 +28,6 @@
  */
 bool nip40_event_is_expired(const event_t *event);
 
-/* nip40_is_expired - Parsed-tags variant used by the storage layer.
- *
- * Searches a parsed tags array for an ["expiration", "<timestamp>"] tag and
- * checks if the current time has passed that timestamp.
- *
- * Args:
- *   tags - parsed tags array (NULL-safe, returns false if NULL)
- *
- * Returns:
- *   true if a tag named "expiration" carries a timestamp <= now
- */
-bool nip40_is_expired(const tags_array_t *tags);
-
 /* nip40_garbage_collect - Background sweep of NIP-40 expired events.
  *
  * Runs inside the single-threaded event loop and asks the storage layer (arg)

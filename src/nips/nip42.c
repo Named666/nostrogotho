@@ -137,7 +137,8 @@ bool nip42_authenticate(struct mg_connection *connection, const event_t *event,
 
 static char nip42_service_url[256];
 
-static void nip42_plugin_init(const relay_config_t *config) {
+static void nip42_plugin_init(const relay_config_t *config, void *ctx) {
+    (void) ctx;
     snprintf(nip42_service_url, sizeof(nip42_service_url), "%s",
              config->service_url ? config->service_url : "");
 }
@@ -146,7 +147,9 @@ static void nip42_plugin_init(const relay_config_t *config) {
  * connection whose pubkey matches the event author. */
 static bool nip42_plugin_accept_publish(struct mg_connection *connection,
                                         const event_t *event,
-                                        char *reason, size_t reason_size) {
+                                        char *reason, size_t reason_size,
+                                        void *ctx) {
+    (void) ctx;
     if (!nip_event_has_tag(event, "-", NULL)) return true;
 
     const char *auth_pubkey = nip42_authenticated_pubkey(connection);
@@ -163,7 +166,9 @@ static bool nip42_plugin_accept_publish(struct mg_connection *connection,
 }
 
 static bool nip42_plugin_on_message(struct mg_connection *connection,
-                                    json_value_t *values, size_t count) {
+                                    json_value_t *values, size_t count,
+                                    void *ctx) {
+    (void) ctx;
     const char *method = json_array_get_string(values, count, 0);
     if (!method || strcmp(method, "AUTH") != 0) return false;
 
@@ -189,7 +194,8 @@ static bool nip42_plugin_on_message(struct mg_connection *connection,
     return true;
 }
 
-static void nip42_plugin_on_connect(struct mg_connection *connection) {
+static void nip42_plugin_on_connect(struct mg_connection *connection, void *ctx) {
+    (void) ctx;
     char challenge[17];
     if (!nip42_open(connection, challenge)) return;
     json_builder_t builder;
@@ -199,7 +205,8 @@ static void nip42_plugin_on_connect(struct mg_connection *connection) {
     nip_plugin_send_json(connection, json_builder_finish(&builder));
 }
 
-static void nip42_plugin_on_disconnect(struct mg_connection *connection) {
+static void nip42_plugin_on_disconnect(struct mg_connection *connection, void *ctx) {
+    (void) ctx;
     nip42_close(connection);
 }
 

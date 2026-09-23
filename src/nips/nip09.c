@@ -5,6 +5,7 @@
 #include "nip09.h"
 #include "nip_event.h"
 #include "nip01.h"
+#include "nip_plugin.h"
 
 /* ---------------------------------------------------------------------------
  * NIP-09 — Event Deletion Request
@@ -196,25 +197,36 @@ static nip01_process_result_t nip09_listener(
     (void)connection;
     (void)relay_url;
 
-    nip01_process_result_t result = {0};
-
     if (!storage) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: storage unavailable");
-        return result;
+        return nip_plugin_reject("error: storage unavailable");
     }
 
     bool deleted = nip09_delete_targets(event, storage);
-    result.accepted = true;
-    result.should_broadcast = false;  /* Deletion events are typically not broadcast */
-    snprintf(result.response_msg, sizeof(result.response_msg), "%s",
-            deleted ? "" : "deletion failed");
-
+    /* Deletion events are accepted but not broadcast (NIP-09). */
+    nip01_process_result_t result = nip_plugin_store_only(storage, event);
+    if (result.accepted && !deleted) {
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                 "deletion failed");
+    }
     return result;
 }
 
-/* Auto-register this NIP's listener at program startup */
+/* ============================================================================
+ * Plugin registration
+ *
+ * NIP-09 listens for kind 5 (Event Deletion) events. Declaring the kind in
+ * the plugin struct is the only wiring needed — nip_plugin_register() hands
+ * it to the NIP-01 dispatcher.
+ * ============================================================================ */
+
+static nip_plugin_t nip09_plugin = {
+    .name = "nip09",
+    .kinds = { NIP_PLUGIN_KIND(5) },
+    .kinds_count = 1,
+    .on_event = nip09_listener,
+};
+
+/* Auto-register this NIP's plugin at program startup */
 __attribute__((constructor)) static void nip09_register_at_startup(void) {
-    nip01_register_listener(5, 5, nip09_listener);
+    nip_plugin_register(&nip09_plugin);
 }

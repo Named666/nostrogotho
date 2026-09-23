@@ -54,29 +54,6 @@
  */
 bool nip01_validate_event(const event_t *ev);
 
-/* nip01_can_accept_event - Check if relay should accept an event
- * 
- * Determines whether a relay should accept and store an event based on
- * NIP-01 basic protocol rules. This includes:
- * - Event validation (ID, signature, delegation)
- * - Content size limits
- * - Timestamp limits (if configured)
- * - Proof-of-work difficulty (if required)
- * 
- * Args:
- *   ev                          - event to evaluate
- *   max_content_length          - maximum allowed content length (0 = unlimited)
- *   created_at_lower_limit      - minimum allowed created_at age in seconds (0 = no limit)
- *   created_at_upper_limit      - maximum allowed created_at future in seconds (0 = no limit)
- *   min_pow_difficulty          - minimum proof-of-work difficulty required (0 = none)
- * 
- * Returns: true if relay should accept event, false otherwise
- */
-bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
-                            time_t created_at_lower_limit,
-                            time_t created_at_upper_limit,
-                            int min_pow_difficulty);
-
 /* ============================================================================
  * Event Stream Listener System (Plugin Architecture)
  * ============================================================================ */
@@ -93,9 +70,10 @@ typedef struct {
 
 /* Listener function type - called when event of registered kind arrives
  * 
- * Each NIP can register listeners for specific kinds. When an event arrives,
- * all registered listeners for that kind are called in order. The first
- * listener to return accepted=true stops further processing.
+ * Each plugin can declare kind ranges it listens for (nip_plugin_t.kinds)
+ * and provide one of these as its on_event hook. When an event arrives, all
+ * plugins whose declared ranges cover its kind are called in registration
+ * order. The first listener to return accepted=true stops further processing.
  * 
  * Args:
  *   connection - WebSocket connection (for auth checks, etc.)
@@ -117,6 +95,9 @@ typedef struct {
  *   - Listener should NOT broadcast; caller decides based on should_broadcast
  *   - Listener should NOT send response to client; caller sends OK/NOTICE
  *   - Multiple listeners can be registered for the same kind
+ * 
+ * See nip_plugin.h for the ergonomic result constructors (nip_plugin_accept,
+ * nip_plugin_reject, nip_plugin_store_and_broadcast, ...).
  */
 typedef nip01_process_result_t (*nip01_event_listener_t)(
     struct mg_connection *connection,
@@ -125,35 +106,6 @@ typedef nip01_process_result_t (*nip01_event_listener_t)(
     const char *relay_url
 );
 
-/* nip01_register_listener - Register a listener for a range of event kinds
- * 
- * Allows NIPs to subscribe to events of their kind(s). When an event whose
- * kind falls within [kind_min, kind_max] arrives, the listener is called.
- * Use kind_min == kind_max to register for a single kind. Multiple listeners
- * (from different NIPs) can overlap the same kind/range.
- * 
- * Args:
- *   kind_min - lowest kind (inclusive) this listener handles
- *   kind_max - highest kind (inclusive) this listener handles
- *   listener - function to call when a matching event arrives
- * 
- * Returns: true if listener registered successfully, false if table is full
- */
-bool nip01_register_listener(int kind_min, int kind_max, nip01_event_listener_t listener);
-
-/* nip01_init_listeners - Initialize built-in NIP listeners
- * 
- * Calls each NIP module's own nipXX_register_listeners() function so it can
- * subscribe to the kinds it cares about. Should be called once during server
- * initialization. Adding a new NIP means adding one call here to its own
- * registration function - the dispatcher itself never needs to change.
- * 
- * Kinds with no registered listener fall back to default NIP-01 behavior:
- * store the event and broadcast it (except ephemeral kinds 20000-29999,
- * which are broadcast without storage per NIP-01).
- */
-void nip01_init_listeners(void);
-
 /* nip01_process_event - Main entry point for event processing
  * 
  * Performs comprehensive event processing:
@@ -161,7 +113,7 @@ void nip01_init_listeners(void);
  * 2. Checks content size limit
  * 3. Checks timestamp limits
  * 4. Checks proof-of-work difficulty
- * 5. Dispatches to registered listeners for this kind
+ * 5. Dispatches to every plugin whose declared kind ranges cover this kind
  * 
  * Args:
  *   connection                  - WebSocket connection
@@ -183,7 +135,7 @@ void nip01_init_listeners(void);
  *       connection, &event, storage_ctx, relay_url,
  *       MAX_CONTENT, 2*3600, 15*60, 20);
  *   
- *   send_status(connection, "OK", event.id, result.accepted, result.response_msg);
+ *   nip_plugin_send_status(connection, "OK", event.id, result.accepted, result.response_msg);
  *   
  *   if (result.accepted && result.should_broadcast) {
  *       broadcast_event(&event);

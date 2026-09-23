@@ -2,6 +2,7 @@
 #include "nip62.h"
 #include "nip_event.h"
 #include "nip01.h"
+#include "nip_plugin.h"
 #include "../storage.h"
 
 bool nip62_should_vanish(const event_t *event, const char *service_url) {
@@ -18,49 +19,47 @@ static nip01_process_result_t nip62_listener(
 
     (void)connection;
 
-    nip01_process_result_t result = {0};
-
     /* NIP-62: "The tag list MUST include at least one `relay` value."
      * Reject kind-62 events that tag no relay at all. */
     if (!nip_event_has_tag(event, "relay", NULL)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "invalid: kind 62 requires at least one relay tag");
-        return result;
+        return nip_plugin_reject("invalid: kind 62 requires at least one relay tag");
     }
 
     if (!storage) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: storage unavailable");
-        return result;
+        return nip_plugin_reject("error: storage unavailable");
     }
 
     if (nip62_should_vanish(event, relay_url)) {
-        int deleted = storage->delete_all_events_by_pubkey(event->pubkey, event->created_at);
+        /* Delete all of the author's events except the vanish request itself
+         * (kind 62). The exclusion is a NIP-62 policy decision, so it lives
+         * here in the plugin — the storage layer stays generic. */
+        int deleted = storage->delete_all_events_by_pubkey(event->pubkey,
+                                                           event->created_at,
+                                                           event->kind);
         if (deleted < 0) {
-            result.accepted = false;
-            snprintf(result.response_msg, sizeof(result.response_msg),
-                    "error: failed to vanish events");
-            return result;
+            return nip_plugin_reject("error: failed to vanish events");
         }
     }
 
-    if (!storage->insert_record(event)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "duplicate: event already exists");
-        return result;
-    }
-
-    result.accepted = true;
-    result.should_broadcast = true;
-    result.response_msg[0] = '\0';
-
-    return result;
+    return nip_plugin_store_and_broadcast(storage, event);
 }
 
-/* Auto-register this NIP's listener at program startup */
+/* ============================================================================
+ * Plugin registration
+ *
+ * NIP-62 listens for kind 62 (Request to Vanish) events. Declaring the kind
+ * in the plugin struct is the only wiring needed — nip_plugin_register()
+ * hands it to the NIP-01 dispatcher.
+ * ============================================================================ */
+
+static nip_plugin_t nip62_plugin = {
+    .name = "nip62",
+    .kinds = { NIP_PLUGIN_KIND(62) },
+    .kinds_count = 1,
+    .on_event = nip62_listener,
+};
+
+/* Auto-register this NIP's plugin at program startup */
 __attribute__((constructor)) static void nip62_register_at_startup(void) {
-    nip01_register_listener(62, 62, nip62_listener);
+    nip_plugin_register(&nip62_plugin);
 }

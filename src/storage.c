@@ -161,35 +161,6 @@ char *escape_like(const char *str, size_t len) {
     return escaped;
 }
 
-/* is_expired - Check if event has expired
- * 
- * Searches an event's tags for ["expiration", "<timestamp>"] tag.
- * Returns true if found and current time is past expiration.
- * 
- * Args: tags - parsed tags array (NULL-safe)
- * Returns: true if expired, false otherwise
- * 
- * NIP-40: Expiration represents absolute Unix timestamp in seconds
- */
-bool is_expired(const tags_array_t *tags) {
-    if (!tags) return false;
-    
-    time_t now = time(NULL);
-    
-    for (size_t i = 0; i < tags->count; i++) {
-        tag_t *tag = &tags->tags[i];
-        
-        if (tag->count >= 2 && strcmp(tag->elements[0], "expiration") == 0) {
-            time_t expiration = (time_t)strtol(tag->elements[1], NULL, 10);
-            if (expiration <= now) {
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
-
 /* ============================================================================
  * Core Storage Operations
  * ============================================================================ */
@@ -595,11 +566,16 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
     return changes;
 }
 
-/* Delete all events by pubkey */
-static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at) {
+/* Delete all events by pubkey up to a timestamp, optionally excluding one
+ * kind. Generic storage primitive — the caller (e.g. the NIP-62 plugin)
+ * decides which kind, if any, must survive. */
+static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at,
+                                       int exclude_kind) {
     if (!db_conn || !pubkey) return -1;
     
-    const char *sql = "DELETE FROM event WHERE pubkey = ? AND created_at <= ? AND kind != 62";
+    const char *sql = exclude_kind
+        ? "DELETE FROM event WHERE pubkey = ? AND created_at <= ? AND kind != ?"
+        : "DELETE FROM event WHERE pubkey = ? AND created_at <= ?";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -609,6 +585,7 @@ static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at) {
     
     sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, (int)created_at);
+    if (exclude_kind) sqlite3_bind_int(stmt, 3, exclude_kind);
     
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));

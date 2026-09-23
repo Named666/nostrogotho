@@ -137,7 +137,8 @@ const char *nip11_information_document(void) {
  * information document on HTTP requests with an appropriate Accept header.
  * ============================================================================ */
 
-static void nip11_plugin_init(const relay_config_t *config) {
+static void nip11_plugin_init(const relay_config_t *config, void *ctx) {
+    (void) ctx;
     nip11_configure(config->max_message_length, config->max_subscriptions,
                     config->max_filters, config->max_subid_length,
                     config->max_event_tags, config->max_content_length,
@@ -146,7 +147,8 @@ static void nip11_plugin_init(const relay_config_t *config) {
                     config->created_at_upper_limit, config->auth_required);
 }
 
-static const char *nip11_plugin_info_document(void) {
+static const char *nip11_plugin_info_document(void *ctx) {
+    (void) ctx;
     return nip11_information_document();
 }
 

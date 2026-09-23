@@ -11,9 +11,10 @@
 /* ============================================================================
  * NIP-01: Basic Protocol Flow, Events and Signatures
  * 
- * Implementation of core event validation and event listener system.
- * Each NIP registers listeners for the event kinds it cares about.
- * When an event arrives, registered listeners are called to process it.
+ * Implementation of core event validation and the event dispatch system.
+ * Each NIP is a plugin that declares the event kinds it cares about; when
+ * an event arrives, the dispatcher calls every plugin whose declared kind
+ * ranges cover it, in registration order.
  *
  * Consolidated here per the reference specs:
  *   - NIP-16 (Event Treatment) is `final mandatory` and "Moved to NIP-01":
@@ -31,81 +32,25 @@ bool nip01_validate_event(const event_t *ev) {
     return check_event(ev);
 }
 
-bool nip01_can_accept_event(const event_t *ev, size_t max_content_length,
-                            time_t created_at_lower_limit,
-                            time_t created_at_upper_limit,
-                            int min_pow_difficulty) {
-    (void) min_pow_difficulty; /* PoW is enforced by the nip13 plugin hook. */
-    if (!ev) return false;
-    
-    /* Validate event ID and signature */
-    if (!nip01_validate_event(ev)) return false;
-    
-    /* Check content size limit */
-    if (max_content_length > 0 && ev->content_len > max_content_length) {
-        return false;
-    }
-    
-    /* Check timestamp limits (NIP-22) */
-    time_t now = time(NULL);
-    if (created_at_lower_limit > 0 && ev->created_at < now - created_at_lower_limit) {
-        return false;
-    }
-    if (created_at_upper_limit > 0 && ev->created_at > now + created_at_upper_limit) {
-        return false;
-    }
-
-    /* Proof-of-work (NIP-13) is enforced by the nip13 plugin's
-     * accept_publish hook before dispatch, so it is not re-checked here. */
-
-    return true;
-}
-
 /* ============================================================================
- * Event Listener Registry
- * 
- * Purely mechanical: stores (kind range -> listener) entries. It has no
- * knowledge of any specific NIP; each NIP module registers itself via
- * __attribute__((constructor)) in its own .c file.
- * 
- * The registry grows dynamically as listeners are registered, so there is no
- * fixed ceiling on the number of NIPs that can be supported.
+ * Event Dispatcher
+ *
+ * The dispatcher walks the plugin registry (nip_plugins()) and invokes each
+ * plugin's on_event hook when the event's kind falls inside one of the
+ * plugin's declared kind ranges. There is no separate listener registry:
+ * a plugin declares its kinds in its nip_plugin_t and nip_plugin_register()
+ * is the only registration call.
  * ============================================================================ */
 
-typedef struct {
-    int kind_min;
-    int kind_max;
-    nip01_event_listener_t listener;
-} listener_entry_t;
-
-static listener_entry_t *listener_registry;
-static size_t registry_size = 0;
-static size_t registry_capacity = 0;
-
-bool nip01_register_listener(int kind_min, int kind_max, nip01_event_listener_t listener) {
-    if (!listener || kind_min > kind_max) return false;
-
-    /* Grow the registry when full (start at 16, double as needed). */
-    if (registry_size >= registry_capacity) {
-        size_t new_capacity = registry_capacity ? registry_capacity * 2 : 16;
-        listener_entry_t *resized = (listener_entry_t *) realloc(
-            listener_registry, new_capacity * sizeof(*resized));
-        if (!resized) return false;
-        listener_registry = resized;
-        registry_capacity = new_capacity;
+/* Return true if `kind` falls inside any of the plugin's declared ranges. */
+static bool plugin_listens_for(const nip_plugin_t *plugin, int kind) {
+    for (size_t i = 0; i < plugin->kinds_count; i++) {
+        if (kind >= plugin->kinds[i].kind_min && kind <= plugin->kinds[i].kind_max) {
+            return true;
+        }
     }
-
-    listener_registry[registry_size].kind_min = kind_min;
-    listener_registry[registry_size].kind_max = kind_max;
-    listener_registry[registry_size].listener = listener;
-    registry_size++;
-
-    return true;
+    return false;
 }
-
-/* ============================================================================
- * Main Event Processing Dispatcher
- * ============================================================================ */
 
 nip01_process_result_t nip01_process_event(
     struct mg_connection *connection,
@@ -172,16 +117,15 @@ nip01_process_result_t nip01_process_event(
      * auth-required tags) are enforced by the server before dispatch via
      * plugin accept_publish() hooks, so this dispatcher stays NIP-agnostic. */
 
-    /* Step 5: Call every registered listener whose range covers this kind,
+    /* Step 5: Call every plugin whose declared kind ranges cover this kind,
      * in registration order. The first listener to accept wins. */
     bool any_listener_matched = false;
-    for (size_t i = 0; i < registry_size; i++) {
-        if (event->kind < listener_registry[i].kind_min ||
-            event->kind > listener_registry[i].kind_max) {
+    for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
+        if (!plugin->on_event || !plugin_listens_for(plugin, event->kind)) {
             continue;
         }
         any_listener_matched = true;
-        result = listener_registry[i].listener(connection, event, storage, relay_url);
+        result = plugin->on_event(connection, event, storage, relay_url);
         if (result.accepted) {
             return result;
         }
@@ -199,31 +143,10 @@ nip01_process_result_t nip01_process_event(
      * behavior. Ephemeral events (kinds 20000-29999) are broadcast without
      * storage; everything else is stored and broadcast. */
     if (event->kind >= 20000 && event->kind < 30000) {
-        result.accepted = true;
-        result.should_broadcast = true;
-        result.response_msg[0] = '\0';
-        return result;
+        return nip_plugin_accept();
     }
     
-    if (!storage) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: storage unavailable");
-        return result;
-    }
-    
-    if (!storage->insert_record(event)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "duplicate: event already exists");
-        return result;
-    }
-    
-    result.accepted = true;
-    result.should_broadcast = true;
-    result.response_msg[0] = '\0';
-    
-    return result;
+    return nip_plugin_store_and_broadcast(storage, event);
 }
 
 /* ============================================================================
@@ -249,34 +172,15 @@ static nip01_process_result_t nip01_replaceable_listener(
     (void)connection;
     (void)relay_url;
 
-    nip01_process_result_t result = {0};
-
     if (!storage) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: storage unavailable");
-        return result;
+        return nip_plugin_reject("error: storage unavailable");
     }
 
     if (!nip01_replace_event(event, storage)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: failed to replace event");
-        return result;
+        return nip_plugin_reject("error: failed to replace event");
     }
 
-    if (!storage->insert_record(event)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "duplicate: event already exists");
-        return result;
-    }
-
-    result.accepted = true;
-    result.should_broadcast = true;
-    result.response_msg[0] = '\0';
-
-    return result;
+    return nip_plugin_store_and_broadcast(storage, event);
 }
 
 /* ============================================================================
@@ -319,52 +223,54 @@ static nip01_process_result_t nip01_addressable_listener(
     (void)connection;
     (void)relay_url;
 
-    nip01_process_result_t result = {0};
-
     if (!storage) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: storage unavailable");
-        return result;
+        return nip_plugin_reject("error: storage unavailable");
     }
 
     if (!nip01_replace_addressable_event(event, storage)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "error: failed to replace event");
-        return result;
+        return nip_plugin_reject("error: failed to replace event");
     }
 
-    if (!storage->insert_record(event)) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "duplicate: event already exists");
-        return result;
-    }
-
-    result.accepted = true;
-    result.should_broadcast = true;
-    result.response_msg[0] = '\0';
-
-    return result;
+    return nip_plugin_store_and_broadcast(storage, event);
 }
 
 /* ============================================================================
- * Built-in listener registration (NIP-16 / NIP-33 consolidated into NIP-01)
+ * Built-in plugin registration (NIP-16 / NIP-33 consolidated into NIP-01)
+ *
+ * The replaceable/addressable semantics are themselves a plugin: it listens
+ * for the NIP-16 / NIP-33 kind ranges and handles storage replacement. This
+ * keeps the dispatcher purely mechanical — it never special-cases kinds.
  * ============================================================================ */
 
-void nip01_init_listeners(void) {
-    /* NIP-16 replaceable events (kinds 0, 3, 10000-19999). */
-    nip01_register_listener(0, 0, nip01_replaceable_listener);
-    nip01_register_listener(3, 3, nip01_replaceable_listener);
-    nip01_register_listener(10000, 19999, nip01_replaceable_listener);
-    /* NIP-33 addressable events (kinds 30000-39999). */
-    nip01_register_listener(30000, 39999, nip01_addressable_listener);
+/* Single on_event entry that routes to the replaceable or addressable
+ * handler based on the kind range (NIP-33 kinds are 30000-39999). */
+static nip01_process_result_t nip01_builtin_listener(
+    struct mg_connection *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url) {
+
+    if (event->kind >= 30000 && event->kind < 40000) {
+        return nip01_addressable_listener(connection, event, storage, relay_url);
+    }
+    return nip01_replaceable_listener(connection, event, storage, relay_url);
 }
 
-/* Auto-register the built-in NIP-16 / NIP-33 listeners at program startup,
+static nip_plugin_t nip01_plugin = {
+    .name = "nip01",
+    .kinds = {
+        NIP_PLUGIN_KIND(0),            /* NIP-16 replaceable: metadata */
+        NIP_PLUGIN_KIND(3),            /* NIP-16 replaceable: contacts */
+        { 10000, 19999 },              /* NIP-16 replaceable: app data */
+        { 30000, 39999 },              /* NIP-33 addressable */
+    },
+    .kinds_count = 4,
+    .on_event = nip01_builtin_listener,
+};
+
+/* Auto-register the built-in NIP-16 / NIP-33 plugin at program startup,
  * matching the self-registration pattern used by every other NIP module. */
 __attribute__((constructor)) static void nip01_register_at_startup(void) {
-    nip01_init_listeners();
+    nip_plugin_register(&nip01_plugin);
 }
 

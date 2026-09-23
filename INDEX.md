@@ -2,13 +2,7 @@
 
 - [README.md](README.md): relay capabilities, supported NIPs, limits, and all runtime options.
 - [QUICKSTART.md](QUICKSTART.md): Windows build, local execution, deployment, and validation.
-- [IMPLEMENTATION.md](IMPLEMENTATION.md): architecture and contributor workflow.
-- [API_REFERENCE.md](API_REFERENCE.md): public C interfaces and ownership rules.
-- [NOSTR.md](NOSTR.md): Nostr protocol message types and relay applicability.
-
-Historical completion and reimplementation reports were consolidated into these
-current guides because they described an earlier, incomplete C99 port and a
-nonexistent CMake build.
+- [NOSTR_COMPATABILITY.md](NOSTR_COMPATABILITY.md): NIP implementation status and compatibility audit.
 
 ## 📚 Documentation
 
@@ -16,52 +10,162 @@ Start here based on your needs:
 
 ### For Beginners
 1. **[QUICKSTART.md](QUICKSTART.md)** - Installation and basic usage
-2. **[examples/example.c](examples/example.c)** - Working code examples
-3. **[IMPLEMENTATION.md](IMPLEMENTATION.md)** - Architecture overview
+2. **[NOSTR_COMPATABILITY.md](NOSTR_COMPATABILITY.md)** - NIP implementation status
+3. **[README.md](README.md)** - Project overview and NIP support table
 
 ### For Developers
 1. **[API_REFERENCE.md](API_REFERENCE.md)** - Complete API documentation
-- [PROJECT_SUMMARY.md](PROJECT_SUMMARY.md) - Project details
+2. **[IMPLEMENTATION.md](IMPLEMENTATION.md)** - Architecture overview
 3. Source code in `src/` directory
 
 ### For Integration
-1. **[CMakeLists.txt](CMakeLists.txt)** - Build configuration
-2. **[src/server.c](src/server.c)** - Server implementation
+1. **[src/server.c](src/server.c)** - Server implementation
+2. **[NOSTR_COMPATABILITY.md](NOSTR_COMPATABILITY.md)** - NIP wiring status
 
 ---
 
-## 📦 Project Structure
+## 📁 Project Structure
 
 ```
 nostrogotho/
 │
-├── 📄 Documentation
-│   ├── QUICKSTART.md           ← Start here!
-│   ├── API_REFERENCE.md        ← Complete API
-│   ├── IMPLEMENTATION.md       ← Architecture
-│   ├── PROJECT_SUMMARY.md   ← Project overview
-│   └── README.md              ← Original project
+├── 📄 Root Documentation
+│   ├── README.md              ← Project overview, NIP support, configuration
+│   ├── QUICKSTART.md          ← Windows build, local execution, deployment
+│   ├── NOSTR_COMPATABILITY.md ← NIP implementation status (living document)
+│   ├── IMPLEMENTATION.md      ← Architecture and contributor workflow
+│   ├── API_REFERENCE.md       ← Public C interfaces
+│   └── NOSTR.md               ← Nostr protocol message types
 │
 ├── 🔨 Build System
-│   ├── CMakeLists.txt         ← Build config
-│   ├── build.sh               ← Build script
-│   ├── nob.c                  ← Nob build system
-│   └── nob.h                  ← Nob header
+│   ├── nob.c                  ← Two-stage build driver (gcc → nob → main.exe)
+│   ├── nob.h                  ← Nob header
+│   └── build/                 ← Generated build output
 │
 ├── 📁 Source Code (src/)
-│   ├── nostrogotho.h/c          ← Core data structures
-│   ├── crypto.h/c             ← Cryptographic ops
-│   ├── storage.h/c            ← SQLite3 layer
-│   ├── server.c               ← WebSocket server
-│   └── main.c                 ← Example main
+│   ├── nostrogotho.h/c        ← Core data structures (event_t, tag_t, filter_t)
+│   ├── crypto.h/c             ← Cryptographic ops (sha256, signature_verify, check_event)
+│   ├── storage.h/c            ← SQLite3 layer (insert_record, send_records, indexes)
+│   ├── server.c               ← WebSocket server, event loop, NIP plugin architecture
+│   └── main.c                 ← Example main entry point
 │
-├── 📁 Examples (examples/)
-│   └── example.c              ← Usage examples
+├── 📁 NIP Plugins (src/nips/)
+│   ├── nip01.c/h              ← Basic Protocol Flow, replaceable events, addressable events
+│   ├── nip09.c/h              ← Event Deletion Request
+│   ├── nip11.c/h              ← Relay Information Document (HTTP)
+│   ├── nip13.c/h              ← Proof of Work
+│   ├── nip17.c/h              ← Private Direct Messages
+│   ├── nip26.c/h              ← Delegated Event Signing
+│   ├── nip40.c/h              ← Expiration Timestamp
+│   ├── nip42.c/h              ← Client Authentication
+│   ├── nip45.c/h              ← Event Counts (COUNT queries)
+│   ├── nip62.c/h              ← Request to Vanish
+│   ├── nip67.c/h              ← EOSE Completeness Hint
+│   ├── nip_event.c/h          ← Shared event-tag inspection
+│   └── nip_plugin.c/h         ← Plugin registration architecture
 │
 ├── 📁 Third-party (thirdparty/)
-│   ├── sqlite3.c/h            ← SQLite3 source
-│   └── mongoose/              ← WebSocket library
+│   ├── sqlite3.c/h            ← SQLite3 source amalgamation
+│   ├── mongoose/              ← WebSocket library (bundled)
+│   └── secp256k1/             ← Schnorr signature library
+│
+└── 📄 Additional Files
+    ├── TODO.md                ← TODO list
+    ├── nob.c README.md        ← Nob build system docs
+    ├── QUICKSTART.md          ← Quick start guide
+    └── nostrogotho.sqlite     ← SQLite database (WAL mode)
 ```
+
+---
+
+## 🎯 Quick Navigation
+
+### Core Modules
+
+| Module | Purpose | Lines | Key Functions |
+|--------|---------|-------|---------------|
+| **nostrogotho.h/c** | Data structures | 229 | `event_alloc`, `filter_alloc`, memory management |
+| **crypto.h/c** | Cryptography | 358 | `sha256`, `signature_verify`, `check_event` |
+| **storage.h/c** | Database | 476 | `insert_record`, `send_records`, SQLite ops |
+| **server.c** | WebSocket + NIP plugins | 295+ | mongoose event handler, event loop, plugin hooks |
+| **NIP Plugins** | Protocol-specific logic | varies | nip01, nip09, nip11, nip13, nip17, nip26, nip40, nip42, nip45, nip62, nip67 |
+
+### Total: ~1,400+ lines of C99 code
+
+---
+
+## 🚀 Getting Started
+
+### 1. First Time Setup
+```powershell
+# Read this first
+cat QUICKSTART.md
+
+# Build the nob driver
+gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
+
+# Run the nob builder
+.\nob.exe
+
+# Run the relay
+.\build\main.exe -service-url wss://relay.example.com
+```
+
+### 2. Understanding the Code
+- Review [NOSTR_COMPATABILITY.md](NOSTR_COMPATABILITY.md) for NIP implementation status
+- Check [IMPLEMENTATION.md](IMPLEMENTATION.md) for architecture overview
+- Examine [API_REFERENCE.md](API_REFERENCE.md) for public C interfaces
+
+### 3. NIP Support Status
+- See [NOSTR_COMPATABILITY.md](NOSTR_COMPATABILITY.md) summary table for current NIP status
+- All NIPs listed as ✅ Complete or 🟡 Partial with detailed integration notes
+
+---
+
+## 📊 NIP Support Summary
+
+Implemented NIPs (as of 2026-09-03 audit):
+
+| NIP | Title | Status | Wired into server |
+|-----|-------|--------|-------------------|
+| 01 | Basic Protocol Flow | ✅ Complete | Yes |
+| 09 | Event Deletion Request | ✅ Complete | Yes |
+| 11 | Relay Information Document | ✅ Complete | Yes (HTTP) |
+| 13 | Proof of Work | ✅ Complete | Yes (via NIP-01) |
+| 16 | Event Treatment | ✅ Complete (→ NIP-01) | Yes |
+| 17 | Private Direct Messages | ✅ Complete | Yes |
+| 26 | Delegated Event Signing | ✅ Complete | Yes (via crypto) |
+| 33 | Parameterized Replaceable Events | ✅ Complete (→ NIP-01) | Yes |
+| 40 | Expiration Timestamp | ✅ Complete | Yes |
+| 42 | Client Authentication | ✅ Complete | Yes |
+| 45 | Event Counts | ✅ Complete | Yes |
+| 62 | Request to Vanish | ✅ Complete | Yes |
+| 67 | EOSE Completeness Hint | ✅ Complete | Yes |
+
+**Target `supported_nips`:** `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62, 67]`
+
+---
+
+## 📦 Build Configuration
+
+The project uses [nob](nob.c) - a two-stage build driver. Build from repository root:
+
+```powershell
+gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
+.\nob.exe
+```
+
+`nob` compiles the relay and SQLite amalgamation directly, linking bundled dependencies from `thirdparty/install`.
+
+**Output:** `build/nostrogotho.exe`
+
+**Configuration options** (via command-line or environment variables):
+- `-database PATH`, `--db PATH` → `DATABASE_URL` → `./nostrogotho.sqlite`
+- `-port PORT` → `7447` (default listener port)
+- `-service-url URL` → `SERVICE_URL` (public URL for NIP-42 and NIP-62)
+- `-min-pow BITS` → `MIN_POW_DIFFICULTY` → `0` (disable PoW)
+- `-created-at-limit SECONDS` → `CREATED_AT_LOWER_LIMIT` → `0` (disable age limit)
+- `-created-at-upper-limit SECONDS` → `CREATED_AT_UPPER_LIMIT` → `900` (max future timestamp)
 
 ---
 

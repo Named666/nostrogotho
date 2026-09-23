@@ -98,34 +98,6 @@
 
 ---
 
-## NIP-40 — Expiration Timestamp
-
-**Reference:** `thirdparty/nips/40.md` · **Implementation:** `src/nips/nip40.c`
-
-### What is implemented ✅
-
-- **`nip40_event_is_expired(event)`** — scans the event's raw tags JSON for an
-  `expiration` tag and returns `true` when `expiration <= now`.
-- **`nip40_is_expired(tags)`** — parsed-tags variant for storage callers.
-- **Accept path (plugin `accept_publish`)** — rejects already-expired
-  publications with `"invalid: event is expired"`.
-- **Query path (plugin `can_deliver`)** — drops expired events from stored
-  queries and broadcasts, so stored-but-expired events are never served.
-- **Background GC** — the plugin registers a periodic `timer` hook that sweeps
-  expired rows out of the database.
-- **Ephemeral events unaffected** — kinds 20000–29999 are never stored, so
-  expiration has no effect on their broadcast-only treatment (per spec).
-
-### Plugin note
-
-NIP-40 is a fully modular plugin. It self-registers via
-`nip_plugin_register()` in `nip40.c` and participates in the relay only
-through the generic `nip_plugin_t` hooks (`accept_publish`, `can_deliver`,
-`timer`). Deleting `src/nips/nip40.c` from the build removes all of the above
-with no changes to `server.c`.
-
----
-
 ## NIP-45 — Event Counts
 
 **Reference:** `thirdparty/nips/45.md` · **Implementation:** `src/nips/nip45.c`
@@ -222,7 +194,8 @@ with no changes to `server.c`.
 
 - **NIP-16 / NIP-33** — both specs are `final mandatory` "Moved to NIP-01";
   their listeners were folded into `nip01.c` (`nip01_replaceable_listener`,
-  `nip01_addressable_listener`, registered via `nip01_init_listeners()`).
+  `nip01_addressable_listener`, registered as a built-in plugin via
+  `nip_plugin_register()` from `nip01.c`).
   `nip16.c/h` and `nip33.c/h` were deleted and the build list updated.
 - **NIP-40** — fully wired (accept + query paths); advertisement is honest.
 - **NIP-45** — `nip45_build_count_response` is the single COUNT formatter;

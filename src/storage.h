@@ -132,14 +132,17 @@ typedef struct {
     int (*delete_record_by_id_and_kind_and_ptag)(const char *id, int kind,
                                                  const tag_t *tag);
     
-    /* delete_all_events_by_pubkey - Delete all events by author (NIP-62)
+    /* delete_all_events_by_pubkey - Delete all events by author up to a time
      * Args:
      *   pubkey - author pubkey
      *   created_at - delete events with created_at <= this timestamp
+     *   exclude_kind - if non-zero, events of this kind are kept (0 = delete all)
      * Returns: number of records deleted, or -1 on error
-     * Used for NIP-62 "Request to Vanish" (deletes all but kind 62 itself)
+     * Generic primitive; the NIP-62 plugin passes its own kind to keep the
+     * vanish request itself from being deleted.
      */
-    int (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at);
+    int (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at,
+                                       int exclude_kind);
     
     /* purge_expired - Delete NIP-40 expired events (background GC)
      * 
@@ -215,17 +218,6 @@ void storage_context_init_sqlite3(storage_context_t *ctx);
 /* ============================================================================
  * Utility Functions
  * ============================================================================ */
-
-/* is_expired - Check if event has expired
- * 
- * Determines if an event has an expiration tag and is past the expiration time.
- * 
- * Args: tags - parsed tags array (NULL-safe)
- * Returns: true if event has valid expiration tag and is expired, false otherwise
- * 
- * NIP-40: Expiration tag format: ["expiration", "<unix timestamp>"]
- */
-bool is_expired(const tags_array_t *tags);
 
 /* escape_like - Escape special characters for SQL LIKE clause
  * 

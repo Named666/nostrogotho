@@ -50,26 +50,6 @@ bool nip40_event_is_expired(const event_t *event) {
     return false;
 }
 
-/* nip40_is_expired - Parsed-tags variant kept for storage-layer callers. */
-bool nip40_is_expired(const tags_array_t *tags) {
-    if (!tags) return false;
-    
-    time_t now = time(NULL);
-    
-    for (size_t i = 0; i < tags->count; i++) {
-        tag_t *tag = &tags->tags[i];
-        
-        if (tag->count >= 2 && strcmp(tag->elements[0], "expiration") == 0) {
-            time_t expiration = (time_t)strtol(tag->elements[1], NULL, 10);
-            if (expiration <= now) {
-                return true;
-            }
-        }
-    }
-    
-    return false;
-}
-
 /* nip40_garbage_collect - Background sweep of NIP-40 expired events.
  *
  * Callback for a periodic mongoose timer. Runs inside the single-threaded
@@ -101,16 +81,19 @@ void nip40_garbage_collect(void *arg) {
  * the relay references this module.
  * ============================================================================ */
 
-static void nip40_plugin_init(const relay_config_t *config) {
+static void nip40_plugin_init(const relay_config_t *config, void *ctx) {
     (void) config; /* No configuration needed. */
+    (void) ctx;
 }
 
 /* Publish policy: "Relays SHOULD drop any events that are published to them
  * if they are expired." */
 static bool nip40_accept_publish(struct mg_connection *connection,
                                  const event_t *event,
-                                 char *reason, size_t reason_size) {
+                                 char *reason, size_t reason_size,
+                                 void *ctx) {
     (void) connection;
+    (void) ctx;
     if (nip40_event_is_expired(event)) {
         snprintf(reason, reason_size, "invalid: event is expired");
         return false;
@@ -120,13 +103,16 @@ static bool nip40_accept_publish(struct mg_connection *connection,
 
 /* Delivery policy: "Relays SHOULD NOT send expired events to clients, even
  * if they are stored." */
-static bool nip40_can_deliver(const event_t *event, struct mg_connection *connection) {
+static bool nip40_can_deliver(const event_t *event, struct mg_connection *connection,
+                              void *ctx) {
     (void) connection;
+    (void) ctx;
     return !nip40_event_is_expired(event);
 }
 
 /* Maintenance: periodic sweep of stored expired events. */
-static void nip40_plugin_timer(storage_context_t *storage) {
+static void nip40_plugin_timer(storage_context_t *storage, void *ctx) {
+    (void) ctx;
     nip40_garbage_collect(storage);
 }
 

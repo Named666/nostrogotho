@@ -10,6 +10,7 @@
 #include "nostrogotho.h"
 #include "storage.h"
 #include "nips/nip01.h"
+#include "nips/nip_event.h"
 #include "nips/nip_plugin.h"
 #include "server.h"
 
@@ -76,10 +77,6 @@ static bool mg_str_contains(struct mg_str haystack, const char *needle) {
     return false;
 }
 
-static void send_json(struct mg_connection *connection, const char *json) {
-    mg_ws_send(connection, json, strlen(json), WEBSOCKET_OP_TEXT);
-}
-
 /* ---------------------------------------------------------------------------
  * Debug logging helpers.
  * ------------------------------------------------------------------------- */
@@ -114,17 +111,6 @@ static void log_message(struct mg_connection *connection, const char *fmt, ...) 
 
 void server_set_debug(bool enabled) { debug_logging = enabled; }
 
-static void send_status(struct mg_connection *connection, const char *type,
-                        const char *id, bool ok, const char *message) {
-    json_builder_t builder;
-    json_builder_start(&builder);
-    json_builder_append_string(&builder, type);
-    if (id) json_builder_append_string(&builder, id);
-    if (strcmp(type, "OK") == 0) json_builder_append_bool(&builder, ok);
-    json_builder_append_string(&builder, message);
-    send_json(connection, json_builder_finish(&builder));
-}
-
 static void remove_subscriptions(struct mg_connection *connection, const char *id) {
     subscription_t **link = &subscriptions;
     while (*link) {
@@ -141,27 +127,11 @@ static void remove_subscriptions(struct mg_connection *connection, const char *i
 /* The tag slice yielded by mg_json_next is itself a complete JSON array
  * (e.g. ["p","<hex>"]), so element extraction is a plain $[index] lookup
  * on it. Wrapping the slice in another bracket pair would make $[index]
- * resolve to an array, which mg_json_get_str rejects with NULL. */
-static char *tag_element(struct mg_str tag, size_t index) {
-    char path[16];
-    snprintf(path, sizeof(path), "$[%llu]", (unsigned long long) index);
-    return mg_json_get_str(tag, path);
-}
-
-static bool event_has_tag(const event_t *event, const char *name, const char *value) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *tag_name = tag_element(tag, 0);
-        char *tag_value = tag_element(tag, 1);
-        bool found = tag_name && strcmp(tag_name, name) == 0 &&
-                     (!value || (tag_value && strcmp(tag_value, value) == 0));
-        free(tag_name);
-        free(tag_value);
-        if (found) return true;
-    }
-    return false;
-}
+ * resolve to an array, which mg_json_get_str rejects with NULL.
+ *
+ * tag_element() / event_has_tag() live in nip_event.c and are shared by
+ * every NIP module — server.c uses them directly instead of re-implementing
+ * the same JSON walk. */
 
 static bool matches_filter(const filter_t *filter, const event_t *event) {
     if (filter->since && event->created_at < filter->since) return false;
@@ -185,7 +155,7 @@ static bool matches_filter(const filter_t *filter, const event_t *event) {
         bool matched = false;
         tag_t *tag = &filter->tags[i];
         for (size_t j = 1; j < tag->count; j++) {
-            if (event_has_tag(event, tag->elements[0], tag->elements[j])) matched = true;
+            if (nip_event_has_tag(event, tag->elements[0], tag->elements[j])) matched = true;
         }
         if (!matched) return false;
     }
@@ -200,7 +170,8 @@ static bool plugins_accept_publish(struct mg_connection *connection,
                                    size_t reason_size) {
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
         if (plugin->accept_publish && !plugin->accept_publish(connection, event,
-                                                              reason, reason_size)) {
+                                                              reason, reason_size,
+                                                              plugin->ctx)) {
             if (!reason[0]) snprintf(reason, reason_size, "invalid: event not accepted");
             return false;
         }
@@ -210,7 +181,7 @@ static bool plugins_accept_publish(struct mg_connection *connection,
 
 static bool plugins_can_deliver(const event_t *event, struct mg_connection *connection) {
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-        if (plugin->can_deliver && !plugin->can_deliver(event, connection)) return false;
+        if (plugin->can_deliver && !plugin->can_deliver(event, connection, plugin->ctx)) return false;
     }
     return true;
 }
@@ -225,7 +196,7 @@ static void broadcast_event(const event_t *event) {
             json_builder_append_string(&builder, "EVENT");
             json_builder_append_string(&builder, subscription->id);
             json_serialize_event(event, &builder);
-            send_json(subscription->connection, json_builder_finish(&builder));
+            nip_plugin_send_json(subscription->connection, json_builder_finish(&builder));
         }
     }
 }
@@ -246,7 +217,7 @@ static void query_sender(const char *json) {
             if (matches_filter(&query_filters[i], &event)) matched = true;
         }
         if (matched && plugins_can_deliver(&event, query_connection)) {
-            send_json(query_connection, json);
+            nip_plugin_send_json(query_connection, json);
         }
         event_release(&event);
     }
@@ -271,7 +242,7 @@ static void query_events(struct mg_connection *connection, const char *sub,
         /* NIP-45: the first plugin providing a COUNT builder wins; otherwise
          * emit a protocol-default bare COUNT response. */
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->build_count) { response = plugin->build_count(sub, (unsigned long) total_count); break; }
+            if (plugin->build_count) { response = plugin->build_count(sub, (unsigned long) total_count, plugin->ctx); break; }
         }
         if (!response) {
             json_builder_t builder;
@@ -289,13 +260,13 @@ static void query_events(struct mg_connection *connection, const char *sub,
          * a fresh NIP-42 AUTH challenge for gift-wrap subscriptions). */
         bool auth_hint = false;
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->eose_auth_hint && plugin->eose_auth_hint(connection, filters, count)) {
+            if (plugin->eose_auth_hint && plugin->eose_auth_hint(connection, filters, count, plugin->ctx)) {
                 auth_hint = true;
                 break;
             }
         }
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->build_eose) { response = plugin->build_eose(sub, has_more, auth_hint); break; }
+            if (plugin->build_eose) { response = plugin->build_eose(sub, has_more, auth_hint, plugin->ctx); break; }
         }
         if (!response) {
             json_builder_t builder;
@@ -309,7 +280,7 @@ static void query_events(struct mg_connection *connection, const char *sub,
         }
     }
     if (response) {
-        send_json(connection, response);
+        nip_plugin_send_json(connection, response);
         free(response);
     }
 }
@@ -358,14 +329,14 @@ static void handle_req(struct mg_connection *connection, json_value_t *values, s
     filter_t *filters = NULL;
     size_t filter_count = 0, subscriptions_count = 0;
     if (!sub || strlen(sub) > MAX_SUB_ID_LENGTH || count < 3 || !collect_filters(values, count, &filters, &filter_count)) {
-        send_status(connection, "CLOSED", sub, false, "error: invalid filter"); return;
+        nip_plugin_send_status(connection, "CLOSED", sub, false, "error: invalid filter"); return;
     }
     if (!do_count) {
         for (subscription_t *s = subscriptions; s; s = s->next) if (s->connection == connection && strcmp(s->id, sub) != 0) subscriptions_count++;
-        if (subscriptions_count >= MAX_SUBSCRIPTIONS) { for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]); free(filters); send_status(connection, "CLOSED", sub, false, "error: too many subscriptions"); return; }
+        if (subscriptions_count >= MAX_SUBSCRIPTIONS) { for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]); free(filters); nip_plugin_send_status(connection, "CLOSED", sub, false, "error: too many subscriptions"); return; }
         remove_subscriptions(connection, sub);
         subscription_t *subscription = (subscription_t *) calloc(1, sizeof(*subscription));
-        if (!subscription || !(subscription->id = string_dup(sub))) { free(subscription); for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]); free(filters); send_status(connection, "CLOSED", sub, false, "error: server unavailable"); return; }
+        if (!subscription || !(subscription->id = string_dup(sub))) { free(subscription); for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]); free(filters); nip_plugin_send_status(connection, "CLOSED", sub, false, "error: server unavailable"); return; }
         subscription->connection = connection; subscription->filters = filters; subscription->filters_count = filter_count;
         subscription->next = subscriptions; subscriptions = subscription;
         query_events(connection, sub, filters, filter_count, false);
@@ -382,7 +353,7 @@ static void handle_event(struct mg_connection *connection, json_value_t *values,
 
     /* Parse event */
     if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) {
-        send_status(connection, "NOTICE", NULL, false, "error: invalid event");
+        nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: invalid event");
         return;
     }
 
@@ -393,7 +364,7 @@ static void handle_event(struct mg_connection *connection, json_value_t *values,
 
     /* Plugin publish policy check (e.g. NIP-40 expiry, NIP-42 "-" tag). */
     if (!plugins_accept_publish(connection, &event, reject_reason, sizeof(reject_reason))) {
-        send_status(connection, "OK", event.id, false, reject_reason);
+        nip_plugin_send_status(connection, "OK", event.id, false, reject_reason);
         event_release(&event);
         return;
     }
@@ -408,7 +379,7 @@ static void handle_event(struct mg_connection *connection, json_value_t *values,
     );
 
     /* Send response to client */
-    send_status(connection, "OK", event.id, result.accepted, result.response_msg);
+    nip_plugin_send_status(connection, "OK", event.id, result.accepted, result.response_msg);
 
     /* Broadcast event if accepted and should broadcast */
     if (result.accepted && result.should_broadcast) {
@@ -421,7 +392,7 @@ static void handle_event(struct mg_connection *connection, json_value_t *values,
 static void handle_message(struct mg_connection *connection, struct mg_ws_message *message) {
     json_value_t values[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
     char *payload; size_t count; const char *method;
-    if (message->data.len > MAX_WS_MESSAGE_LENGTH) { send_status(connection, "NOTICE", NULL, false, "error: message too large"); return; }
+    if (message->data.len > MAX_WS_MESSAGE_LENGTH) { nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: message too large"); return; }
     payload = (char *) malloc(message->data.len + 1);
     if (!payload) return;
     memcpy(payload, message->data.buf, message->data.len); payload[message->data.len] = '\0';
@@ -432,18 +403,18 @@ static void handle_message(struct mg_connection *connection, struct mg_ws_messag
     /* Let plugins consume the message first (e.g. NIP-42 "AUTH"). */
     bool consumed = false;
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-        if (plugin->on_message && plugin->on_message(connection, values, count)) {
+        if (plugin->on_message && plugin->on_message(connection, values, count, plugin->ctx)) {
             consumed = true;
             break;
         }
     }
     if (!consumed) {
-        if (!method || count < 2) send_status(connection, "NOTICE", NULL, false, "error: invalid request");
+        if (!method || count < 2) nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: invalid request");
         else if (strcmp(method, "REQ") == 0) handle_req(connection, values, count, false);
         else if (strcmp(method, "COUNT") == 0) handle_req(connection, values, count, true);
         else if (strcmp(method, "CLOSE") == 0) { const char *sub = json_array_get_string(values, count, 1); if (sub) remove_subscriptions(connection, sub); }
         else if (strcmp(method, "EVENT") == 0) handle_event(connection, values, count);
-        else send_status(connection, "NOTICE", NULL, false, "error: invalid request");
+        else nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: invalid request");
     }
     json_array_free(values, count); free(payload);
 }
@@ -458,7 +429,7 @@ static void nostr_event_handler(struct mg_connection *connection, int event, voi
         if (accept && mg_str_contains(*accept, "application/nostr+json")) {
             for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
                 if (plugin->info_document) {
-                    mg_http_reply(connection, 200, "Content-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", plugin->info_document());
+                    mg_http_reply(connection, 200, "Content-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\n", "%s", plugin->info_document(plugin->ctx));
                     served_info = true;
                     break;
                 }
@@ -468,14 +439,14 @@ static void nostr_event_handler(struct mg_connection *connection, int event, voi
     } else if (event == MG_EV_WS_OPEN) {
         log_message(connection, "client connected (websocket open)");
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->on_connect) plugin->on_connect(connection);
+            if (plugin->on_connect) plugin->on_connect(connection, plugin->ctx);
         }
     } else if (event == MG_EV_WS_MSG) handle_message(connection, event_data);
     else if (event == MG_EV_CLOSE) {
         log_message(connection, "client disconnected");
         remove_subscriptions(connection, NULL);
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->on_disconnect) plugin->on_disconnect(connection);
+            if (plugin->on_disconnect) plugin->on_disconnect(connection, plugin->ctx);
         }
     }
 }
@@ -485,7 +456,7 @@ static void nostr_event_handler(struct mg_connection *connection, int event, voi
 static void plugin_timer_fn(void *arg) {
     (void) arg;
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-        if (plugin->timer) plugin->timer(storage_ctx);
+        if (plugin->timer) plugin->timer(storage_ctx, plugin->ctx);
     }
 }
 
