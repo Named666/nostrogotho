@@ -83,6 +83,51 @@ static bool parse_a_tag(const char *a, int *kind, char *pubkey,
     return true;
 }
 
+typedef struct {
+    const char *tag_name;
+    const char *tag_value;
+    bool empty_value_when_missing;
+} nip09_tag_match_t;
+
+static bool nip09_event_has_exact_tag_value(const event_t *event, void *userdata) {
+    const nip09_tag_match_t *match = (const nip09_tag_match_t *)userdata;
+    struct mg_str key, tag, tags = mg_str(event->tags_json ? event->tags_json : "[]");
+    size_t offset = 0;
+    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+        char *name = nip_tag_element(tag, 0);
+        if (name && strcmp(name, match->tag_name) == 0) {
+            char *value = nip_tag_element(tag, 1);
+            bool result = strcmp(value ? value : "", match->tag_value) == 0;
+            free(value);
+            free(name);
+            return result;
+        }
+        free(name);
+    }
+    return match->empty_value_when_missing && match->tag_value[0] == '\0';
+}
+
+static bool nip09_delete_matching(storage_context_t *storage,
+                                  const storage_event_scope_t *scope,
+                                  storage_event_predicate_t predicate,
+                                  void *userdata, size_t *deleted_total) {
+    storage_event_scope_t page = *scope;
+    char cursor[MAX_ID_SIZE + 1] = "";
+    bool more = false;
+    size_t total = 0;
+    do {
+        size_t deleted = 0;
+        char next_id[MAX_ID_SIZE + 1] = "";
+        page.after_id = cursor[0] ? cursor : NULL;
+        if (!storage->delete_matching(&page, predicate, userdata, &deleted,
+                                      next_id, sizeof(next_id), &more)) return false;
+        total += deleted;
+        snprintf(cursor, sizeof(cursor), "%s", next_id);
+    } while (more);
+    if (deleted_total) *deleted_total = total;
+    return true;
+}
+
 /* Delete a replaceable/addressable event referenced by an "a" tag.
  * Returns false only on a storage error; targets the relay has no knowledge
  * of, or that fail author/kind validation, are skipped without failing. */
@@ -111,10 +156,18 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
                                                            event->created_at);
     } else {
         /* Addressable event (kind 30000-40000) with a "d" identifier. */
-        char *elements[2] = {"d", (char *)d_identifier};
-        tag_t dtag = {elements, 2, 2};
-        result = storage->delete_record_by_kind_and_pubkey_and_dtag(
-            kind, pubkey, &dtag, event->created_at);
+        storage_event_scope_t scope = {0};
+        nip09_tag_match_t match = {"d", d_identifier, true};
+        size_t deleted;
+        scope.pubkey = pubkey;
+        scope.has_kind = true;
+        scope.kind = kind;
+        scope.has_created_at_before = true;
+        scope.created_at_before = event->created_at;
+        return storage->delete_matching &&
+               nip09_delete_matching(storage, &scope,
+                                    nip09_event_has_exact_tag_value, &match,
+                                    &deleted);
     }
     return result >= 0;
 }
@@ -135,7 +188,6 @@ static bool deletion_authorized(const event_t *event, const event_t *target) {
 static bool delete_e_target(const event_t *event, storage_context_t *storage,
                             const char *id) {
     event_t *target = storage->get_event_by_id(id);
-    int result;
     bool ok = true;
 
     if (!target) return true;  /* No knowledge of this event — nothing to do. */
@@ -146,13 +198,20 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
     if (deletion_authorized(event, target) &&
         kind_is_requested(event, target->kind)) {
         if (target->kind == 1059) {
-            tag_t recipient = {(char *[]) {"p", (char *) event->pubkey}, 2, 2};
-            result = storage->delete_record_by_id_and_kind_and_ptag(
-                id, 1059, &recipient);
+            storage_event_scope_t scope = {0};
+            nip09_tag_match_t match = {"p", event->pubkey, false};
+            size_t deleted = 0;
+            scope.id = id;
+            scope.has_kind = true;
+            scope.kind = 1059;
+            if (!storage->delete_matching ||
+                !nip09_delete_matching(storage, &scope,
+                                      nip09_event_has_exact_tag_value, &match,
+                                      &deleted) || deleted == 0) ok = false;
         } else {
-            result = storage->delete_record_by_id_and_pubkey(id, event->pubkey);
+            int result = storage->delete_record_by_id_and_pubkey(id, event->pubkey);
+            if (result <= 0) ok = false;
         }
-        if (result <= 0) ok = false;
     }
     event_free(target);
     return ok;

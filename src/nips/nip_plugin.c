@@ -6,9 +6,9 @@
 /* ============================================================================
  * NIP Plugin Registry
  *
- * A simple intrusive linked list. Registration happens from per-module
- * constructors, which run before main() on MinGW/GCC, so by the time
- * server_configure() runs the full set of compiled-in plugins is known.
+ * A simple intrusive linked list. Registration happens from per-image
+ * constructors before module INIT. Each shared image owns a private copy of
+ * this registry; init() only attaches services/configuration.
  *
  * nip_plugin_register() is the single registration entry point: it links the
  * plugin into the registry AND wires any declared kinds into the NIP-01
@@ -17,6 +17,47 @@
  */
 
 static nip_plugin_t *registry;
+static nip_plugin_send_json_fn host_send_json;
+static nip_plugin_tag_index_fn tag_indexer;
+static nip_plugin_query_index_fn query_indexer;
+
+void nip_plugin_set_send_json(nip_plugin_send_json_fn send_json) {
+    host_send_json = send_json;
+}
+
+void nip_plugin_set_tag_indexer(nip_plugin_tag_index_fn indexer) {
+    tag_indexer = indexer;
+}
+
+void nip_plugin_set_query_indexer(nip_plugin_query_index_fn indexer) {
+    query_indexer = indexer;
+}
+
+bool nip_plugin_extract_index_tags(const event_t *event,
+                                   storage_tag_match_t **matches,
+                                   size_t *count) {
+    if (!matches || !count) return false;
+    *matches = NULL;
+    *count = 0;
+    return !tag_indexer || tag_indexer(event, matches, count);
+}
+
+bool nip_plugin_query_index_tags(const filter_t *filters,
+                                 size_t filters_count,
+                                 storage_tag_match_t **matches,
+                                 size_t *count) {
+    if (!matches || !count) return false;
+    *matches = NULL;
+    *count = 0;
+    return !query_indexer || query_indexer(filters, filters_count,
+                                           matches, count);
+}
+
+void nip_plugin_reset_registry(void) {
+    host_send_json = NULL;
+    tag_indexer = NULL;
+    query_indexer = NULL;
+}
 
 void nip_plugin_register(nip_plugin_t *plugin) {
     if (!plugin || !plugin->name) return;
@@ -35,7 +76,8 @@ void nip_plugins_init(const relay_config_t *config) {
 }
 
 void nip_plugin_send_json(struct mg_connection *connection, const char *json) {
-    if (connection && json) mg_ws_send(connection, json, strlen(json), WEBSOCKET_OP_TEXT);
+    if (!connection || !json || !host_send_json) return;
+    if (host_send_json) host_send_json(connection, json, strlen(json));
 }
 
 void nip_plugin_send_status(struct mg_connection *connection, const char *type,
@@ -71,7 +113,19 @@ nip01_process_result_t nip_plugin_reject(const char *message) {
 }
 
 bool nip_plugin_store(storage_context_t *storage, const event_t *event) {
-    return storage && storage->insert_record && storage->insert_record(event);
+    storage_tag_match_t *matches = NULL;
+    size_t count = 0;
+    bool indexed = nip_plugin_extract_index_tags(event, &matches, &count);
+    bool stored = storage && storage->insert_record && indexed &&
+                  storage->insert_record(event, matches, count);
+    if (matches) {
+        for (size_t i = 0; i < count; i++) {
+            free((void *)matches[i].tag_name);
+            free((void *)matches[i].tag_value);
+        }
+        free(matches);
+    }
+    return stored;
 }
 
 nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage,
@@ -79,7 +133,7 @@ nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage
     if (!storage || !storage->insert_record) {
         return nip_plugin_reject("error: storage unavailable");
     }
-    if (!storage->insert_record(event)) {
+    if (!nip_plugin_store(storage, event)) {
         return nip_plugin_reject("duplicate: event already exists");
     }
     return nip_plugin_accept();

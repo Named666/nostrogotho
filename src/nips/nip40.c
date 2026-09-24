@@ -50,6 +50,11 @@ bool nip40_event_is_expired(const event_t *event) {
     return false;
 }
 
+static bool nip40_expiry_predicate(const event_t *event, void *userdata) {
+    (void)userdata;
+    return nip40_event_is_expired(event);
+}
+
 /* nip40_garbage_collect - Background sweep of NIP-40 expired events.
  *
  * Callback for a periodic mongoose timer. Runs inside the single-threaded
@@ -60,16 +65,32 @@ bool nip40_event_is_expired(const event_t *event) {
  * the server on a purge error.
  *
  * Args:
- *   arg - storage_context_t* (the backend to sweep). May be NULL / may lack
- *         purge_expired(); either case is a no-op.
+ *   arg - storage_context_t* (the backend to sweep). May be NULL; then this
+ *         operation is a no-op.
  */
 void nip40_garbage_collect(void *arg) {
     storage_context_t *storage = (storage_context_t *) arg;
-    if (!storage || !storage->purge_expired) return;
-
-    int deleted = storage->purge_expired(time(NULL));
-    if (deleted > 0) fprintf(stdout, "[NIP-40 GC] deleted %d expired event(s)\n", deleted);
-    else if (deleted < 0) fprintf(stderr, "NIP-40 GC: purge failed\n");
+    storage_event_scope_t scope = {0};
+    char cursor[MAX_ID_SIZE + 1] = "";
+    size_t total = 0;
+    bool more = false;
+    if (!storage || !storage->delete_matching) return;
+    do {
+        size_t deleted = 0;
+        char next_id[MAX_ID_SIZE + 1] = "";
+        scope.after_id = cursor[0] ? cursor : NULL;
+        if (!storage->delete_matching(&scope,
+                                      nip40_expiry_predicate,
+                                      NULL, &deleted, next_id, sizeof(next_id),
+                                      &more)) {
+            fprintf(stderr, "NIP-40 GC: storage selection failed\n");
+            return;
+        }
+        total += deleted;
+        snprintf(cursor, sizeof(cursor), "%s", next_id);
+    } while (more);
+    if (total > 0) fprintf(stdout, "[NIP-40 GC] deleted %lu expired event(s)\n",
+                           (unsigned long)total);
 }
 
 /* ============================================================================

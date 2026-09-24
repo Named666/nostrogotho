@@ -123,9 +123,20 @@ typedef struct nip_plugin {
     struct nip_plugin *next;
 } nip_plugin_t;
 
+typedef void (*nip_plugin_send_json_fn)(struct mg_connection *connection,
+                                        const char *json, size_t length);
+
 /* Register a plugin. Call from __attribute__((constructor)) in the NIP's
  * own .c file so inclusion in the build is the only opt-in required. */
 void nip_plugin_register(nip_plugin_t *plugin);
+/* Clear host-service callback slots only; do not unlink constructor-registered
+ * plugins from this image's registry. */
+void nip_plugin_reset_registry(void);
+
+/* Install an optional host transport bridge. Monolithic builds leave this
+ * unset and use Mongoose directly; reloadable builds install the resident
+ * host bridge during module initialization. */
+void nip_plugin_set_send_json(nip_plugin_send_json_fn send_json);
 
 /* Head of the registration list (in registration order). */
 nip_plugin_t *nip_plugins(void);
@@ -165,5 +176,24 @@ nip01_process_result_t nip_plugin_store_only(storage_context_t *storage,
 
 /* Thin wrapper over storage->insert_record. */
 bool nip_plugin_store(storage_context_t *storage, const event_t *event);
+
+/* Configure the generic tag-index extractor used by plugin store helpers.
+ * The hook is synchronous and the returned keys are freed before returning. */
+typedef bool (*nip_plugin_tag_index_fn)(const event_t *event,
+                                        storage_tag_match_t **matches,
+                                        size_t *count);
+typedef bool (*nip_plugin_query_index_fn)(const filter_t *filters,
+                                          size_t filters_count,
+                                          storage_tag_match_t **matches,
+                                          size_t *count);
+void nip_plugin_set_tag_indexer(nip_plugin_tag_index_fn indexer);
+void nip_plugin_set_query_indexer(nip_plugin_query_index_fn indexer);
+bool nip_plugin_extract_index_tags(const event_t *event,
+                                   storage_tag_match_t **matches,
+                                   size_t *count);
+bool nip_plugin_query_index_tags(const filter_t *filters,
+                                 size_t filters_count,
+                                 storage_tag_match_t **matches,
+                                 size_t *count);
 
 #endif /* NIP_PLUGIN_H_ */

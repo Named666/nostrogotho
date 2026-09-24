@@ -7,6 +7,7 @@
 #include "crypto.h"
 #include "server.h"
 #include "storage.h"
+#include "nhr.h"
 
 static storage_context_t storage_ctx = {0};
 
@@ -56,6 +57,8 @@ int main(int argc, const char **argv) {
     int min_pow = 0;
     int lower_limit = 0;
     int upper_limit = 900;
+    bool hot_reload = false;
+    const char *module_path = getenv("NHR_MODULE_PATH");
 
     if (!parse_int(getenv("MIN_POW_DIFFICULTY") ? getenv("MIN_POW_DIFFICULTY") : "0", &min_pow) ||
         !parse_int(getenv("CREATED_AT_LOWER_LIMIT") ? getenv("CREATED_AT_LOWER_LIMIT") : "0", &lower_limit) ||
@@ -78,6 +81,10 @@ int main(int argc, const char **argv) {
             service_url = argv[++i];
         } else if (strcmp(argv[i], "--debug") == 0) {
             server_set_debug(true);
+        } else if (strcmp(argv[i], "--hot-reload") == 0) {
+            hot_reload = true;
+        } else if (strcmp(argv[i], "--module") == 0 && i + 1 < argc) {
+            module_path = argv[++i];
         } else if (strcmp(argv[i], "-min-pow") == 0 && i + 1 < argc) {
             if (!parse_int(argv[++i], &min_pow) || min_pow < 0) return 1;
         } else if (strcmp(argv[i], "-created-at-lower-limit") == 0 && i + 1 < argc) {
@@ -90,6 +97,8 @@ int main(int argc, const char **argv) {
             printf("  -port num                      WebSocket port (default: 7447)\n");
             printf("  -service-url url               Public relay URL for NIP-42/NIP-62\n");
             printf("  --debug                        Print connects, disconnects and events to console\n");
+            printf("  --hot-reload                   Load relay policy from a reloadable module\n");
+            printf("  --module path                  Module path (default: build/nostrogotho.so/.dll)\n");
             printf("  -min-pow bits                  Minimum NIP-13 difficulty\n");
             printf("  -created-at-lower-limit sec    Maximum accepted age, 0 disables\n");
             printf("  -created-at-upper-limit sec    Maximum accepted future offset, 0 disables\n");
@@ -103,6 +112,31 @@ int main(int argc, const char **argv) {
 
     if (!init_storage(db_path)) {
         return 1;
+    }
+
+    if (hot_reload) {
+        relay_config_t config;
+        Nhr_Runtime runtime;
+        if (!module_path) {
+#ifdef _WIN32
+            module_path = "build/nostrogotho.dll";
+#else
+            module_path = "build/nostrogotho.so";
+#endif
+        }
+        if (!server_make_relay_config(&storage_ctx, service_url ? service_url : "",
+                                      min_pow, (time_t)lower_limit,
+                                      (time_t)upper_limit, &config) ||
+            !nhr_runtime_init(&runtime, &storage_ctx, &config, module_path)) {
+            fprintf(stderr, "Failed to initialize hot-reload module\n");
+            cleanup();
+            return 1;
+        }
+        signal(SIGINT, sigint_handler);
+        bool result = server_run_hot(port, &runtime, module_path);
+        nhr_runtime_shutdown(&runtime);
+        cleanup();
+        return result ? 0 : 1;
     }
 
     server_configure(&storage_ctx, service_url ? service_url : "", min_pow,

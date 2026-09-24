@@ -7,9 +7,9 @@
 /* ============================================================================
  * Build dispatcher.
  *
- *   nob            -> auto-detect the host OS and build for it
- *   nob win        -> force the Windows build (src_build/nob_win.c)
- *   nob linux      -> force the Linux build   (src_build/nob_linux.c)
+ *   nob              -> auto-detect the host OS and build for it
+ *   nob win|linux    -> force the requested target
+ *   nob [target] -hr -> run the hot-reload supervisor
  * ============================================================================ */
 
 int main(int argc, char **argv)
@@ -19,14 +19,28 @@ int main(int argc, char **argv)
     /* Parse the target argument: "win" or "linux". Anything else falls back
      * to auto-detection based on the compiler's host target. */
     int want_win = -1; /* -1 = auto */
+    int hot_reload = 0;
+    int separator = argc;
+    int target_argc = 0;
+    char **target_argv = NULL;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "win") == 0)        want_win = 1;
+        if (strcmp(argv[i], "--") == 0) { separator = i + 1; break; }
+        else if (strcmp(argv[i], "win") == 0)        want_win = 1;
         else if (strcmp(argv[i], "linux") == 0) want_win = 0;
+        else if (strcmp(argv[i], "-hr") == 0)   hot_reload = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            nob_log(INFO, "Usage: nob [win|linux]");
+            nob_log(INFO, "Usage: nob [win|linux] [-hr] [-- relay-args...]");
             nob_log(INFO, "  (no argument)  auto-detect host OS");
+            nob_log(INFO, "  -hr            build, run, and watch reloadable module");
             return 0;
+        } else if (argv[i][0] == '-') {
+            nob_log(ERROR, "Unknown nob option: %s", argv[i]);
+            return 1;
         }
+    }
+    if (separator < argc) {
+        target_argc = argc - separator;
+        target_argv = &argv[separator];
     }
     if (want_win < 0) {
 #ifdef _WIN32
@@ -76,7 +90,10 @@ int main(int argc, char **argv)
     nob_cc_inputs(&cmd, input_path);
     if (!cmd_run(&cmd)) return 1;
 
+    cmd.count = 0;
     cmd_append(&cmd, executable_path);
+    if (hot_reload) nob_cmd_append(&cmd, "-hr");
+    for (int i = 0; i < target_argc; i++) nob_cmd_append(&cmd, target_argv[i]);
     if (!cmd_run(&cmd)) return 1;
 
     return 0;

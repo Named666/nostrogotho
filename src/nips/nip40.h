@@ -39,7 +39,7 @@ bool nip40_event_is_expired(const event_t *event);
  *
  * Args:
  *   arg - pointer to an initialized storage_context_t. NULL-safe; a context
- *         without purge_expired() is a no-op.
+ *         without generic event-selection support is a no-op.
  */
 void nip40_garbage_collect(void *arg);
 

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include "nostrogotho.h"
+#include "../storage.h"
 
 /* ============================================================================
  * NIP-26: Delegated Event Signing
@@ -53,5 +54,16 @@
  */
 bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
                             const char *conditions, const char *delegation_sig);
+
+/* NIP-26 chooses the generic tag-index pairs that make delegated authors
+ * discoverable to storage queries. Caller owns returned array and strings. */
+bool nip26_extract_index_tags(const event_t *event,
+                              storage_tag_match_t **matches, size_t *count);
+void nip26_free_index_tags(storage_tag_match_t *matches, size_t count);
+bool nip26_query_index_tags(const filter_t *filters, size_t filters_count,
+                            storage_tag_match_t **matches, size_t *count);
+void nip26_set_crypto_services(
+    void (*hash_fn)(const uint8_t *, size_t, uint8_t[32]),
+    bool (*verify_fn)(const char *, const char *, const uint8_t[32]));
 
 #endif /* NIP26_H_ */

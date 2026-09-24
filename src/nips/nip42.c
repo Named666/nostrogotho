@@ -116,11 +116,76 @@ bool nip42_open_challenge(struct mg_connection *connection, char challenge[17]) 
 bool nip42_authenticate(struct mg_connection *connection, const event_t *event,
                         const char *service_url, time_t now) {
     nip42_client_t *client = find_client(connection);
-    if (!client || event->kind != 22242 || !check_event(event) ||
+    bool valid_event;
+#ifdef NHR_BUILD_MODULE
+    extern bool nhr_module_accepts_event(const event_t *event);
+    valid_event = nhr_module_accepts_event(event);
+#else
+    valid_event = check_event(event);
+#endif
+    if (!client || event->kind != 22242 || !valid_event ||
         llabs((long long) now - (long long) event->created_at) > 600 ||
         !nip_event_has_tag(event, "challenge", client->challenge) ||
         !nip_event_has_relay_tag(event, service_url)) return false;
     strcpy(client->pubkey, event->pubkey);
+    return true;
+}
+
+bool nip42_save_state(nip42_state_t *state,
+                      const nip42_connection_t *connections,
+                      size_t connection_count) {
+    size_t count = 0;
+    if (!state) return false;
+    memset(state, 0, sizeof(*state));
+    state->version = 1;
+    for (nip42_client_t *client = clients; client; client = client->next) {
+        uintptr_t connection_id = 0;
+        for (size_t i = 0; i < connection_count; i++) {
+            if (connections[i].connection == client->connection) {
+                connection_id = connections[i].id;
+                break;
+            }
+        }
+        if (!connection_id) continue;
+        if (count >= sizeof(state->clients) / sizeof(state->clients[0])) return false;
+        state->clients[count].connection_id = connection_id;
+        snprintf(state->clients[count].challenge,
+                 sizeof(state->clients[count].challenge), "%s", client->challenge);
+        snprintf(state->clients[count].pubkey,
+                 sizeof(state->clients[count].pubkey), "%s", client->pubkey);
+        count++;
+    }
+    state->count = (uint32_t)count;
+    return true;
+}
+
+bool nip42_restore_state(const nip42_state_t *state,
+                         const nip42_connection_t *connections,
+                         size_t connection_count) {
+    if (!state || state->version != 1 ||
+        state->count > sizeof(state->clients) / sizeof(state->clients[0])) return false;
+    for (uint32_t i = 0; i < state->count; i++) {
+        struct mg_connection *connection = NULL;
+        for (size_t j = 0; j < connection_count; j++) {
+            if (connections[j].id == state->clients[i].connection_id) {
+                connection = connections[j].connection;
+                break;
+            }
+        }
+        if (!connection) continue; /* Client disconnected since the snapshot. */
+        nip42_client_t *client = find_client(connection);
+        if (!client) {
+            client = (nip42_client_t *)calloc(1, sizeof(*client));
+            if (!client) return false;
+            client->connection = connection;
+            client->next = clients;
+            clients = client;
+        }
+        memcpy(client->challenge, state->clients[i].challenge,
+               sizeof(client->challenge));
+        memcpy(client->pubkey, state->clients[i].pubkey,
+               sizeof(client->pubkey));
+    }
     return true;
 }
 

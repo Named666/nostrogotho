@@ -1,5 +1,7 @@
 #include "crypto.h"
+#ifndef NHR_DYNAMIC_MODULE
 #include "nips/nip26.h"
+#endif
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -642,7 +644,7 @@ static tags_array_t *parse_tags_json(const char *json_str) {
  * 
  * Fails gracefully with detailed logging on any step failure.
  */
-bool check_event(const event_t *ev) {
+bool check_event_core(const event_t *ev) {
     if (!ev) return false;
     
     /* Build the event hash input: [0, pubkey, created_at, kind, tags, content]
@@ -717,7 +719,15 @@ bool check_event(const event_t *ev) {
         return false;
     }
     
-    /* Check delegation tags if present */
+    return true;
+}
+
+#ifndef NHR_DYNAMIC_MODULE
+bool check_event(const event_t *ev) {
+    if (!check_event_core(ev)) return false;
+#ifndef NHR_DYNAMIC_MODULE
+    /* Check delegation tags in the monolithic build. Hot builds perform this
+     * NIP-26 policy check inside the module using host crypto services. */
     if (!ev->tags_json) {
         /* No tags, skip delegation check */
     } else {
@@ -750,7 +760,13 @@ bool check_event(const event_t *ev) {
     }
     
     return true;
+#else
+    return true;
+#endif
 }
+#else
+bool check_event(const event_t *ev) { return check_event_core(ev); }
+#endif
 
 /* ============================================================================
  * Proof of Work (NIP-13)

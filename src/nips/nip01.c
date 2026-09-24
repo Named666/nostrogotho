@@ -29,7 +29,12 @@ bool nip01_validate_event(const event_t *ev) {
     
     /* Delegate to crypto layer for full validation
      * (ID verification, signature verification, delegation checking) */
+#ifdef NHR_BUILD_MODULE
+    extern bool nhr_module_accepts_event(const event_t *event);
+    return nhr_module_accepts_event(ev);
+#else
     return check_event(ev);
+#endif
 }
 
 /* ============================================================================
@@ -163,6 +168,59 @@ static bool nip01_replace_event(const event_t *event, storage_context_t *storage
                                                      event->created_at) >= 0;
 }
 
+typedef struct {
+    const char *identifier;
+} nip01_dtag_match_t;
+
+static bool nip01_matches_dtag(const event_t *event, void *userdata) {
+    const nip01_dtag_match_t *match = (const nip01_dtag_match_t *)userdata;
+    struct mg_str key, tag, tags = mg_str(event->tags_json ? event->tags_json : "[]");
+    size_t offset = 0;
+    bool found_d = false;
+    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+        char *name = nip_tag_element(tag, 0);
+        if (name && strcmp(name, "d") == 0) {
+            char *value = nip_tag_element(tag, 1);
+            found_d = true;
+            bool matched = strcmp(value ? value : "", match->identifier) == 0;
+            free(value);
+            free(name);
+            return matched;
+        }
+        free(name);
+    }
+    /* NIP-01/33: absence of a d tag is equivalent to d="". */
+    return !found_d && match->identifier[0] == '\0';
+}
+
+static bool nip01_delete_addressable(const event_t *event,
+                                     storage_context_t *storage,
+                                     const char *identifier) {
+    storage_event_scope_t scope = {0};
+    nip01_dtag_match_t match;
+    char cursor[MAX_ID_SIZE + 1] = "";
+    bool more;
+
+    if (!storage || !storage->delete_matching) return false;
+    scope.pubkey = event->pubkey;
+    scope.has_kind = true;
+    scope.kind = event->kind;
+    scope.has_created_at_before = true;
+    scope.created_at_before = event->created_at;
+    match.identifier = identifier ? identifier : "";
+
+    do {
+        size_t deleted = 0;
+        char next_id[MAX_ID_SIZE + 1] = "";
+        scope.after_id = cursor[0] ? cursor : NULL;
+        if (!storage->delete_matching(&scope, nip01_matches_dtag, &match,
+                                      &deleted, next_id, sizeof(next_id), &more)) return false;
+        (void)deleted;
+        snprintf(cursor, sizeof(cursor), "%s", next_id);
+    } while (more);
+    return true;
+}
+
 static nip01_process_result_t nip01_replaceable_listener(
     struct mg_connection *connection,
     const event_t *event,
@@ -206,10 +264,7 @@ static bool nip01_replace_addressable_event(const event_t *event,
         }
     }
     /* NIP-01: an event without a "d" tag is treated as having an empty one. */
-    tag_t dtag = {(char *[]) {"d", dvalue ? dvalue : ""}, 2, 2};
-    bool replaced = storage->delete_record_by_kind_and_pubkey_and_dtag(
-                        event->kind, event->pubkey, &dtag,
-                        event->created_at) >= 0;
+    bool replaced = nip01_delete_addressable(event, storage, dvalue);
     free(dvalue);
     return replaced;
 }

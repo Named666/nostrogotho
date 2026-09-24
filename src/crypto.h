@@ -154,6 +154,7 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
  * Note: Does NOT check timestamps or proof-of-work; those are checked separately
  */
 bool check_event(const event_t *ev);
+bool check_event_core(const event_t *ev);
 
 /* check_delegation - Verify a delegation tag (NIP-26)
  * 

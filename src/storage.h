@@ -32,6 +32,37 @@
  */
 typedef void (*send_records_callback_t)(const char *json_event);
 
+/* Optional column-level narrowing for generic event walks. Tag interpretation
+ * is deliberately left to the caller's synchronous predicate callback. */
+typedef struct {
+    const char *id;
+    const char *after_id;
+    const char *pubkey;
+    bool has_kind;
+    int kind;
+    bool has_created_at_before;
+    time_t created_at_before;
+    bool has_created_at_at_or_before;
+    time_t created_at_at_or_before;
+    bool has_created_at_after;
+    time_t created_at_after;
+    bool has_excluded_kind;
+    int excluded_kind;
+    size_t limit; /* Maximum rows examined; zero uses the backend default. */
+} storage_event_scope_t;
+
+/* Called synchronously with a borrowed event view. Return true to select the
+ * event for deletion. The callback is never retained by storage. */
+typedef bool (*storage_event_predicate_t)(const event_t *event, void *userdata);
+
+/* Generic opaque tag-index extension. A NIP may provide (tag name, tag value)
+ * pairs at insertion and query time; storage performs no interpretation. */
+typedef struct {
+    const char *tag_name;
+    const char *tag_value;
+    size_t filter_index;
+} storage_tag_match_t;
+
 /* ============================================================================
  * Storage Context Structure
  * ============================================================================ */
@@ -86,7 +117,9 @@ typedef struct {
      * Returns: true if inserted, false if duplicate or error
      * Note: May enforce uniqueness on event ID
      */
-    bool (*insert_record)(const event_t *ev);
+    bool (*insert_record)(const event_t *ev,
+                          const storage_tag_match_t *indexed_tags,
+                          size_t indexed_tags_count);
     
     /* ====================================================================
      * Event Deletion Operations
@@ -109,56 +142,22 @@ typedef struct {
      */
     int (*delete_record_by_kind_and_pubkey)(int kind, const char *pubkey, time_t created_at);
     
-    /* delete_record_by_kind_and_pubkey_and_dtag - Delete addressable events (NIP-09, NIP-33)
-     * Args:
-     *   kind - addressable event kind (30000-40000 range)
-     *   pubkey - author pubkey
-     *   tag - tag to match (usually ["d", "identifier"])
-     *   created_at - delete events with created_at < this timestamp
-     * Returns: number of records deleted, or -1 on error
-     * Used for parameterized replaceable events
-     */
-    int (*delete_record_by_kind_and_pubkey_and_dtag)(int kind, const char *pubkey,
-                                                     const tag_t *tag, time_t created_at);
-    
-    /* delete_record_by_id_and_kind_and_ptag - Delete gift-wrap events (NIP-09, NIP-17)
-     * Args:
-     *   id - event ID to match
-     *   kind - event kind (1059, 21059 for gift wraps)
-     *   tag - p-tag to match (usually ["p", pubkey])
-     * Returns: number of records deleted, or -1 on error
-     * Used for gift wrap deletion (only sender/recipient can delete)
-     */
-    int (*delete_record_by_id_and_kind_and_ptag)(const char *id, int kind,
-                                                 const tag_t *tag);
-    
-    /* delete_all_events_by_pubkey - Delete all events by author up to a time
-     * Args:
-     *   pubkey - author pubkey
-     *   created_at - delete events with created_at <= this timestamp
-     *   exclude_kind - if non-zero, events of this kind are kept (0 = delete all)
-     * Returns: number of records deleted, or -1 on error
-     * Generic primitive; the NIP-62 plugin passes its own kind to keep the
-     * vanish request itself from being deleted.
-     */
-    int (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at,
-                                       int exclude_kind);
-    
-    /* purge_expired - Delete NIP-40 expired events (background GC)
-     * 
-     * Deletes every stored event whose ["expiration", "<timestamp>"] tag has
-     * a timestamp <= now. Intended to be driven by a periodic background task
-     * (the server event loop) so that already-accepted events don't linger in
-     * the database forever.
-     * 
-     * Args: now - reference timestamp (time(NULL)); events expiring on or
-     *             before this instant are removed.
-     * Returns: number of rows deleted, or -1 on error. May be NULL if the
-     *          backend does not implement expiration GC.
-     * 
-     * Thread safety: same as the rest of the storage context (NOT thread-safe).
-     */
-    int (*purge_expired)(time_t now);
+    /* delete_matching - Delete events narrowed by generic columns and
+     * selected by a caller-supplied synchronous predicate. The callback may
+     * inspect tags but must not retain the borrowed event pointers. `deleted`
+     * receives the number of deleted rows when non-NULL. Returns false on
+     * database/allocation failure. Storage invokes the callback in bounded
+     * batches and never stores it. */
+    bool (*delete_matching)(const storage_event_scope_t *scope,
+                            storage_event_predicate_t predicate,
+                            void *userdata, size_t *deleted,
+                            char *next_id, size_t next_id_size, bool *more);
+
+    /* Generic indexed tag-value lookup; NIP code chooses the tag semantics.
+     * Returns caller-owned event ID strings and an allocated array. */
+    bool (*find_ids_by_tag)(const char *tag_name, const char *tag_value,
+                            char ***ids, size_t *count);
+    void (*free_id_list)(char **ids, size_t count);
     
     /* ====================================================================
      * Event Query and Streaming
@@ -193,7 +192,12 @@ typedef struct {
      */
     bool (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more, int *out_count);
+                        bool do_count, bool *has_more, int *out_count,
+                        const storage_tag_match_t *indexed_tags,
+                        size_t indexed_tags_count);
+    /* Return a module-owned array of generic tag index keys extracted from an
+     * event, for use in the next insert_record call. Caller releases it with
+     * free_tag_matches(). Storage stores only the supplied opaque pairs. */
 } storage_context_t;
 
 /* ============================================================================

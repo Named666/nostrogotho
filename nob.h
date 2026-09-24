@@ -507,6 +507,14 @@ typedef struct {
 // Wait until the process has finished
 NOBDEF bool nob_proc_wait(Nob_Proc proc);
 
+/* Poll a child process without blocking. Returns 0 while running, 1 when it
+ * exited successfully, and -1 on error/nonzero exit. Reaps/closes on exit. */
+NOBDEF int nob_proc_poll(Nob_Proc proc);
+
+/* Terminate a child process and reap/close its handle. */
+NOBDEF bool nob_proc_terminate(Nob_Proc proc);
+NOBDEF void nob_sleep_ms(unsigned milliseconds);
+
 // Wait until all the processes have finished
 NOBDEF bool nob_procs_wait(Nob_Procs procs);
 
@@ -527,6 +535,9 @@ typedef struct {
     size_t count;
     size_t capacity;
 } Nob_Cmd;
+
+/* Start a child process and return its handle without waiting. */
+NOBDEF Nob_Proc nob_cmd_start(Nob_Cmd *cmd);
 
 // Options for nob_cmd_run_opt() function.
 typedef struct {
@@ -1788,57 +1799,101 @@ NOBDEF bool nob_procs_wait_and_reset(Nob_Procs *procs)
 NOBDEF bool nob_proc_wait(Nob_Proc proc)
 {
     if (proc == NOB_INVALID_PROC) return false;
-
 #ifdef _WIN32
-    DWORD result = WaitForSingleObject(
-                       proc,    // HANDLE hHandle,
-                       INFINITE // DWORD  dwMilliseconds
-                   );
-
-    if (result == WAIT_FAILED) {
-        nob_log(NOB_ERROR, "could not wait on child process: %s", nob_win32_error_message(GetLastError()));
-        return false;
-    }
-
+    DWORD result = WaitForSingleObject(proc, INFINITE);
+    if (result == WAIT_FAILED) return false;
     DWORD exit_status;
-    if (!GetExitCodeProcess(proc, &exit_status)) {
-        nob_log(NOB_ERROR, "could not get process exit code: %s", nob_win32_error_message(GetLastError()));
-        return false;
-    }
-
-    if (exit_status != 0) {
-        nob_log(NOB_ERROR, "command exited with exit code %lu", exit_status);
-        return false;
-    }
-
+    if (!GetExitCodeProcess(proc, &exit_status)) return false;
+    if (exit_status != 0) return false;
     CloseHandle(proc);
-
     return true;
 #else
     for (;;) {
-        int wstatus = 0;
-        if (waitpid(proc, &wstatus, 0) < 0) {
+        int status = 0;
+        if (waitpid(proc, &status, 0) < 0) {
             nob_log(NOB_ERROR, "could not wait on command (pid %d): %s", proc, strerror(errno));
             return false;
         }
-
-        if (WIFEXITED(wstatus)) {
-            int exit_status = WEXITSTATUS(wstatus);
+        if (WIFEXITED(status)) {
+            int exit_status = WEXITSTATUS(status);
             if (exit_status != 0) {
                 nob_log(NOB_ERROR, "command exited with exit code %d", exit_status);
                 return false;
             }
-
             break;
         }
-
-        if (WIFSIGNALED(wstatus)) {
-            nob_log(NOB_ERROR, "command process was terminated by signal %d", WTERMSIG(wstatus));
+        if (WIFSIGNALED(status)) {
+            nob_log(NOB_ERROR, "command process was terminated by signal %d", WTERMSIG(status));
             return false;
         }
     }
-
     return true;
+#endif
+}
+
+NOBDEF int nob_proc_poll(Nob_Proc proc)
+{
+    if (proc == NOB_INVALID_PROC) return -1;
+#ifdef _WIN32
+    DWORD wait_result = WaitForSingleObject(proc, 0);
+    if (wait_result == WAIT_TIMEOUT) return 0;
+    if (wait_result == WAIT_FAILED) return -1;
+    DWORD exit_status = 0;
+    if (!GetExitCodeProcess(proc, &exit_status)) return -1;
+    CloseHandle(proc);
+    return exit_status == 0 ? 1 : -1;
+#else
+    int status = 0;
+    pid_t result = waitpid(proc, &status, WNOHANG);
+    if (result == 0) return 0;
+    if (result < 0) return -1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status) == 0 ? 1 : -1;
+    return -1;
+#endif
+}
+
+NOBDEF bool nob_proc_terminate(Nob_Proc proc)
+{
+    if (proc == NOB_INVALID_PROC) return false;
+#ifdef _WIN32
+    if (!TerminateProcess(proc, 1)) {
+        DWORD wait_result = WaitForSingleObject(proc, 0);
+        if (wait_result != WAIT_OBJECT_0) return false;
+    }
+    WaitForSingleObject(proc, INFINITE);
+    CloseHandle(proc);
+    return true;
+#else
+    int status = 0;
+    pid_t result = waitpid(proc, &status, WNOHANG);
+    if (result == proc) return true;
+    if (result < 0) return false;
+    if (kill(proc, SIGTERM) != 0 && errno != ESRCH) return false;
+    while (waitpid(proc, &status, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return true;
+#endif
+}
+
+NOBDEF Nob_Proc nob_cmd_start(Nob_Cmd *cmd)
+{
+    Nob_Proc proc;
+    if (!cmd || cmd->count == 0) return NOB_INVALID_PROC;
+    proc = nob__cmd_start_process(*cmd, NULL, NULL, NULL);
+    cmd->count = 0;
+    return proc;
+}
+
+NOBDEF void nob_sleep_ms(unsigned milliseconds)
+{
+#ifdef _WIN32
+    Sleep(milliseconds);
+#else
+    struct timespec duration;
+    duration.tv_sec = milliseconds / 1000;
+    duration.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
+    while (nanosleep(&duration, &duration) < 0 && errno == EINTR) {}
 #endif
 }
 
@@ -3057,6 +3112,10 @@ NOBDEF char *nob_temp_running_executable_path(void)
         #define fd_close nob_fd_close
         #define Procs Nob_Procs
         #define proc_wait nob_proc_wait
+        #define proc_poll nob_proc_poll
+        #define proc_terminate nob_proc_terminate
+        #define cmd_start nob_cmd_start
+        #define sleep_ms nob_sleep_ms
         #define procs_wait nob_procs_wait
         #define procs_wait_and_reset nob_procs_wait_and_reset
         #define procs_append_with_flush nob_procs_append_with_flush
