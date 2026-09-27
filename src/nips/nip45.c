@@ -53,14 +53,8 @@ static nip_capability_t nip45_caps[] = {
     },
 };
 
-void nip45_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip45_caps) / sizeof(nip45_caps[0]); i++)
-        nip_registry_register(registry, &nip45_caps[i]);
-}
+/* ============================================================================
+ * Registration (using macro to eliminate boilerplate)
+ * ============================================================================ */
 
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip45_register_provider(void) {
-    nip_capability_add_provider(nip45_register);
-}
+NIP_REGISTER(nip45, nip45_caps)

@@ -7,13 +7,11 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "crypto.h"
-#include "model/event_util.h"
-#include "protocol/protocol.h"
+#include "model/tag_iter.h"
+#include "storage.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* ============================================================================
  * NIP-01 Capability Implementation
@@ -22,7 +20,6 @@
  * Uses the new transport-agnostic capability interface.
  * ============================================================================ */
 
-/* Forward declarations */
 static bool nip01_kind_handler_handles_kind(int kind, void *ctx);
 static nip01_process_result_t nip01_kind_handler_process_event(
     connection_id_t connection_id, const event_t *event,
@@ -125,27 +122,6 @@ static nip01_process_result_t nip01_replaceable_listener(const event_t *event, s
  * NIP-33 Addressable (Parameterized Replaceable) Events
  * ============================================================================ */
 
-static bool nip01_matches_dtag(const event_t *event, void *userdata) {
-    const char *identifier = (const char *)userdata;
-    struct mg_str key, tag, tags = mg_str(event->tags_json ? event->tags_json : "[]");
-    size_t offset = 0;
-    bool found_d = false;
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element(tag.buf, 0);
-        if (name && strcmp(name, "d") == 0) {
-            char *value = event_tag_element(tag.buf, 1);
-            found_d = true;
-            bool matched = strcmp(value ? value : "", identifier) == 0;
-            free(value);
-            free(name);
-            return matched;
-        }
-        free(name);
-    }
-    /* NIP-01/33: absence of a d tag is equivalent to d="". */
-    return !found_d && identifier[0] == '\0';
-}
-
 static bool nip01_delete_addressable(const event_t *event, storage_context_t *storage, const char *identifier) {
     storage_event_scope_t scope = {0};
     char cursor[MAX_ID_SIZE + 1] = "";
@@ -162,7 +138,7 @@ static bool nip01_delete_addressable(const event_t *event, storage_context_t *st
         size_t deleted = 0;
         char next_id[MAX_ID_SIZE + 1] = "";
         scope.after_id = cursor[0] ? cursor : NULL;
-        if (!storage->delete_matching(&scope, nip01_matches_dtag, (void *)identifier, &deleted, next_id, sizeof(next_id), &more)) return false;
+        if (!storage->delete_matching(&scope, tag_predicate_match_d_tag, (void *)identifier, &deleted, next_id, sizeof(next_id), &more)) return false;
         (void)deleted;
         snprintf(cursor, sizeof(cursor), "%s", next_id);
     } while (more);
@@ -170,19 +146,7 @@ static bool nip01_delete_addressable(const event_t *event, storage_context_t *st
 }
 
 static bool nip01_replace_addressable_event(const event_t *event, storage_context_t *storage) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
-    char *dvalue = NULL;
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element(tag.buf, 0);
-        bool is_d = name && strcmp(name, "d") == 0;
-        free(name);
-        if (is_d) {
-            dvalue = event_tag_element(tag.buf, 1);
-            break;
-        }
-    }
-    /* NIP-01: an event without a "d" tag is treated as having an empty one. */
+    char *dvalue = tag_find_value(event, "d");
     bool replaced = nip01_delete_addressable(event, storage, dvalue);
     free(dvalue);
     return replaced;
@@ -215,17 +179,7 @@ static nip01_process_result_t nip01_addressable_listener(const event_t *event, s
 }
 
 /* ============================================================================
- * Registration
+ * Registration (using macro to eliminate boilerplate)
  * ============================================================================ */
 
-void nip01_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip01_caps) / sizeof(nip01_caps[0]); i++)
-        nip_registry_register(registry, &nip01_caps[i]);
-}
-
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip01_register_provider(void) {
-    nip_capability_add_provider(nip01_register);
-}
+NIP_REGISTER(nip01, nip01_caps)

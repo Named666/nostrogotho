@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #ifndef NHR_DYNAMIC_MODULE
 #include "../crypto.h"
 #endif
@@ -30,6 +30,7 @@ void nip26_set_crypto_services(
     nip26_hash_fn = hash_fn;
     nip26_verify_fn = verify_fn;
 }
+
 /* ============================================================================
  * NIP-26: Delegated Event Signing
  * 
@@ -131,16 +132,18 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
 
 bool nip26_extract_index_tags(const event_t *event,
                               storage_tag_match_t **matches, size_t *count) {
-    struct mg_str key, tag, tags;
-    size_t offset = 0;
     if (!event || !matches || !count) return false;
     *matches = NULL;
     *count = 0;
-    tags = mg_str(event->tags_json ? event->tags_json : "[]");
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element_slice(tag, 0);
+
+    tag_iter_t it;
+    tag_iter_init(&it, event);
+    
+    struct mg_str key, tag;
+    while (tag_iter_next(&it, &key, &tag)) {
+        char *name = tag_iter_element(&it, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = event_tag_element_slice(tag, 1);
+            char *delegator = tag_iter_element(&it, 1);
             if (delegator) {
                 storage_tag_match_t *grown = (storage_tag_match_t *)realloc(
                     *matches, (*count + 1) * sizeof(**matches));
@@ -163,7 +166,6 @@ bool nip26_extract_index_tags(const event_t *event,
     }
     return true;
 }
-
 
 void nip26_free_index_tags(storage_tag_match_t *matches, size_t count) {
     for (size_t i = 0; i < count; i++) {
@@ -221,15 +223,16 @@ static bool nip26_accept_publish(uintptr_t connection_id, const event_t *event,
 
     if (!event || !event->tags_json) return true;
 
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
-
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element(tag.buf, 0);
+    tag_iter_t it;
+    tag_iter_init(&it, event);
+    
+    struct mg_str key, tag;
+    while (tag_iter_next(&it, &key, &tag)) {
+        char *name = tag_iter_element(&it, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = event_tag_element(tag.buf, 1);
-            char *conditions = event_tag_element(tag.buf, 2);
-            char *sig = event_tag_element(tag.buf, 3);
+            char *delegator = tag_iter_element(&it, 1);
+            char *conditions = tag_iter_element(&it, 2);
+            char *sig = tag_iter_element(&it, 3);
 
             bool ok = true;
             if (delegator && sig) {
@@ -265,15 +268,8 @@ static nip_capability_t nip26_caps[] = {
     },
 };
 
-void nip26_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip26_caps) / sizeof(nip26_caps[0]); i++)
-        nip_registry_register(registry, &nip26_caps[i]);
-}
+/* ============================================================================
+ * Registration (using macro to eliminate boilerplate)
+ * ============================================================================ */
 
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip26_register_provider(void) {
-    nip_capability_add_provider(nip26_register);
-}
-
+NIP_REGISTER(nip26, nip26_caps)

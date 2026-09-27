@@ -14,7 +14,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #include "../storage.h"
 #include <stdio.h>
 #include <time.h>
@@ -37,28 +37,14 @@
 static bool nip40_event_is_expired(const event_t *event) {
     if (!event || !event->tags_json) return false;
 
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
+    char *expiration_str = tag_find_value(event, "expiration");
+    if (!expiration_str) return false;
+    
+    time_t expiration = (time_t) strtoll(expiration_str, NULL, 10);
+    free(expiration_str);
+    
     time_t now = time(NULL);
-
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element_slice(tag, 0);
-        if (name && strcmp(name, "expiration") == 0) {
-            char *value = event_tag_element_slice(tag, 1);
-            bool expired = false;
-            if (value) {
-                time_t expiration = (time_t) strtoll(value, NULL, 10);
-                expired = expiration <= now;
-            }
-            free(value);
-            free(name);
-            if (expired) return true;
-            /* An expired tag governs even if another tag is unexpired. */
-        } else {
-            free(name);
-        }
-    }
-    return false;
+    return expiration <= now;
 }
 
 static bool nip40_expiry_predicate(const event_t *event, void *userdata) {
@@ -147,14 +133,8 @@ static nip_capability_t nip40_caps[] = {
     },
 };
 
-void nip40_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip40_caps) / sizeof(nip40_caps[0]); i++)
-        nip_registry_register(registry, &nip40_caps[i]);
-}
+/* ============================================================================
+ * Registration (using macro to eliminate boilerplate)
+ * ============================================================================ */
 
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip40_register_provider(void) {
-    nip_capability_add_provider(nip40_register);
-}
+NIP_REGISTER(nip40, nip40_caps)

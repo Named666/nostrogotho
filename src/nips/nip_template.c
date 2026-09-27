@@ -39,7 +39,7 @@
  */
 
 #include "nip_capability.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #include "protocol/protocol.h"
 #include "relay/connection_session.h"
 #include "relay/relay.h"            /* host builds: relay_send_json() */
@@ -212,17 +212,7 @@ static nip_capability_t nipxx_caps[] = {
      */
 };
 
-/* Trim the table above to what you implement, then register it. This is the
- * ONLY registration call a NIP needs. */
-void nipxx_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nipxx_caps) / sizeof(nipxx_caps[0]); i++)
-        nip_registry_register(registry, &nipxx_caps[i]);
-}
+/* Trim the table above to what you implement, then register it using the
+ * NIP_REGISTER macro. This is the ONLY registration call a NIP needs. */
 
-/* Compiling this file enables the NIP; deleting it removes the capability
- * without touching protocol/transport code — in both monolithic and -hr
- * builds. The constructor runs before main() on GCC/MinGW. */
-__attribute__((constructor)) static void nipxx_register_provider(void) {
-    nip_capability_add_provider(nipxx_register);
-}
+NIP_REGISTER(nipxx, nipxx_caps)

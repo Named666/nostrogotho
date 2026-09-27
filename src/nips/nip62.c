@@ -12,7 +12,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #include "../storage.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +20,8 @@
 
 /* Check whether a Request to Vanish applies to this relay. */
 static bool nip62_should_vanish(const event_t *event, const char *service_url) {
-    return event_has_tag(event, "relay", "ALL_RELAYS") ||
-           (service_url && *service_url && event_has_relay_tag(event, service_url));
+    return tag_has(event, "relay", "ALL_RELAYS") ||
+           (service_url && *service_url && tag_has(event, "relay", service_url));
 }
 
 static bool nip62_select_all(const event_t *event, void *userdata) {
@@ -84,7 +84,7 @@ static nip01_process_result_t nip62_kind_handler_process_event(
 
     /* NIP-62: "The tag list MUST include at least one `relay` value."
      * Reject kind-62 events that tag no relay at all. */
-    if (!event_has_tag(event, "relay", NULL)) {
+    if (!tag_has(event, "relay", NULL)) {
         nip01_process_result_t result = {0};
         result.accepted = false;
         snprintf(result.response_msg, sizeof(result.response_msg), "invalid: kind 62 requires at least one relay tag");
@@ -120,14 +120,8 @@ static nip01_process_result_t nip62_kind_handler_process_event(
     return result;
 }
 
-void nip62_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip62_caps) / sizeof(nip62_caps[0]); i++)
-        nip_registry_register(registry, &nip62_caps[i]);
-}
+/* ============================================================================
+ * Registration (using macro to eliminate boilerplate)
+ * ============================================================================ */
 
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip62_register_provider(void) {
-    nip_capability_add_provider(nip62_register);
-}
+NIP_REGISTER(nip62, nip62_caps)

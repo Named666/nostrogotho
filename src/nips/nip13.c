@@ -8,7 +8,7 @@
 
 #include "nip_capability.h"
 #include "crypto.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -56,14 +56,16 @@ static nip_capability_t nip13_caps[] = {
  * ============================================================================ */
 
 static int nip13_committed_target(const event_t *event) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
+    tag_iter_t it;
+    tag_iter_init(&it, event);
+    
+    struct mg_str key, tag;
     int target = 0;
 
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element(tag.buf, 0);
+    while (tag_iter_next(&it, &key, &tag)) {
+        char *name = tag_iter_element(&it, 0);
         if (name && strcmp(name, "nonce") == 0) {
-            char *value = event_tag_element(tag.buf, 2);
+            char *value = tag_iter_element(&it, 2);
             free(name);
             if (value) {
                 char *end = NULL;
@@ -115,17 +117,7 @@ static bool nip13_publication_policy_accept_publish(
 }
 
 /* ============================================================================
- * Registration
+ * Registration (using macro to eliminate boilerplate)
  * ============================================================================ */
 
-void nip13_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip13_caps) / sizeof(nip13_caps[0]); i++)
-        nip_registry_register(registry, &nip13_caps[i]);
-}
-
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip13_register_provider(void) {
-    nip_capability_add_provider(nip13_register);
-}
+NIP_REGISTER(nip13, nip13_caps)

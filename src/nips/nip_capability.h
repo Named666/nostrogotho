@@ -280,6 +280,31 @@ void nip_capability_add_provider(nip_capability_provider_fn provider);
 void nip_registry_register_providers(nip_registry_t *registry);
 
 /* ============================================================================
+ * Registration Boilerplate Macro
+ * ============================================================================
+ * 
+ * Reduces NIP file boilerplate. Usage in nipXX.c:
+ * 
+ *   static nip_capability_t nipXX_caps[] = { ... };
+ *   
+ *   NIP_REGISTER(nipXX, nipXX_caps)
+ * 
+ * Expands to:
+ *   void nipXX_register(nip_registry_t *registry) { ... }
+ *   __attribute__((constructor)) static void nipXX_register_provider(void) { ... }
+ * ============================================================================ */
+
+#define NIP_REGISTER(nip_name, caps_array) \
+    void nip_name##_register(nip_registry_t *registry) { \
+        if (!registry) return; \
+        for (size_t i = 0; i < sizeof(caps_array) / sizeof(caps_array[0]); i++) \
+            nip_registry_register(registry, &caps_array[i]); \
+    } \
+    __attribute__((constructor)) static void nip_name##_register_provider(void) { \
+        nip_capability_add_provider(nip_name##_register); \
+    }
+
+/* ============================================================================
  * Shared NIP-provided helpers (cross-file callers)
  *
  * Each NIP is a single self-contained nipXX.c. The few helpers needed

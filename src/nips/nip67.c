@@ -63,14 +63,8 @@ static nip_capability_t nip67_caps[] = {
     },
 };
 
-void nip67_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip67_caps) / sizeof(nip67_caps[0]); i++)
-        nip_registry_register(registry, &nip67_caps[i]);
-}
+/* ============================================================================
+ * Registration (using macro to eliminate boilerplate)
+ * ============================================================================ */
 
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip67_register_provider(void) {
-    nip_capability_add_provider(nip67_register);
-}
+NIP_REGISTER(nip67, nip67_caps)

@@ -7,7 +7,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #include "protocol/protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +25,7 @@ static bool nip17_targets_gift_wraps(const filter_t *filter) {
 /* Enforce authenticated-recipient delivery for gift-wrap events. */
 static bool nip17_is_visible_to(const event_t *event, const char *authenticated_pubkey) {
     return (event->kind != 1059 && event->kind != 21059) ||
-           (authenticated_pubkey && event_has_tag(event, "p", authenticated_pubkey));
+           (authenticated_pubkey && tag_has(event, "p", authenticated_pubkey));
 }
 
 static bool nip17_delivery_policy_can_deliver(const event_t *event, uintptr_t connection_id, void *ctx);
@@ -75,14 +75,8 @@ static bool nip17_protocol_response_needs_auth_hint(const filter_t *filters, siz
     return false;
 }
 
-void nip17_register(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < sizeof(nip17_caps) / sizeof(nip17_caps[0]); i++)
-        nip_registry_register(registry, &nip17_caps[i]);
-}
+/* ============================================================================
+ * Registration (using macro to eliminate boilerplate)
+ * ============================================================================ */
 
-/* Self-registration: compiling this file enables the NIP; deleting it
- * removes the capability without touching protocol/transport code. */
-__attribute__((constructor)) static void nip17_register_provider(void) {
-    nip_capability_add_provider(nip17_register);
-}
+NIP_REGISTER(nip17, nip17_caps)

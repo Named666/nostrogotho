@@ -1,7 +1,7 @@
 #include "nhr_module.h"
 #include "nip_capability.h" /* registry + nip26/nip42 shared decls (each NIP is one nipXX.c) */
 #include "crypto.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -187,14 +187,15 @@ static void module_storage_adapter_init(void) {
 static bool module_check_event(const event_t *event) {
     if (!g_host || !g_host->crypto_check_event || !g_host->crypto_check_event(g_host->userdata, event)) return false;
     if (!event->tags_json) return true;
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
-    size_t offset = 0;
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = event_tag_element(event->tags_json, 0);
+    tag_iter_t it;
+    tag_iter_init(&it, event);
+    struct mg_str key, tag;
+    while (tag_iter_next(&it, &key, &tag)) {
+        char *name = tag_iter_element(&it, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = event_tag_element(event->tags_json, 1);
-            char *conditions = event_tag_element(event->tags_json, 2);
-            char *signature = event_tag_element(event->tags_json, 3);
+            char *delegator = tag_iter_element(&it, 1);
+            char *conditions = tag_iter_element(&it, 2);
+            char *signature = tag_iter_element(&it, 3);
             bool valid = delegator && conditions && signature &&
                          nip26_check_delegation(event, delegator, conditions, signature);
             free(delegator);
