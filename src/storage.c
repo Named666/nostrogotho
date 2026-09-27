@@ -22,7 +22,7 @@
 static sqlite3 *db_conn = NULL;
 
 /* Parameter types for bound SQL statements.
- * PARAM_TYPE_OWNED_STRING marks heap-allocated (string_dup'd) values that
+ * PARAM_TYPE_OWNED_STRING marks heap-allocated (malloc+strcpy) values that
  * must be released by params_release(); PARAM_TYPE_STRING values are
  * borrowed (e.g. they point into a filter_t) and are never freed here. */
 #define PARAM_TYPE_NUMBER 0
@@ -120,13 +120,14 @@ static bool find_ids_by_tag_sqlite3(const char *tag_name, const char *tag_value,
             return false;
         }
         ids = grown;
-        ids[count] = string_dup(id);
+        ids[count] = malloc(strlen(id) + 1);
         if (!ids[count]) {
             sqlite3_finalize(stmt);
             for (size_t i = 0; i < count; i++) free(ids[i]);
             free(ids);
             return false;
         }
+        strcpy(ids[count], id);
         count++;
     }
     sqlite3_finalize(stmt);
@@ -426,7 +427,7 @@ static storage_delete_result_t delete_record_by_kind_and_pubkey(int kind, const 
             return result;
         }
         ids = grown;
-        ids[count] = string_dup(event_id);
+        ids[count] = malloc(strlen(event_id) + 1);
         if (!ids[count]) {
             for (size_t i = 0; i < count; i++) free(ids[i]);
             free(ids);
@@ -435,6 +436,7 @@ static storage_delete_result_t delete_record_by_kind_and_pubkey(int kind, const 
             snprintf(result.error_message, sizeof(result.error_message), "out of memory");
             return result;
         }
+        strcpy(ids[count], event_id);
         count++;
     }
     sqlite3_finalize(stmt);
@@ -549,9 +551,11 @@ static bool delete_matching_sqlite3(const storage_event_scope_t *scope,
             event.content_len = event.content ? strlen(event.content) : 0;
             snprintf(event.sig, sizeof(event.sig), "%s", (const char *)sig);
             if (event_matches_scope(&event, scope) && (!predicate || predicate(&event, userdata))) {
-                ids[ids_count] = string_dup(event.id);
-                pubkeys[ids_count] = string_dup(event.pubkey);
+                ids[ids_count] = malloc(strlen(event.id) + 1);
+                pubkeys[ids_count] = malloc(strlen(event.pubkey) + 1);
                 if (!ids[ids_count] || !pubkeys[ids_count]) { ok = false; break; }
+                strcpy(ids[ids_count], event.id);
+                strcpy(pubkeys[ids_count], event.pubkey);
                 ids_count++;
             }
             snprintf(last_id, sizeof(last_id), "%s", event.id);
@@ -645,7 +649,13 @@ static bool append_tag_like_condition(char *conditions, size_t conditions_size,
             break;
         }
         params[*param_count].type = PARAM_TYPE_OWNED_STRING;
-        params[*param_count].value.string = string_dup(pattern);
+        params[*param_count].value.string = malloc(strlen(pattern) + 1);
+        if (!params[*param_count].value.string) {
+            free(pattern);
+            ok = false;
+            break;
+        }
+        strcpy(params[*param_count].value.string, pattern);
         (*param_count)++;
         free(pattern);
     }
@@ -973,7 +983,13 @@ static bool send_records(send_records_callback_t sender, const char *sub,
             char *escaped = escape_like(filter->search, strlen(filter->search));
             char pattern[512];
             snprintf(pattern, sizeof(pattern), "%%%s%%", escaped ? escaped : filter->search);
-            params[param_count].value.string = string_dup(pattern);
+            params[param_count].value.string = malloc(strlen(pattern) + 1);
+            if (!params[param_count].value.string) {
+                if (escaped) free(escaped);
+                params_release(params, param_count);
+                return false;
+            }
+            strcpy(params[param_count].value.string, pattern);
             if (escaped) free(escaped);
             param_count++;
         }

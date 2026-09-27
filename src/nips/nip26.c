@@ -191,8 +191,8 @@ bool nip26_query_index_tags(const filter_t *filters, size_t filters_count,
                 return false;
             }
             *matches = grown;
-            (*matches)[*count].tag_name = string_dup("delegation");
-            (*matches)[*count].tag_value = string_dup(author);
+            (*matches)[*count].tag_name = malloc(strlen("delegation") + 1);
+            (*matches)[*count].tag_value = malloc(strlen(author) + 1);
             (*matches)[*count].filter_index = f;
             if (!(*matches)[*count].tag_name || !(*matches)[*count].tag_value) {
                 free((void *)(*matches)[*count].tag_name);
@@ -202,6 +202,8 @@ bool nip26_query_index_tags(const filter_t *filters, size_t filters_count,
                 *count = 0;
                 return false;
             }
+            strcpy((*matches)[*count].tag_name, "delegation");
+            strcpy((*matches)[*count].tag_value, author);
             (*count)++;
         }
     }

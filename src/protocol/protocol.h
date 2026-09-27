@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "relay/config.h"
 #include "nostrogotho.h"
 #include "json_util.h"
 
@@ -53,12 +54,6 @@ typedef struct {
     } payload;
 } protocol_message_t;
 
-/* Parse a JSON array into a protocol message
- * Returns true on success, false on parse error.
- * On success, caller owns the protocol_message_t and must call protocol_message_free().
- * Enforces all input size limits before allocating unbounded structures. */
-bool protocol_parse_message(const char *json, size_t length, protocol_message_t *out);
-
 /* Free a protocol message and all owned resources */
 void protocol_message_free(protocol_message_t *msg);
 
@@ -96,5 +91,11 @@ char *protocol_serialize_auth(const char *challenge);
 
 /* Free a serialized response string */
 void protocol_free_string(char *str);
+
+/* Parse a client message with relay config limits (higher-level than protocol_parse_message) */
+bool protocol_parse_client_message(const char *data, size_t length,
+                                   const relay_config_t *config,
+                                   protocol_message_t *out,
+                                   char *reject_reason, size_t reason_size);
 
 #endif /* PROTOCOL_H_ */

@@ -18,7 +18,6 @@ struct connection_session {
 };
 
 static connection_session_t *sessions = NULL;
-static uintptr_t next_connection_id = 1;
 
 connection_id_t connection_session_create(uintptr_t connection_id,
                                           struct mg_connection *connection) {

@@ -59,6 +59,7 @@ int main(int argc, const char **argv) {
     int lower_limit = 0;
     int upper_limit = 900;
     bool hot_reload = false;
+    bool debug_logging = false;
     const char *module_path = getenv("NHR_MODULE_PATH");
 
     if (!parse_int(getenv("MIN_POW_DIFFICULTY") ? getenv("MIN_POW_DIFFICULTY") : "0", &min_pow) ||
@@ -81,7 +82,7 @@ int main(int argc, const char **argv) {
         } else if (strcmp(argv[i], "-service-url") == 0 && i + 1 < argc) {
             service_url = argv[++i];
         } else if (strcmp(argv[i], "--debug") == 0) {
-            /* debug logging will be set in relay config */
+            debug_logging = true;
         } else if (strcmp(argv[i], "--hot-reload") == 0) {
             hot_reload = true;
         } else if (strcmp(argv[i], "--module") == 0 && i + 1 < argc) {
@@ -123,7 +124,7 @@ int main(int argc, const char **argv) {
     config.min_pow_difficulty = min_pow;
     config.created_at_lower_limit = (time_t)lower_limit;
     config.created_at_upper_limit = (time_t)upper_limit;
-    config.debug_logging = false; /* TODO: parse --debug flag */
+    config.debug_logging = debug_logging;
 
     relay_t *relay = relay_create(&config, &storage_ctx);
     if (!relay) {

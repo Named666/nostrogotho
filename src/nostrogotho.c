@@ -262,41 +262,5 @@ void tags_array_free(tags_array_t *tags) {
         }
         free(tags->tags);
     }
-    
-    free(tags);
-}
-
-/* ============================================================================
- * String Utility Functions
- * ============================================================================ */
-
-/* string_dup - Duplicate a null-terminated string
- * 
- * Creates a malloc'd copy of the input string. Useful for storing string
- * values that need separate ownership (e.g., in event IDs, pubkeys).
- * 
- * Args: str - null-terminated string to duplicate (NULL-safe)
- * Returns: malloc'd copy on success, NULL if str is NULL or malloc fails
- * 
- * Caller responsibility: Must call string_free() to release the copy
- */
-char *string_dup(const char *str) {
-    if (!str) return NULL;
-    
-    size_t len = strlen(str);
-    char *dup = (char *)malloc(len + 1);
-    if (!dup) return NULL;
-    
-    strcpy(dup, str);
-    return dup;
-}
-
-/* string_free - Free a duplicated string
- * 
- * Safely releases memory allocated by string_dup().
- * 
- * Args: str - pointer to malloc'd string (NULL-safe, does nothing if NULL)
- */
-void string_free(char *str) {
-    free(str);
+free(tags);
 }

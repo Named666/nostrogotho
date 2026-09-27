@@ -207,6 +207,72 @@ bool check_delegation(const event_t *ev, const char *delegator_pubkey,
                       const char *conditions, const char *delegation_sig);
 
 /* ============================================================================
+ * Event Hash Building (Internal)
+ * ============================================================================
+ * 
+ * These functions build the canonical event hash input per NIP-01:
+ *   [0, pubkey, created_at, kind, tags, content]
+ * All string fields are JSON-escaped per NIP-01 specification.
+ */
+
+/* event_build_hash_input - Build the serialized event data for hashing
+ * 
+ * Constructs the canonical NIP-01 event serialization used for event ID
+ * computation and signature verification.
+ * 
+ * Args:
+ *   ev        - event to serialize (must not be NULL)
+ *   buffer    - output buffer (caller allocated)
+ *   buffer_size - size of output buffer
+ * 
+ * Returns: number of bytes written (excluding null terminator), or 0 on error
+ *          (buffer too small or escape failure)
+ * 
+ * Note: buffer must be large enough to hold the serialized event.
+ *       Use event_hash_input_size() to compute required size.
+ */
+size_t event_build_hash_input(const event_t *ev, char *buffer, size_t buffer_size);
+
+/* event_hash_input_size - Calculate required buffer size for hash input
+ * 
+ * Returns the exact number of bytes needed for the serialized event
+ * (excluding null terminator). Use this to allocate buffer before calling
+ * event_build_hash_input().
+ * 
+ * Args: ev - event to measure (must not be NULL)
+ * Returns: required buffer size, or 0 if ev is NULL
+ */
+size_t event_hash_input_size(const event_t *ev);
+
+/* event_compute_id - Compute event ID from event data
+ * 
+ * Builds the hash input, computes SHA256, and returns hex-encoded ID.
+ * 
+ * Args: ev - event to compute ID for (must not be NULL)
+ * Returns: malloc'd hex string (64 chars + null), or NULL on failure
+ * 
+ * Caller responsibility: Must free result with free()
+ */
+char *event_compute_id(const event_t *ev);
+
+/* json_escape - Escape a string for JSON serialization (NIP-01 compatible)
+ * 
+ * Escapes characters per JSON spec for use in event ID computation:
+ *   ", \, \b, \f, \n, \r, \t, and control chars as \uXXXX
+ * 
+ * IMPORTANT: '/' is NOT escaped, matching JSON.stringify behavior
+ * required by NIP-01 for canonical event serialization.
+ * 
+ * Args:
+ *   src       - source string (must not be NULL)
+ *   dst       - destination buffer (must not be NULL)
+ *   dst_size  - size of destination buffer
+ * 
+ * Returns: number of bytes written (including null), or 0 if buffer too small
+ */
+size_t json_escape(const char *src, char *dst, size_t dst_size);
+
+/* ============================================================================
  * Proof of Work (NIP-13)
  * ============================================================================ */
 

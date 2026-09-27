@@ -2,6 +2,7 @@
 #ifndef NHR_DYNAMIC_MODULE
 #include "nips/nip_capability.h" /* nip26_check_delegation (NIP-26 lives in src/nips/nip26.c) */
 #endif
+#include "model/event_util.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -202,83 +203,10 @@ static int hex_value(char c) {
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
-
-/* json_escape_string - Escape a string for use in JSON
- *
- * Escapes special JSON characters in a string so it can be safely
- * included in a JSON string literal (within double quotes).
- *
- * Characters escaped:
- *   "  -> \"
- *   \  -> \\
- *   \b -> (backspace)
- *   \f -> (formfeed)
- *   \n -> (newline)
- *   \r -> (carriage return)
- *   \t -> (tab)
- *
- * NOTE: '/' is deliberately NOT escaped. This escaper produces the input to
- * the event-id hash, which per NIP-01 must be the canonical serialization
- * clients compute (JSON.stringify semantics: '/' stays literal). Escaping
- * it made every event whose content contains '/' fail id verification.
- *
- * Args:
- *   src - source string (must not be NULL)
- *   dst - destination buffer (must not be NULL)
- *   dst_size - size of destination buffer
- *
- * Returns: number of bytes written (including null terminator),
- *          0 if buffer too small to fit escaped string
- */
-static size_t json_escape_string(const char *src, char *dst, size_t dst_size) {
-    if (!src || !dst || dst_size == 0) return 0;
-    
-    size_t out_pos = 0;
-    
-    for (const char *p = src; *p && out_pos < dst_size - 1; p++) {
-        char c = *p;
-        const char *escape = NULL;
-        size_t escape_len = 0;
-        
-        switch (c) {
-            case '"':  escape = "\\\""; escape_len = 2; break;
-            case '\\': escape = "\\\\"; escape_len = 2; break;
-            case '\b': escape = "\\b"; escape_len = 2; break;
-            case '\f': escape = "\\f"; escape_len = 2; break;
-            case '\n': escape = "\\n"; escape_len = 2; break;
-            case '\r': escape = "\\r"; escape_len = 2; break;
-            case '\t': escape = "\\t"; escape_len = 2; break;
-            default:
-                if ((unsigned char)c < 32) {
-                    /* Control characters: output as \uXXXX */
-                    char buf[7];
-                    int len = snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                    if (out_pos + len >= dst_size) return 0;
-                    memcpy(dst + out_pos, buf, len);
-                    out_pos += len;
-                    continue;
-                }
-                escape = NULL;
-                break;
-        }
-        
-        if (escape) {
-            if (out_pos + escape_len >= dst_size) return 0;
-            memcpy(dst + out_pos, escape, escape_len);
-            out_pos += escape_len;
-        } else {
-            dst[out_pos++] = c;
-        }
-    }
-    
-    if (out_pos >= dst_size) return 0;
-    dst[out_pos] = '\0';
-    return out_pos + 1;
-}
-
 /* ============================================================================
  * Hex Encoding/Decoding
- * ============================================================================ */
+ * ============================================================================
+ */
 
 /* bytes_to_hex - Encode bytes as lowercase hex string
  * 
@@ -472,249 +400,56 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex, const uint8_t
     /* Verify signature */
     return secp256k1_schnorrsig_verify(verify_ctx, sig_bytes, digest, 32, &xonly_pubkey);
 }
-
-/* ============================================================================
- * Tag Parsing (Helper)
- * ============================================================================ */
-
-/* parse_tags_json - Parse tags from JSON array string
- * 
- * Extracts tags from a JSON array string and creates a tags_array_t structure.
- * Handles basic Nostr tag format: [["name", "val1", "val2"], ...]
- * 
- * Args: json_str - JSON array string (NULL-safe)
- * Returns: parsed tags_array_t, or NULL if parsing fails
- * 
- * Implementation:
- *   - Simple state machine parser (not full JSON parser)
- *   - Handles escaped quotes within strings
- *   - Skips whitespace and commas
- *   - Builds tag array incrementally
- * 
- * Caller responsibility: Must call tags_array_free() to release result
- */
-static tags_array_t *parse_tags_json(const char *json_str) {
-    if (!json_str) return NULL;
-    
-    /* Simple JSON parser for tag arrays
-     * This is a simplified parser that handles basic array of arrays format:
-     * [["tag1", "value1"], ["tag2", "value2", "value3"]]
-     */
-    
-    tags_array_t *tags = tags_array_alloc(MAX_TAG_ELEMENTS);
-    if (!tags) return NULL;
-    
-    const char *p = json_str;
-    
-    /* Skip to first '[' */
-    while (*p && *p != '[') p++;
-    if (*p != '[') {
-        tags_array_free(tags);
-        return NULL;
-    }
-    
-    p++;  /* Skip '[' */
-    
-    while (*p && *p != ']') {
-        /* Skip whitespace */
-        while (*p && (*p == ' ' || *p == '\n' || *p == '\t' || *p == ',')) p++;
-        
-        if (*p == ']') break;
-        
-        if (*p == '[') {
-            /* Start of a tag */
-            p++;
-            /* Bounds check: reject events with more tags than capacity */
-            if (tags->count >= MAX_TAG_ELEMENTS) {
-                tags_array_free(tags);
-                return NULL;
-            }
-            tag_t *tag = tag_alloc(MAX_TAG_ELEMENTS);
-            if (!tag) {
-                tags_array_free(tags);
-                return NULL;
-            }
-            
-            while (*p && *p != ']') {
-                /* Skip whitespace and comma */
-                while (*p && (*p == ' ' || *p == '\n' || *p == '\t' || *p == ',')) p++;
-                
-                if (*p == ']') break;
-                
-                if (*p == '"') {
-                    /* Parse string with proper unescaping (mirrors
-                     * parse_json_string in json_util.c): scan the raw span,
-                     * then decode escape sequences into the output buffer. */
-                    p++;
-                    /* Bounds check: reject tags with more elements than capacity */
-                    if (tag->count >= tag->capacity) {
-                        tag_free(tag);
-                        tags_array_free(tags);
-                        return NULL;
-                    }
-                    const char *str_start = p;
-                    size_t raw_len = 0;
-
-                    /* Find the raw (escaped) span of the string */
-                    while (*p && *p != '"') {
-                        if (*p == '\\' && p[1]) p++;  /* Skip escaped character */
-                        p++;
-                        raw_len++;
-                    }
-
-                    if (*p == '"') {
-                        /* Unescape into output buffer; output is never longer
-                         * than the raw span, so raw_len + 1 always suffices */
-                        char *element = (char *)malloc(raw_len + 1);
-                        if (element) {
-                            size_t out_idx = 0;
-                            size_t in_idx = 0;
-                            while (in_idx < raw_len) {
-                                if (str_start[in_idx] == '\\' && in_idx + 1 < raw_len) {
-                                    in_idx++;
-                                    char c = str_start[in_idx];
-                                    switch (c) {
-                                        case '"':  element[out_idx++] = '"'; break;
-                                        case '\\': element[out_idx++] = '\\'; break;
-                                        case '/':  element[out_idx++] = '/'; break;
-                                        case 'b':  element[out_idx++] = '\b'; break;
-                                        case 'f':  element[out_idx++] = '\f'; break;
-                                        case 'n':  element[out_idx++] = '\n'; break;
-                                        case 'r':  element[out_idx++] = '\r'; break;
-                                        case 't':  element[out_idx++] = '\t'; break;
-                                        default:   element[out_idx++] = c; break;
-                                    }
-                                } else {
-                                    element[out_idx++] = str_start[in_idx];
-                                }
-                                in_idx++;
-                            }
-                            element[out_idx] = '\0';
-                            tag->elements[tag->count++] = element;
-                        }
-                        p++;
-                    }
-                }
-            }
-            
-            if (*p == ']') {
-                p++;
-                if (tag->count > 0) {
-                    tags->tags[tags->count++] = *tag;
-                } else {
-                    tag_free(tag);
-                }
-            } else {
-                /* Unterminated tag: free partially filled tag */
-                tag_free(tag);
-                tags_array_free(tags);
-                return NULL;
-            }
-        }
-    }
-
-    return tags;
-}
-
-
 /* ============================================================================
  * Event Validation (NIP-01)
- * ============================================================================ */
-
-/* check_event - Validate a complete Nostr event
+ * ============================================================================
+ */
+/* check_event_core - Validate a complete Nostr event (ID + signature)
  * 
- * Performs comprehensive event validation:
- * 1. Reconstructs event hash from event data: [0, pubkey, created_at, kind, tags, content]
- * 2. Computes SHA256 of this JSON
- * 3. Verifies computed ID matches event.id
- * 4. Verifies signature with event.pubkey
- * 5. Validates any delegation tags present
+ * Performs core validation of a Nostr event:
+ * 1. Verifies event ID is correct SHA256 hash of event data
+ * 2. Verifies signature with public key
  * 
  * Args: ev - event to validate (must not be NULL)
- * Returns: true if all checks pass, false if any check fails
+ * 
+ * Returns: true if event is valid, false if any check fails
  * 
  * Requirements:
  *   - crypto_init() must have been called
- *   - Event must have all required fields initialized
+ *   - event must have all fields properly initialized
  * 
- * Note: Does NOT check:
- *   - Timestamp validity (checked separately for NIP-22)
- *   - Proof-of-work (checked separately for NIP-13)
- *   - Event size limits (checked separately)
- * 
- * Fails gracefully with detailed logging on any step failure.
+ * Note: Does NOT check timestamps, proof-of-work, or delegation;
+ *       those are checked separately
  */
 bool check_event_core(const event_t *ev) {
     if (!ev) return false;
     
-    /* Build the event hash input: [0, pubkey, created_at, kind, tags, content]
-     * Content and pubkey must be JSON-escaped for proper serialization.
-     *
-     * Stack usage is kept minimal: the content escape buffer and the
-     * serialization buffer are heap-allocated because this function runs on
-     * every incoming event (possibly concurrently). Worst case for JSON
-     * escaping is 6 output bytes per input byte (\u00XX for control chars).
-     */
-    char escaped_pubkey[MAX_PUBKEY_SIZE * 2 + 1];
+    /* Compute event ID from event data and verify it matches */
+    char *computed_id = event_compute_id(ev);
+    if (!computed_id) return false;
     
-    /* Escape pubkey for JSON (64 hex chars -> 129-byte stack buffer, safe) */
-    if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
-        return false;
-    }
+    bool id_matches = (strcmp(computed_id, ev->id) == 0);
+    free(computed_id);
     
-    /* Escape content for JSON - heap allocated, sized for worst-case escaping */
-    const char *content = ev->content ? ev->content : "";
-    size_t content_len = strlen(content);
+    if (!id_matches) return false;
     
-    size_t escaped_content_cap = content_len * 6 + 1;
-    char *escaped_content = (char *)malloc(escaped_content_cap);
-    if (!escaped_content) {
-        return false;
-    }
-    if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
-        free(escaped_content);
-        return false;
-    }
+    /* Verify signature - need to recompute digest for signature verification */
+    size_t buffer_size = event_hash_input_size(ev);
+    if (buffer_size == 0) return false;
     
-    /* Size the serialization buffer: fixed overhead + tags + escaped content */
-    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
-    size_t tags_len = strlen(tags_json);
-    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
-    char *buffer = (char *)malloc(buffer_cap);
-    if (!buffer) {
-        free(escaped_content);
-        return false;
-    }
+    char *buffer = (char *)malloc(buffer_size);
+    if (!buffer) return false;
     
-    int written = snprintf(buffer, buffer_cap,
-                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
-                          escaped_pubkey, (long long)ev->created_at, ev->kind,
-                          tags_json,
-                          escaped_content);
-    free(escaped_content);
-    escaped_content = NULL;
-    
-    if (written < 0 || (size_t)written >= buffer_cap) {
+    size_t len = event_build_hash_input(ev, buffer, buffer_size);
+    if (len == 0) {
         free(buffer);
         return false;
     }
     
-    /* Compute SHA256 hash */
     uint8_t digest[32];
-    sha256((const uint8_t *)buffer, strlen(buffer), digest);
+    sha256((const uint8_t *)buffer, len, digest);
     free(buffer);
-    buffer = NULL;
     
-    /* Convert digest to hex and compare with event ID */
-    char *id_hex = bytes_to_hex(digest, 32);
-    if (!id_hex) return false;
-    
-    bool id_matches = (strcmp(id_hex, ev->id) == 0);
-    free(id_hex);
-    
-    if (!id_matches) return false;
-    
-    /* Verify signature */
     if (!signature_verify(ev->sig, ev->pubkey, digest)) {
         return false;
     }
@@ -725,45 +460,38 @@ bool check_event_core(const event_t *ev) {
 #ifndef NHR_DYNAMIC_MODULE
 bool check_event(const event_t *ev) {
     if (!check_event_core(ev)) return false;
-#ifndef NHR_DYNAMIC_MODULE
+
     /* Check delegation tags in the monolithic build. Hot builds perform this
      * NIP-26 policy check inside the module using host crypto services. */
     if (!ev->tags_json) {
         /* No tags, skip delegation check */
     } else {
-        tags_array_t *tags = parse_tags_json(ev->tags_json);
-        if (!tags) {
+        size_t count = 0;
+        char **delegation_tag = event_find_tag(ev, "delegation", &count);
+        if (!delegation_tag) {
             /* Fail closed: an unparseable tags blob must not skip
              * delegation verification. Tags accepted by the parse-time
              * gate always parse here, so this rejects only genuinely
              * malformed input. */
             return false;
         }
-        {
-            for (size_t i = 0; i < tags->count; i++) {
-                tag_t *tag = &tags->tags[i];
-                
-                if (tag->elements && tag->count >= 4 && strcmp(tag->elements[0], "delegation") == 0) {
-                    const char *delegator_pubkey = tag->elements[1];
-                    const char *conditions = tag->elements[2];
-                    const char *delegation_sig = tag->elements[3];
-                    
-                    if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
-                        tags_array_free(tags);
-                        return false;
-                    }
-                }
-            }
+        
+        if (count >= 4) {
+            const char *delegator_pubkey = delegation_tag[1];
+            const char *conditions = delegation_tag[2];
+            const char *delegation_sig = delegation_tag[3];
             
-            tags_array_free(tags);
+            if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
+                event_free_tag(delegation_tag);
+                return false;
+            }
         }
+        
+        event_free_tag(delegation_tag);
     }
     
     return true;
-#else
-    return true;
-#endif
-}
+    }
 #else
 bool check_event(const event_t *ev) { return check_event_core(ev); }
 #endif
@@ -780,53 +508,11 @@ bool check_event(const event_t *ev) { return check_event_core(ev); }
 bool check_event_id(const event_t *ev) {
     if (!ev) return false;
     
-    /* Build the event hash input: [0, pubkey, created_at, kind, tags, content] */
-    char escaped_pubkey[MAX_PUBKEY_SIZE * 2 + 1];
+    char *computed_id = event_compute_id(ev);
+    if (!computed_id) return false;
     
-    if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
-        return false;
-    }
-    
-    const char *content = ev->content ? ev->content : "";
-    size_t content_len = strlen(content);
-    size_t escaped_content_cap = content_len * 6 + 1;
-    char *escaped_content = (char *)malloc(escaped_content_cap);
-    if (!escaped_content) return false;
-    if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
-        free(escaped_content);
-        return false;
-    }
-    
-    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
-    size_t tags_len = strlen(tags_json);
-    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
-    char *buffer = (char *)malloc(buffer_cap);
-    if (!buffer) {
-        free(escaped_content);
-        return false;
-    }
-    
-    int written = snprintf(buffer, buffer_cap,
-                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
-                          escaped_pubkey, (long long)ev->created_at, ev->kind,
-                          tags_json,
-                          escaped_content);
-    free(escaped_content);
-    
-    if (written < 0 || (size_t)written >= buffer_cap) {
-        free(buffer);
-        return false;
-    }
-    
-    uint8_t digest[32];
-    sha256((const uint8_t *)buffer, strlen(buffer), digest);
-    free(buffer);
-    
-    char *id_hex = bytes_to_hex(digest, 32);
-    if (!id_hex) return false;
-    
-    bool id_matches = (strcmp(id_hex, ev->id) == 0);
-    free(id_hex);
+    bool id_matches = (strcmp(computed_id, ev->id) == 0);
+    free(computed_id);
     
     return id_matches;
 }
@@ -842,48 +528,156 @@ bool check_event_id(const event_t *ev) {
 bool check_signature(const event_t *ev) {
     if (!ev) return false;
     
-    /* Build the event hash input to get the digest */
-    char escaped_pubkey[MAX_PUBKEY_SIZE * 2 + 1];
-    if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
-        return false;
-    }
+    size_t buffer_size = event_hash_input_size(ev);
+    if (buffer_size == 0) return false;
     
-    const char *content = ev->content ? ev->content : "";
-    size_t content_len = strlen(content);
-    size_t escaped_content_cap = content_len * 6 + 1;
-    char *escaped_content = (char *)malloc(escaped_content_cap);
-    if (!escaped_content) return false;
-    if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
-        free(escaped_content);
-        return false;
-    }
+    char *buffer = (char *)malloc(buffer_size);
+    if (!buffer) return false;
     
-    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
-    size_t tags_len = strlen(tags_json);
-    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
-    char *buffer = (char *)malloc(buffer_cap);
-    if (!buffer) {
-        free(escaped_content);
-        return false;
-    }
-    
-    int written = snprintf(buffer, buffer_cap,
-                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
-                          escaped_pubkey, (long long)ev->created_at, ev->kind,
-                          tags_json,
-                          escaped_content);
-    free(escaped_content);
-    
-    if (written < 0 || (size_t)written >= buffer_cap) {
+    size_t len = event_build_hash_input(ev, buffer, buffer_size);
+    if (len == 0) {
         free(buffer);
         return false;
     }
     
     uint8_t digest[32];
-    sha256((const uint8_t *)buffer, strlen(buffer), digest);
+    sha256((const uint8_t *)buffer, len, digest);
     free(buffer);
     
     return signature_verify(ev->sig, ev->pubkey, digest);
+}
+
+/* ============================================================================
+ * JSON String Escaping (NIP-01 compatible)
+ * ============================================================================
+ * 
+ * Single source of truth for JSON string escaping used in event ID computation
+ * and JSON serialization. Matches JSON.stringify behavior (no '/' escaping).
+ */
+
+size_t json_escape(const char *src, char *dst, size_t dst_size) {
+    if (!src || !dst || dst_size == 0) return 0;
+    
+    size_t out_pos = 0;
+    
+    for (const char *p = src; *p && out_pos < dst_size - 1; p++) {
+        unsigned char c = (unsigned char)*p;
+        const char *escape = NULL;
+        size_t escape_len = 0;
+        
+        switch (c) {
+            case '"':  escape = "\\\""; escape_len = 2; break;
+            case '\\': escape = "\\\\"; escape_len = 2; break;
+            case '\b': escape = "\\b"; escape_len = 2; break;
+            case '\f': escape = "\\f"; escape_len = 2; break;
+            case '\n': escape = "\\n"; escape_len = 2; break;
+            case '\r': escape = "\\r"; escape_len = 2; break;
+            case '\t': escape = "\\t"; escape_len = 2; break;
+            default:
+                if (c < 32) {
+                    /* Control characters: output as \uXXXX */
+                    char buf[7];
+                    int len = snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    if (out_pos + len >= dst_size) return 0;
+                    memcpy(dst + out_pos, buf, len);
+                    out_pos += len;
+                    continue;
+                }
+                escape = NULL;
+                break;
+        }
+        
+        if (escape) {
+            if (out_pos + escape_len >= dst_size) return 0;
+            memcpy(dst + out_pos, escape, escape_len);
+            out_pos += escape_len;
+        } else {
+            dst[out_pos++] = (char)c;
+        }
+    }
+    
+    if (out_pos >= dst_size) return 0;
+    dst[out_pos] = '\0';
+    return out_pos + 1;
+}
+
+/* ============================================================================
+ * Event Hash Building
+ * ============================================================================
+ */
+
+size_t event_hash_input_size(const event_t *ev) {
+    if (!ev) return 0;
+    
+    const char *content = ev->content ? ev->content : "";
+    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
+    
+    /* Maximum escape expansion: 6 bytes per input byte (for \uXXXX) */
+    size_t escaped_pubkey_max = strlen(ev->pubkey) * 6 + 1;
+    size_t escaped_content_max = strlen(content) * 6 + 1;
+    
+    /* Format: [0,"<pubkey>",<created_at>,<kind>,<tags>,"<content>"] */
+    return 128 + escaped_pubkey_max + escaped_content_max + strlen(tags_json);
+}
+
+size_t event_build_hash_input(const event_t *ev, char *buffer, size_t buffer_size) {
+    if (!ev || !buffer || buffer_size == 0) return 0;
+    
+    const char *content = ev->content ? ev->content : "";
+    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
+    
+    /* Escape pubkey and content for JSON */
+    char *escaped_pubkey = (char *)malloc(strlen(ev->pubkey) * 6 + 1);
+    if (!escaped_pubkey) return 0;
+    if (!json_escape(ev->pubkey, escaped_pubkey, strlen(ev->pubkey) * 6 + 1)) {
+        free(escaped_pubkey);
+        return 0;
+    }
+    
+    char *escaped_content = (char *)malloc(strlen(content) * 6 + 1);
+    if (!escaped_content) {
+        free(escaped_pubkey);
+        return 0;
+    }
+    if (!json_escape(content, escaped_content, strlen(content) * 6 + 1)) {
+        free(escaped_pubkey);
+        free(escaped_content);
+        return 0;
+    }
+    
+    int written = snprintf(buffer, buffer_size,
+                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
+                          escaped_pubkey, (long long)ev->created_at, ev->kind,
+                          tags_json,
+                          escaped_content);
+    
+    free(escaped_pubkey);
+    free(escaped_content);
+    
+    if (written < 0 || (size_t)written >= buffer_size) return 0;
+    return (size_t)written;
+}
+
+char *event_compute_id(const event_t *ev) {
+    if (!ev) return NULL;
+    
+    size_t buffer_size = event_hash_input_size(ev);
+    if (buffer_size == 0) return NULL;
+    
+    char *buffer = (char *)malloc(buffer_size);
+    if (!buffer) return NULL;
+    
+    size_t len = event_build_hash_input(ev, buffer, buffer_size);
+    if (len == 0) {
+        free(buffer);
+        return NULL;
+    }
+    
+    uint8_t digest[32];
+    sha256((const uint8_t *)buffer, len, digest);
+    free(buffer);
+    
+    return bytes_to_hex(digest, 32);
 }
 
 /* ============================================================================

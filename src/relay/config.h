@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <time.h>
+#include "storage.h"
 
 /* ============================================================================
  * RELAY_CONFIG.H - Single Authoritative Relay Configuration
@@ -30,6 +31,7 @@ typedef struct {
     int max_filters_per_subscription;
     int max_subscription_id_length;
     int max_query_limit;
+    storage_context_t *storage;
 } relay_config_t;
 
 /* Initialize relay configuration with defaults */

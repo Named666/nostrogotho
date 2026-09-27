@@ -30,7 +30,10 @@ static char *nip45_build_count_response(const char *sub_id, unsigned long count)
 
     /* json_builder_finish returns a pointer to internal buffer,
      * so duplicate it for the caller to own. */
-    return string_dup(result);
+    char *dup = malloc(strlen(result) + 1);
+    if (!dup) return NULL;
+    strcpy(dup, result);
+    return dup;
 }
 
 static char *nip45_protocol_response_build_count(const char *sub, unsigned long count, void *ctx) {

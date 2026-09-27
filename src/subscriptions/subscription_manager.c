@@ -206,8 +206,7 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
                                             const event_t *event,
                                             bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                             void *can_deliver_ctx,
-                                            void (*send_event)(struct mg_connection *, const char *, const event_t *),
-                                            void *send_ctx) {
+                                            void (*send_event)(struct mg_connection *, const char *, const event_t *)) {
     if (!manager || !event || !send_event) return;
     
     for (subscription_t *sub = manager->subscriptions; sub; sub = sub->next) {
@@ -242,11 +241,10 @@ struct query_context {
     size_t query_filters_count;
     bool do_count;
     void (*send_json)(struct mg_connection *, const char *);
-    void *send_ctx;
     bool (*can_deliver)(const event_t *, connection_id_t, void *);
     void *can_deliver_ctx;
-    char *(*build_eose)(const char *sub, bool has_more, bool auth_hint);
-    char *(*build_count)(const char *sub, unsigned long count);
+    char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx);
+    char *(*build_count)(const char *sub, unsigned long count, void *ctx);
     bool (*needs_auth_hint)(const filter_t *, size_t, connection_id_t, void *);
     void (*send_auth_challenge)(connection_id_t, void *);
     void *protocol_response_ctx;
@@ -254,9 +252,6 @@ struct query_context {
     int total_count;
     connection_id_t connection_id;
 };
-
-/* Global context for query callback (single-threaded) */
-static struct query_context *g_query_context = NULL;
 
 /* Shared delivery pipeline for stored results: parse the stored
  * ["EVENT", sub, {...}] frame once, apply the same matcher and the same
@@ -306,11 +301,10 @@ bool subscription_manager_query(subscription_manager_t *manager,
                                 size_t filters_count,
                                 bool do_count,
                                 void (*send_json)(struct mg_connection *, const char *),
-                                void *send_ctx,
                                 bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                 void *can_deliver_ctx,
-                                char *(*build_eose)(const char *sub, bool has_more, bool auth_hint),
-                                char *(*build_count)(const char *sub, unsigned long count),
+                                char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx),
+                                char *(*build_count)(const char *sub, unsigned long count, void *ctx),
                                 bool (*needs_auth_hint)(const filter_t *filters,
                                                         size_t filters_count,
                                                         connection_id_t connection_id,
@@ -332,7 +326,6 @@ bool subscription_manager_query(subscription_manager_t *manager,
         .query_filters_count = filters_count,
         .do_count = do_count,
         .send_json = send_json,
-        .send_ctx = send_ctx,
         .can_deliver = can_deliver,
         .can_deliver_ctx = can_deliver_ctx,
         .build_eose = build_eose,
@@ -369,7 +362,7 @@ bool subscription_manager_query(subscription_manager_t *manager,
             }
         }
         if (ctx.build_eose) {
-            char *eose = ctx.build_eose(sub, ctx.has_more, auth_hint);
+            char *eose = ctx.build_eose(sub, ctx.has_more, auth_hint, ctx.protocol_response_ctx);
             if (eose) {
                 ctx.send_json(connection, eose);
                 free(eose);
@@ -385,7 +378,7 @@ bool subscription_manager_query(subscription_manager_t *manager,
     } else {
         /* For COUNT, send COUNT response */
         if (ctx.build_count) {
-            char *count_resp = ctx.build_count(sub, (unsigned long)ctx.total_count);
+            char *count_resp = ctx.build_count(sub, (unsigned long)ctx.total_count, ctx.protocol_response_ctx);
             if (count_resp) {
                 ctx.send_json(connection, count_resp);
                 free(count_resp);

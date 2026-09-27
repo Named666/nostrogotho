@@ -48,8 +48,7 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
                                             const event_t *event,
                                             bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                             void *can_deliver_ctx,
-                                            void (*send_event)(struct mg_connection *, const char *, const event_t *),
-                                            void *send_ctx);
+                                            void (*send_event)(struct mg_connection *, const char *, const event_t *));
 
 /* Execute a stored query for a subscription.
  *
@@ -66,11 +65,10 @@ bool subscription_manager_query(subscription_manager_t *manager,
                                 size_t filters_count,
                                 bool do_count,
                                 void (*send_json)(struct mg_connection *, const char *),
-                                void *send_ctx,
                                 bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                 void *can_deliver_ctx,
-                                char *(*build_eose)(const char *sub, bool has_more, bool auth_hint),
-                                char *(*build_count)(const char *sub, unsigned long count),
+                                char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx),
+                                char *(*build_count)(const char *sub, unsigned long count, void *ctx),
                                 bool (*needs_auth_hint)(const filter_t *filters,
                                                         size_t filters_count,
                                                         connection_id_t connection_id,

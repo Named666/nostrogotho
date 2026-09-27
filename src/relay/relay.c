@@ -8,7 +8,6 @@
 #include "subscriptions/subscription_manager.h"
 #include "relay/connection_session.h"
 #include "protocol/protocol.h"
-#include "validation/event_validation.h"
 #include "nhr.h"
 #include <mongoose.h>
 #include <stdio.h>
@@ -33,9 +32,9 @@ static void broadcast_event(relay_t *relay, const event_t *event);
 static void send_event_json(struct mg_connection *connection, const char *sub, const event_t *event);
 static void query_events(relay_t *relay, struct mg_connection *connection, const char *sub,
                           filter_t *filters, size_t count, bool do_count);
-static void send_query_json(struct mg_connection *connection, const char *json);
-static void handle_req(relay_t *relay, struct mg_connection *connection, json_value_t *values, size_t count, bool do_count);
-static void handle_event(relay_t *relay, struct mg_connection *connection, json_value_t *values, size_t count);
+static void handle_req(relay_t *relay, struct mg_connection *connection,
+                       const char *sub, filter_t *filters, size_t filter_count, bool do_count);
+static void handle_event(relay_t *relay, struct mg_connection *connection, const event_t *event);
 static void handle_message(relay_t *relay, struct mg_connection *connection, struct mg_ws_message *message);
 static void log_timestamp(void);
 static void log_peer(struct mg_connection *connection);
@@ -354,8 +353,7 @@ static void broadcast_event(relay_t *relay, const event_t *event) {
     subscription_manager_match_and_deliver(relay->subscriptions, event,
         relay_can_deliver,
         relay->nip_registry,
-        send_event_json,
-        NULL);
+        send_event_json);
 }
 
 static void send_event_json(struct mg_connection *connection, const char *sub, const event_t *event) {
@@ -368,20 +366,16 @@ static void send_event_json(struct mg_connection *connection, const char *sub, c
     }
 }
 
-/* Global registry for query wrappers (single-threaded) */
-static nip_registry_t *g_query_registry = NULL;
-
-/* Wrapper functions for protocol response builders that capture the registry */
-static char *relay_build_eose(const char *sub, bool has_more, bool auth_hint) {
-    return nip_composition_build_eose(g_query_registry, sub, has_more, auth_hint);
+/* Wrapper functions for protocol response builders that capture the registry
+ * via the context parameter (passed by subscription_manager_query). */
+static char *relay_build_eose(const char *sub, bool has_more, bool auth_hint, void *ctx) {
+    return nip_composition_build_eose((nip_registry_t *)ctx, sub, has_more, auth_hint);
 }
 
-static char *relay_build_count(const char *sub, unsigned long count) {
-    return nip_composition_build_count(g_query_registry, sub, count);
+static char *relay_build_count(const char *sub, unsigned long count, void *ctx) {
+    return nip_composition_build_count((nip_registry_t *)ctx, sub, count);
 }
 
-/* Thin adapters: the subscription manager takes opaque ctx, the relay
- * passes its NIP registry straight through to the composition helpers. */
 static bool relay_needs_auth_hint(const filter_t *filters, size_t count,
                                   connection_id_t conn_id, void *ctx) {
     return nip_composition_needs_auth_hint((nip_registry_t *)ctx, filters, count, conn_id);
@@ -391,14 +385,16 @@ static void relay_send_auth_challenge(connection_id_t conn_id, void *ctx) {
     nip_composition_send_auth_challenge((nip_registry_t *)ctx, conn_id);
 }
 
+static void send_query_json(struct mg_connection *connection, const char *json) {
+    transport_send_json(connection, json);
+}
+
 static void query_events(relay_t *relay, struct mg_connection *connection, const char *sub,
-                         filter_t *filters, size_t count, bool do_count) {
+                          filter_t *filters, size_t count, bool do_count) {
     if (!relay) return;
 
-    g_query_registry = relay->nip_registry;
-
     subscription_manager_query(relay->subscriptions, relay->storage, connection, sub, filters, count, do_count,
-        send_query_json, NULL,
+        send_query_json,
         relay_can_deliver,
         relay->nip_registry,
         relay_build_eose,
@@ -406,107 +402,23 @@ static void query_events(relay_t *relay, struct mg_connection *connection, const
         relay_needs_auth_hint,
         relay_send_auth_challenge,
         relay->nip_registry);
-
-    g_query_registry = NULL;
 }
 
-static void send_query_json(struct mg_connection *connection, const char *json) {
-    transport_send_json(connection, json);
-}
-
-/**
- * \brief           Collect REQ/COUNT filters from parsed values
- * \param[in]       values: Parsed JSON array values
- * \param[in]       count: Number of values
- * \param[out]      out: Allocated filter array
- * \param[out]      out_count: Number of filters collected
- * \param[in]       max_filters: Cap from relay_config_t (0 = accept none)
- * \return          `1` on success, `0` otherwise
- */
-static bool
-collect_filters(json_value_t *values, size_t count, filter_t **out,
-                size_t *out_count, size_t max_filters) {
-    filter_t *filters = NULL;
-    size_t filter_capacity = 0;
-    size_t idx = 0;
-    if (values == NULL || out == NULL || out_count == NULL) {
-        return false;
-    }
-    *out = NULL;
-    *out_count = 0;
-    if (count >= 3 && values[2].type == JSON_TYPE_ARRAY) {
-        json_value_t inner[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
-        size_t inner_count = 0;
-        if (values[2].value.string_val == NULL) {
-            return false;
-        }
-        inner_count = json_array_parse(values[2].value.string_val, inner, MAX_JSON_ARRAY_ELEMENTS);
-        if (inner_count == 0) {
-            json_array_free(inner, inner_count);
-            return false;
-        }
-        filter_capacity = inner_count;
-        filters = calloc(filter_capacity, sizeof(*filters));
-        if (filters == NULL) {
-            json_array_free(inner, inner_count);
-            return false;
-        }
-        for (idx = 0; idx < inner_count && *out_count < max_filters; ++idx) {
-            if (inner[idx].type == JSON_TYPE_OBJECT && inner[idx].value.string_val != NULL) {
-                if (json_parse_filter(inner[idx].value.string_val, &filters[*out_count])) {
-                    (*out_count)++;
-                } else {
-                    filter_release(&filters[*out_count]);
-                    memset(&filters[*out_count], 0, sizeof(filters[*out_count]));
-                }
-            }
-        }
-        json_array_free(inner, inner_count);
-    } else {
-        if (count <= 2) {
-            return false;
-        }
-        filter_capacity = count - 2;
-        filters = calloc(filter_capacity, sizeof(*filters));
-        if (filters == NULL) {
-            return false;
-        }
-        for (idx = 2; idx < count && *out_count < max_filters; ++idx) {
-            if (values[idx].type == JSON_TYPE_OBJECT && values[idx].value.string_val != NULL) {
-                if (json_parse_filter(values[idx].value.string_val, &filters[*out_count])) {
-                    (*out_count)++;
-                } else {
-                    filter_release(&filters[*out_count]);
-                    memset(&filters[*out_count], 0, sizeof(filters[*out_count]));
-                }
-            }
-        }
-    }
-    if (*out_count == 0) {
-        free(filters);
-        filters = NULL;
-        return false;
-    }
-    *out = filters;
-    return true;
-}
-
-static void handle_req(relay_t *relay, struct mg_connection *connection, json_value_t *values, size_t count, bool do_count) {
-    const char *sub = json_array_get_string(values, count, 1);
-    filter_t *filters = NULL;
-    size_t filter_count = 0;
-    
+static void handle_req(relay_t *relay, struct mg_connection *connection,
+                       const char *sub, filter_t *filters, size_t filter_count, bool do_count) {
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
     
-    if (!sub || strlen(sub) > relay->config.max_subscription_id_length || count < 3 ||
-        !collect_filters(values, count, &filters, &filter_count,
-                         (size_t)relay->config.max_filters_per_subscription)) {
+    if (!sub || strlen(sub) > relay->config.max_subscription_id_length || filter_count == 0) {
         char *closed = protocol_serialize_closed(sub, false, "error: invalid filter");
         if (closed) {
             transport_send_json(connection, closed);
             protocol_free_string(closed);
+        }
+        if (!do_count) {
+            for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]);
+            free(filters);
         }
         return;
     }
@@ -541,107 +453,154 @@ static void handle_req(relay_t *relay, struct mg_connection *connection, json_va
     }
 }
 
-/* Validation stage of the EVENT pipeline (PLAN section 10): structure,
- * event ID, Schnorr signature, delegation, relay timestamps and relay PoW.
+/* Validation stage of the EVENT pipeline: structure,
+ * event ID, Schnorr signature, delegation, relay timestamps.
  * Runs AFTER NIP publication policies (matching the legacy order where
  * accept_publish hooks ran before nip01_process_event validation) and BEFORE
- * kind dispatch. Reasons preserve the legacy wire messages. */
+ * kind dispatch. Reasons preserve the legacy wire messages.
+ * 
+ * NOTE: Proof of Work (NIP-13) is checked by NIP-13's publication policy,
+ * NOT here, to avoid duplicate computation.
+ */
 static bool validate_event_for_publish(relay_t *relay, const event_t *event,
                                        char *reason, size_t reason_size) {
-    size_t max_content = relay->config.max_content_length > 0
-        ? (size_t)relay->config.max_content_length
-        : (size_t)relay->config.max_event_content_length;
-    validation_outcome_t outcome = validation_validate_event(
-        event, max_content,
-        relay->config.created_at_lower_limit,
-        relay->config.created_at_upper_limit,
-        relay->config.min_pow_difficulty);
-    const char *message;
-
-    if (outcome.result == VALIDATION_OK) return true;
-
-    switch (outcome.result) {
-        case VALIDATION_INVALID_EVENT_ID:
-        case VALIDATION_INVALID_SIGNATURE:
-        case VALIDATION_INVALID_DELEGATION:
-            message = "invalid: event id, signature or delegation is invalid";
-            break;
-        case VALIDATION_CONTENT_TOO_LARGE:
-            message = strcmp(outcome.reason, "event serialization too large") == 0
-                ? "invalid: event serialization too large"
-                : "invalid: content too large";
-            break;
-        case VALIDATION_TIMESTAMP_OUT_OF_RANGE:
-            message = "invalid: created_at is out of the acceptable range";
-            break;
-        case VALIDATION_INSUFFICIENT_POW:
-            message = "invalid: insufficient proof of work";
-            break;
-        default:
-            message = "invalid: event is invalid";
-            break;
+    /* Check structure */
+    if (!event) {
+        snprintf(reason, reason_size, "event is null");
+        return false;
     }
-    snprintf(reason, reason_size, "%s", message);
-    return false;
+    
+    if (!event->id[0] || !event->pubkey[0] || !event->sig[0]) {
+        snprintf(reason, reason_size, "missing required fields");
+        return false;
+    }
+    
+    if (event->kind < 0) {
+        snprintf(reason, reason_size, "invalid kind");
+        return false;
+    }
+    
+    if (event->created_at == 0) {
+        snprintf(reason, reason_size, "invalid created_at");
+        return false;
+    }
+    
+    size_t max_content = relay->config.max_event_content_length;
+    if (max_content > 0 && event->content_len > max_content) {
+        snprintf(reason, reason_size, "content too large");
+        return false;
+    }
+    
+    /* Check event serialization size */
+    size_t serialized_size = json_serialized_event_size(event);
+    if (serialized_size + 160 > 65536) {
+        snprintf(reason, reason_size, "event serialization too large");
+        return false;
+    }
+    
+    /* Verify event ID */
+    if (!check_event_id(event)) {
+        snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        return false;
+    }
+    
+    /* Verify signature - need to recompute digest */
+    size_t buffer_size = event_hash_input_size(event);
+    if (buffer_size == 0) {
+        snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        return false;
+    }
+    
+    char *buffer = (char *)malloc(buffer_size);
+    if (!buffer) {
+        snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        return false;
+    }
+    
+    size_t len = event_build_hash_input(event, buffer, buffer_size);
+    if (len == 0) {
+        free(buffer);
+        snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        return false;
+    }
+    
+    uint8_t digest[32];
+    sha256((const uint8_t *)buffer, len, digest);
+    free(buffer);
+    
+    if (!signature_verify(event->sig, event->pubkey, digest)) {
+        snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        return false;
+    }
+    
+    /* Check timestamp bounds */
+    time_t now = time(NULL);
+    if (relay->config.created_at_lower_limit > 0 && 
+        event->created_at < now - relay->config.created_at_lower_limit) {
+        snprintf(reason, reason_size, "invalid: created_at is out of the acceptable range");
+        return false;
+    }
+    
+    if (relay->config.created_at_upper_limit > 0 && 
+        event->created_at > now + relay->config.created_at_upper_limit) {
+        snprintf(reason, reason_size, "invalid: created_at is out of the acceptable range");
+        return false;
+    }
+    
+    return true;
 }
 
-static void handle_event(relay_t *relay, struct mg_connection *connection, json_value_t *values, size_t count) {
-    event_t event;
+static void handle_event(relay_t *relay, struct mg_connection *connection, const event_t *event) {
+    event_t event_copy = *event;
     char reject_reason[256] = {0};
     
-    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) {
-        char *notice = protocol_serialize_notice("error: invalid event");
-        if (notice) {
-            transport_send_json(connection, notice);
-            protocol_free_string(notice);
-        }
-        return;
-    }
-    
     log_message(relay, connection, "event kind=%d id=%.*s pubkey=%.*s created_at=%lld",
-                event.kind, (int)sizeof(event.id), event.id,
-                (int)sizeof(event.pubkey), event.pubkey,
-                (long long)event.created_at);
+                event_copy.kind, (int)sizeof(event_copy.id), event_copy.id,
+                (int)sizeof(event_copy.pubkey), event_copy.pubkey,
+                (long long)event_copy.created_at);
     
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
     
-    if (!plugins_accept_publish(relay, conn_id, &event, reject_reason, sizeof(reject_reason))) {
-        char *ok = protocol_serialize_ok(event.id, false, reject_reason);
+    /* 1. Validate event FIRST (structure, ID, signature, delegation, timestamps, PoW)
+     * Reject invalid events immediately without wasting compute on policy checks. */
+    if (!validate_event_for_publish(relay, &event_copy, reject_reason, sizeof(reject_reason))) {
+        char *ok = protocol_serialize_ok(event_copy.id, false, reject_reason);
         if (ok) {
             transport_send_json(connection, ok);
             protocol_free_string(ok);
         }
-        event_release(&event);
+        event_release(&event_copy);
         return;
     }
-
-    if (!validate_event_for_publish(relay, &event, reject_reason, sizeof(reject_reason))) {
-        char *ok = protocol_serialize_ok(event.id, false, reject_reason);
+    
+    /* 2. Then check NIP publication policies (NIP-13 PoW, NIP-26 delegation, NIP-42 auth, etc.) */
+    if (!plugins_accept_publish(relay, conn_id, &event_copy, reject_reason, sizeof(reject_reason))) {
+        char *ok = protocol_serialize_ok(event_copy.id, false, reject_reason);
         if (ok) {
             transport_send_json(connection, ok);
             protocol_free_string(ok);
         }
-        event_release(&event);
+        event_release(&event_copy);
         return;
     }
-
-    /* Use the new capability interface for event processing */
+    
+    /* 3. Process via kind handler (NIP-01 replaceable/addressable, etc.) */
     nip_kind_composition_result_t kind_result = nip_composition_process_kind(
-        relay->nip_registry, conn_id, &event, relay->storage, relay->config.service_url);
+        relay->nip_registry, conn_id, &event_copy, relay->storage, relay->config.service_url);
     
     nip01_process_result_t result;
     if (kind_result.any_handler_matched) {
         result = kind_result.result;
     } else {
         /* Default NIP-01 behavior for kinds without handlers */
-        if (event.kind >= 20000 && event.kind < 30000) {
+        if (event_copy.kind >= 20000 && event_copy.kind < 30000) {
             result.accepted = true;
             result.should_broadcast = true;
             result.response_msg[0] = '\0';
         } else {
-            storage_insert_result_t insert_result = relay->storage->insert_record(&event, NULL, 0);
+            storage_insert_result_t insert_result = relay->storage->insert_record(&event_copy, NULL, 0);
             if (insert_result.result == STORAGE_OK) {
                 result.accepted = true;
                 result.should_broadcast = true;
@@ -658,104 +617,98 @@ static void handle_event(relay_t *relay, struct mg_connection *connection, json_
         }
     }
     
-    char *ok = protocol_serialize_ok(event.id, result.accepted, result.response_msg);
+    char *ok = protocol_serialize_ok(event_copy.id, result.accepted, result.response_msg);
     if (ok) {
         transport_send_json(connection, ok);
         protocol_free_string(ok);
     }
     
     if (result.accepted && result.should_broadcast) {
-        broadcast_event(relay, &event);
+        broadcast_event(relay, &event_copy);
     }
     
-    event_release(&event);
+    event_release(&event_copy);
 }
 
 static void handle_message(relay_t *relay, struct mg_connection *connection, struct mg_ws_message *message) {
-    json_value_t values[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
-    char *payload;
-    size_t count;
-    const char *method;
-    
-    if (message->data.len > relay->config.max_ws_message_length) {
-        char *notice = protocol_serialize_notice("error: message too large");
-        if (notice) {
-            transport_send_json(connection, notice);
-            protocol_free_string(notice);
-        }
-        return;
-    }
-    
-    payload = malloc(message->data.len + 1);
-    if (!payload) return;
-    memcpy(payload, message->data.buf, message->data.len);
-    payload[message->data.len] = '\0';
-    
-    log_message(relay, connection, "recv: %s", payload);
-    count = json_array_parse(payload, values, MAX_JSON_ARRAY_ELEMENTS);
-    method = json_array_get_string(values, count, 0);
-    
+    char reject_reason[256] = {0};
+    protocol_message_t proto_msg;
+    bool proto_valid;
+    bool consumed = false;
+
+    /* Parse using the protocol parser with config limits */
+    proto_valid = protocol_parse_client_message(message->data.buf, message->data.len,
+                                                 &relay->config, &proto_msg, reject_reason, sizeof(reject_reason));
+
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
-    
-    /* Parse once into a typed protocol message and offer it to every
-     * message_intercept capability (e.g. NIP-42 AUTH). A capability returns
-     * true only if it fully consumed the message (custom verb or AUTH
-     * response); otherwise default REQ/COUNT/CLOSE/EVENT/AUTH dispatch runs.
-     * This is what lets a new NIP add a verb or auth flow without restart:
-     * ship the capability in the reloaded module. */
-    protocol_message_t proto_msg;
-    bool proto_valid = protocol_parse_message(payload, message->data.len, &proto_msg);
-    bool consumed = false;
+
+    if (!proto_valid) {
+        if (reject_reason[0]) {
+            char *notice = protocol_serialize_notice(reject_reason);
+            if (notice) {
+                transport_send_json(connection, notice);
+                protocol_free_string(notice);
+            }
+        }
+        return;
+    }
+
+    /* Offer to message intercept capabilities (e.g. NIP-42 AUTH) */
     for (nip_capability_t *cap = relay->nip_registry->capabilities; cap; cap = cap->next) {
         if (cap->type == NIP_CAP_MESSAGE_INTERCEPT && cap->caps.message_intercept.on_message) {
-            if (cap->caps.message_intercept.on_message(
-                    conn_id, proto_valid ? &proto_msg : NULL, cap->ctx)) {
+            if (cap->caps.message_intercept.on_message(conn_id, &proto_msg, cap->ctx)) {
                 consumed = true;
                 break;
             }
         }
     }
-    
+
     if (!consumed) {
-        if (!method || count < 2) {
-            char *notice = protocol_serialize_notice("error: invalid request");
-            if (notice) {
-                transport_send_json(connection, notice);
-                protocol_free_string(notice);
-            }
-        } else if (strcmp(method, "REQ") == 0) {
-            handle_req(relay, connection, values, count, false);
-        } else if (strcmp(method, "COUNT") == 0) {
-            handle_req(relay, connection, values, count, true);
-        } else if (strcmp(method, "CLOSE") == 0) {
-            const char *sub = json_array_get_string(values, count, 1);
-            if (sub) remove_subscriptions(relay, connection, sub);
-        } else if (strcmp(method, "EVENT") == 0) {
-            handle_event(relay, connection, values, count);
-        } else if (strcmp(method, "AUTH") == 0) {
-            /* AUTH was already offered to interceptors above (NIP-42 owns
-             * the challenge flow and answers OK itself). Reaching here
-             * means no capability consumed it: malformed AUTH or no AUTH
-             * provider in this module generation. */
-            char *notice = protocol_serialize_notice("error: invalid auth");
-            if (notice) {
-                transport_send_json(connection, notice);
-                protocol_free_string(notice);
-            }
-        } else {
-            char *notice = protocol_serialize_notice("error: invalid request");
-            if (notice) {
-                transport_send_json(connection, notice);
-                protocol_free_string(notice);
-            }
+        switch (proto_msg.command) {
+            case PROTOCOL_CMD_REQ:
+                handle_req(relay, connection, proto_msg.payload.req.subscription_id,
+                           proto_msg.payload.req.filters, proto_msg.payload.req.filters_count, false);
+                break;
+            case PROTOCOL_CMD_COUNT:
+                handle_req(relay, connection, proto_msg.payload.count.subscription_id,
+                           proto_msg.payload.count.filters, proto_msg.payload.count.filters_count, true);
+                break;
+            case PROTOCOL_CMD_CLOSE:
+                if (proto_msg.payload.close.subscription_id) {
+                    remove_subscriptions(relay, connection, proto_msg.payload.close.subscription_id);
+                }
+                break;
+            case PROTOCOL_CMD_EVENT:
+                handle_event(relay, connection, &proto_msg.payload.event.event);
+                break;
+            case PROTOCOL_CMD_AUTH:
+                /* AUTH was already offered to interceptors above (NIP-42 owns
+                 * the challenge flow and answers OK itself). Reaching here
+                 * means no capability consumed it: malformed AUTH or no AUTH
+                 * provider in this module generation. */
+                {
+                    char *notice = protocol_serialize_notice("error: invalid auth");
+                    if (notice) {
+                        transport_send_json(connection, notice);
+                        protocol_free_string(notice);
+                    }
+                }
+                break;
+            default:
+                {
+                    char *notice = protocol_serialize_notice("error: invalid request");
+                    if (notice) {
+                        transport_send_json(connection, notice);
+                        protocol_free_string(notice);
+                    }
+                }
+                break;
         }
     }
-    
-    if (proto_valid) protocol_message_free(&proto_msg);
-    json_array_free(values, count);
-    free(payload);
+
+    protocol_message_free(&proto_msg);
 }
 
 static void log_timestamp(void) {

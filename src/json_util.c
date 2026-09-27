@@ -717,8 +717,9 @@ static bool append_string(char ***items, size_t *count, size_t *capacity, const 
         *items = resized;
         *capacity = new_capacity;
     }
-    (*items)[*count] = string_dup(value);
+    (*items)[*count] = malloc(strlen(value) + 1);
     if (!(*items)[*count]) return false;
+    strcpy((*items)[*count], value);
     (*count)++;
     return true;
 }
@@ -775,11 +776,12 @@ static bool append_filter_tag(filter_t *filter, const char *name,
     if (filter->tags_count >= MAX_TAG_ELEMENTS || name[0] == '\0') return false;
     tag = tag_alloc(MAX_TAG_ELEMENTS);
     if (!tag) return false;
-    tag->elements[tag->count++] = string_dup(name);
+    tag->elements[tag->count++] = malloc(strlen(name) + 1);
     if (!tag->elements[0]) {
         tag_free(tag);
         return false;
     }
+    strcpy(tag->elements[0], name);
     /* NIP-01: values in #e and #p filters must be exact 64-char lowercase hex */
     bool require_hex64 = (strcmp(name, "e") == 0 || strcmp(name, "p") == 0);
     while ((offset = mg_json_next(raw, offset, &key, &value)) != 0) {
@@ -822,7 +824,7 @@ static bool validate_event_tags(struct mg_str tags) {
         size_t element_offset = 0;
         size_t element_count = 0;
         if (key.buf != NULL || ++tag_count > 100 || tag.len < 2 || tag.buf[0] != '[') return false;
-        /* Per-tag element cap must match parse_tags_json() in crypto.c: its
+        /* Per-tag element cap must match event_find_tag() in event_util.c: its
          * scanner aborts (returning NULL) beyond MAX_TAG_ELEMENTS elements,
          * which used to silently skip delegation-tag verification while the
          * mongoose-based tag lookups still honored the tag. Keep both

@@ -199,18 +199,4 @@ tags_array_t *tags_array_alloc(size_t tag_count);
  * Note: Recursively frees all tag structures in the array */
 void tags_array_free(tags_array_t *tags);
 
-/* ============================================================================
- * String Utility Functions
- * ============================================================================ */
-
-/* string_dup - Duplicate a null-terminated string
- * Args: str - string to duplicate (NULL-safe)
- * Returns: malloc'd copy of string, or NULL if str is NULL or allocation fails
- * Caller: must call string_free() to release */
-char *string_dup(const char *str);
-
-/* string_free - Free a duplicated string
- * Args: str - pointer to malloc'd string (NULL-safe) */
-void string_free(char *str);
-
 #endif /* NOSTROGOTHO_H_ */

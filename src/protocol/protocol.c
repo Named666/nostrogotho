@@ -8,138 +8,6 @@
  * PROTOCOL.C - Nostr Protocol Parsing and Serialization Implementation
  * ============================================================================ */
 
-/**
- * \brief           Parse a Nostr wire message into a protocol message
- * \param[in]       json: Input JSON text
- * \param[in]       length: Length of input in bytes
- * \param[out]      out: Parsed message output
- * \return          `1` on success, `0` otherwise
- */
-bool
-protocol_parse_message(const char *json, size_t length, protocol_message_t *out) {
-    json_value_t values[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
-    size_t count = 0;
-    const char *method = NULL;
-    uint8_t ok = 0;
-
-    if (json == NULL || out == NULL || length == 0) {
-        return 0;
-    }
-    memset(out, 0, sizeof(*out));
-    count = json_array_parse(json, values, MAX_JSON_ARRAY_ELEMENTS);
-    if (count < 2) {
-        json_array_free(values, count);
-        return 0;
-    }
-    method = json_array_get_string(values, count, 0);
-    if (method == NULL) {
-        json_array_free(values, count);
-        return 0;
-    }
-    if (strcmp(method, "EVENT") == 0) {
-        if (count != 2 || values[1].type != JSON_TYPE_OBJECT) {
-            json_array_free(values, count);
-            return 0;
-        }
-        ok = json_parse_event(values[1].value.string_val, &out->payload.event.event);
-        if (!ok) {
-            json_array_free(values, count);
-            return 0;
-        }
-        out->command = PROTOCOL_CMD_EVENT;
-    } else if (strcmp(method, "REQ") == 0) {
-        const char *sub = json_array_get_string(values, count, 1);
-        filter_t *filters = NULL;
-        size_t filter_count = 0;
-        if (sub == NULL) {
-            json_array_free(values, count);
-            return 0;
-        }
-        out->payload.req.subscription_id = string_dup(sub);
-        if (out->payload.req.subscription_id == NULL) {
-            json_array_free(values, count);
-            return 0;
-        }
-        if (!protocol_collect_filters(values, count, &filters, &filter_count,
-                                        PROTOCOL_MAX_FILTERS)) {
-            free(out->payload.req.subscription_id);
-            out->payload.req.subscription_id = NULL;
-            json_array_free(values, count);
-            return 0;
-        }
-        out->payload.req.filters = filters;
-        out->payload.req.filters_count = filter_count;
-        out->command = PROTOCOL_CMD_REQ;
-    } else if (strcmp(method, "CLOSE") == 0) {
-        const char *sub = json_array_get_string(values, count, 1);
-        if (sub == NULL) {
-            json_array_free(values, count);
-            return 0;
-        }
-        out->payload.close.subscription_id = string_dup(sub);
-        if (out->payload.close.subscription_id == NULL) {
-            json_array_free(values, count);
-            return 0;
-        }
-        out->command = PROTOCOL_CMD_CLOSE;
-    } else if (strcmp(method, "AUTH") == 0) {
-        if (count != 2) {
-            json_array_free(values, count);
-            return 0;
-        }
-        if (values[1].type == JSON_TYPE_OBJECT) {
-            /* Client AUTH response carrying a signed kind:22242 event. */
-            if (!json_parse_event(values[1].value.string_val,
-                                  &out->payload.auth.event)) {
-                json_array_free(values, count);
-                return 0;
-            }
-            out->payload.auth.has_event = true;
-        } else {
-            /* Relay challenge (string form). */
-            const char *challenge = json_array_get_string(values, count, 1);
-            if (challenge == NULL) {
-                json_array_free(values, count);
-                return 0;
-            }
-            out->payload.auth.challenge = string_dup(challenge);
-            if (out->payload.auth.challenge == NULL) {
-                json_array_free(values, count);
-                return 0;
-            }
-        }
-        out->command = PROTOCOL_CMD_AUTH;
-    } else if (strcmp(method, "COUNT") == 0) {
-        const char *sub = json_array_get_string(values, count, 1);
-        filter_t *filters = NULL;
-        size_t filter_count = 0;
-        if (sub == NULL) {
-            json_array_free(values, count);
-            return 0;
-        }
-        out->payload.count.subscription_id = string_dup(sub);
-        if (out->payload.count.subscription_id == NULL) {
-            json_array_free(values, count);
-            return 0;
-        }
-        if (!protocol_collect_filters(values, count, &filters, &filter_count,
-                                        PROTOCOL_MAX_FILTERS)) {
-            free(out->payload.count.subscription_id);
-            out->payload.count.subscription_id = NULL;
-            json_array_free(values, count);
-            return 0;
-        }
-        out->payload.count.filters = filters;
-        out->payload.count.filters_count = filter_count;
-        out->command = PROTOCOL_CMD_COUNT;
-    } else {
-        json_array_free(values, count);
-        return 0;
-    }
-    json_array_free(values, count);
-    return 1;
-}
-
 void protocol_message_free(protocol_message_t *msg) {
     if (!msg) return;
     
@@ -264,7 +132,9 @@ prv_builder_dup(const json_builder_t *builder) {
     if (tmp == NULL) {
         return NULL;
     }
-    dup = string_dup(tmp);
+    dup = malloc(strlen(tmp) + 1);
+    if (!dup) return NULL;
+    strcpy(dup, tmp);
     return dup;
 }
 

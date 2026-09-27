@@ -92,8 +92,8 @@ typedef bool (*storage_event_predicate_t)(const event_t *event, void *userdata);
 /* Generic opaque tag-index extension. A NIP may provide (tag name, tag value)
  * pairs at insertion and query time; storage performs no interpretation. */
 typedef struct {
-    const char *tag_name;
-    const char *tag_value;
+    char *tag_name;
+    char *tag_value;
     size_t filter_index;
 } storage_tag_match_t;
 

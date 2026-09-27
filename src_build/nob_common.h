@@ -132,8 +132,8 @@ static void nob_handle_stop_signal(int signal_number) {
     SRC_FOLDER"relay/config.c", \
     SRC_FOLDER"subscriptions/subscription_manager.c", \
     SRC_FOLDER"protocol/protocol.c", \
-    SRC_FOLDER"model/event_util.c", \
-    SRC_FOLDER"validation/event_validation.c"
+    SRC_FOLDER"protocol/parser.c", \
+    SRC_FOLDER"model/event_util.c"
 
 #define NOB_HOST_SOURCES \
     SRC_FOLDER"main.c", SRC_FOLDER"crypto.c", \
@@ -144,8 +144,8 @@ static void nob_handle_stop_signal(int signal_number) {
     SRC_FOLDER"transport/server.c", \
     SRC_FOLDER"subscriptions/subscription_manager.c", \
     SRC_FOLDER"protocol/protocol.c", \
-    SRC_FOLDER"model/event_util.c", \
-    SRC_FOLDER"validation/event_validation.c"
+    SRC_FOLDER"protocol/parser.c", \
+    SRC_FOLDER"model/event_util.c"
 /* NIP sources (registry + one nipXX.c per NIP) always come from the
  * nob_add_nip_sources() glob — never listed explicitly, or they link twice.
  * Exception: the hot-reload host links ONLY the registry (implementations
@@ -164,8 +164,8 @@ static void nob_handle_stop_signal(int signal_number) {
     SRC_FOLDER"transport/server.h", SRC_FOLDER"transport/server.c", \
     SRC_FOLDER"subscriptions/subscription_manager.h", SRC_FOLDER"subscriptions/subscription_manager.c", \
     SRC_FOLDER"protocol/protocol.h", SRC_FOLDER"protocol/protocol.c", \
+    SRC_FOLDER"protocol/parser.h", SRC_FOLDER"protocol/parser.c", \
     SRC_FOLDER"model/event_util.h", SRC_FOLDER"model/event_util.c", \
-    SRC_FOLDER"validation/event_validation.h", SRC_FOLDER"validation/event_validation.c", \
     SRC_FOLDER"nips/nip_capability.h", SRC_FOLDER"nips/nip_capability.c"
 
 /* Build the reloadable module under a staging name, then atomically publish.

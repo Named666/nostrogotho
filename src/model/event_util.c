@@ -158,3 +158,68 @@ void event_free_tag_values(char **values, size_t count) {
     }
     free(values);
 }
+
+/* Find a tag by name and return all its elements as an array of strings.
+ * Returns malloc'd array of element pointers with NULL sentinel.
+ * Caller must free with event_free_tag(). */
+char **event_find_tag(const event_t *event, const char *name, size_t *count) {
+    if (!event || !name || !event->tags_json) return NULL;
+    
+    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    size_t offset = 0;
+    
+    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+        char *tag_name = event_tag_element_slice(tag, 0);
+        if (tag_name && strcmp(tag_name, name) == 0) {
+            /* Count elements in this tag */
+            size_t elem_count = 0;
+            struct mg_str element_key, element;
+            size_t element_offset = 0;
+            while ((element_offset = mg_json_next(tag, element_offset, &element_key, &element)) != 0) {
+                elem_count++;
+            }
+            
+            /* Allocate array for elements + NULL sentinel */
+            char **elements = calloc(elem_count + 1, sizeof(*elements));
+            if (!elements) {
+                free(tag_name);
+                return NULL;
+            }
+            
+            /* Extract all elements */
+            element_offset = 0;
+            size_t idx = 0;
+            bool ok = true;
+            while ((element_offset = mg_json_next(tag, element_offset, &element_key, &element)) != 0) {
+                char *elem = event_tag_element_slice(tag, idx);
+                if (!elem) {
+                    ok = false;
+                    break;
+                }
+                elements[idx++] = elem;
+            }
+            
+            free(tag_name);
+            
+            if (!ok) {
+                for (size_t i = 0; i < idx; i++) free(elements[i]);
+                free(elements);
+                return NULL;
+            }
+            
+            if (count) *count = elem_count;
+            return elements;
+        }
+        free(tag_name);
+    }
+    return NULL;
+}
+
+/* Free an array of tag elements returned by event_find_tag */
+void event_free_tag(char **elements) {
+    if (!elements) return;
+    for (size_t i = 0; elements[i]; i++) {
+        free(elements[i]);
+    }
+    free(elements);
+}

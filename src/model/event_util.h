@@ -35,6 +35,23 @@ char **event_get_tag_values(const event_t *event, const char *name, size_t *coun
 /* Count tags with the given name */
 size_t event_get_tag_count(const event_t *event, const char *name);
 
+/* Find a tag by name and return all its elements as an array of strings.
+ * Returns malloc'd array of element pointers (caller must free each element and the array).
+ * Returns NULL if tag not found or on error.
+ * The last element of the returned array is NULL (sentinel).
+ * 
+ * Args:
+ *   event - event to search (must not be NULL)
+ *   name  - tag name to find (must not be NULL)
+ *   count - if not NULL, receives number of elements (excluding NULL sentinel)
+ * 
+ * Example: for tag ["delegation", "pubkey", "conditions", "sig"], returns
+ *   array with 4 elements: ["delegation", "pubkey", "conditions", "sig", NULL] */
+char **event_find_tag(const event_t *event, const char *name, size_t *count);
+
+/* Free an array of tag elements returned by event_find_tag */
+void event_free_tag(char **elements);
+
 /* Free an array of tag values */
 void event_free_tag_values(char **values, size_t count);
 
