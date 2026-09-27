@@ -13,12 +13,12 @@ void test_count_leading_zero_bits() {
         printf("FAIL: count_leading_zero_bits '00000001' = %d (expected 31)\n", result);
     }
     
-    /* Test: "1abc..." should give 0 leading zero bits */
+    /* Test: "1abc..." should give 3 leading zero bits (leading nibble 0x1). */
     result = count_leading_zero_bits("1abc");
-    if (result == 0) {
-        printf("PASS: count_leading_zero_bits '1abc' = 0\n");
+    if (result == 3) {
+        printf("PASS: count_leading_zero_bits '1abc' = 3\n");
     } else {
-        printf("FAIL: count_leading_zero_bits '1abc' = %d (expected 0)\n", result);
+        printf("FAIL: count_leading_zero_bits '1abc' = %d (expected 3)\n", result);
     }
     
     /* Test: NULL input */

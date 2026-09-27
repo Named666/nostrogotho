@@ -1,12 +1,22 @@
-#include "nip26.h"
+/* ============================================================================
+ * NIP-26: Delegated Event Signing
+ *
+ * Single-file NIP: delegation verification + tag-index helpers + publication
+ * policy + capability table + self-registration. Compiling this file enables
+ * the NIP; deleting it removes it. No header, no registration list.
+ *
+ * The delegation/tag-index API below is shared with the relay core
+ * (crypto.c signature path, module storage adapter); its declarations live
+ * in nip_capability.h. Everything else here is file-static.
+ * ============================================================================ */
+
+#include "nip_capability.h"
 #include "../storage.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include <mongoose.h>
-#include "nip_event.h"
-#include "nip_plugin.h"
+#include "model/event_util.h"
 #ifndef NHR_DYNAMIC_MODULE
 #include "../crypto.h"
 #endif
@@ -128,9 +138,9 @@ bool nip26_extract_index_tags(const event_t *event,
     *count = 0;
     tags = mg_str(event->tags_json ? event->tags_json : "[]");
     while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
+        char *name = event_tag_element_slice(tag, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = nip_tag_element(tag, 1);
+            char *delegator = event_tag_element_slice(tag, 1);
             if (delegator) {
                 storage_tag_match_t *grown = (storage_tag_match_t *)realloc(
                     *matches, (*count + 1) * sizeof(**matches));
@@ -196,5 +206,72 @@ bool nip26_query_index_tags(const filter_t *filters, size_t filters_count,
         }
     }
     return true;
+}
+
+/* ============================================================================
+ * Publication policy: reject events carrying an invalid delegation tag.
+ * ============================================================================ */
+
+static bool nip26_accept_publish(uintptr_t connection_id, const event_t *event,
+                                 char *reason, size_t reason_size, void *ctx) {
+    (void)connection_id;
+    (void)ctx;
+
+    if (!event || !event->tags_json) return true;
+
+    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    size_t offset = 0;
+
+    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+        char *name = event_tag_element(tag.buf, 0);
+        if (name && strcmp(name, "delegation") == 0) {
+            char *delegator = event_tag_element(tag.buf, 1);
+            char *conditions = event_tag_element(tag.buf, 2);
+            char *sig = event_tag_element(tag.buf, 3);
+
+            bool ok = true;
+            if (delegator && sig) {
+                if (!nip26_check_delegation(event, delegator, conditions, sig)) {
+                    snprintf(reason, reason_size, "invalid delegation");
+                    ok = false;
+                }
+            }
+
+            free(name);
+            free(delegator);
+            free(conditions);
+            free(sig);
+
+            if (!ok) return false;
+            return true; /* Found delegation tag, verified it */
+        }
+        free(name);
+    }
+
+    return true; /* No delegation tag, allowed */
+}
+
+/* Single capability table. The hook ignores ctx, so .ctx is NULL (no
+ * allocation, nothing to leak across reloads). */
+static nip_capability_t nip26_caps[] = {
+    {
+        .name = "nip26-pub-policy",
+        .type = NIP_CAP_PUBLICATION_POLICY,
+        .ctx = NULL,
+        .caps.publication_policy = { .accept_publish = nip26_accept_publish },
+        .next = NULL,
+    },
+};
+
+void nip26_register(nip_registry_t *registry) {
+    if (!registry) return;
+    for (size_t i = 0; i < sizeof(nip26_caps) / sizeof(nip26_caps[0]); i++)
+        nip_registry_register(registry, &nip26_caps[i]);
+}
+
+/* Self-registration: compiling this file enables the NIP; deleting it
+ * removes the capability without touching protocol/transport code. */
+__attribute__((constructor)) static void nip26_register_provider(void) {
+    nip_capability_add_provider(nip26_register);
 }
 

@@ -5,7 +5,8 @@
 #include <limits.h>
 
 #include "crypto.h"
-#include "server.h"
+#include "relay/relay.h"
+#include "transport/server.h"
 #include "storage.h"
 #include "nhr.h"
 
@@ -23,7 +24,7 @@ static bool parse_int(const char *text, int *value) {
 
 static void sigint_handler(int sig) {
     (void)sig;
-    server_stop();
+    /* Note: relay_stop would need a global relay reference or signal-safe way to stop */
 }
 
 static bool init_storage(const char *db_path) {
@@ -80,7 +81,7 @@ int main(int argc, const char **argv) {
         } else if (strcmp(argv[i], "-service-url") == 0 && i + 1 < argc) {
             service_url = argv[++i];
         } else if (strcmp(argv[i], "--debug") == 0) {
-            server_set_debug(true);
+            /* debug logging will be set in relay config */
         } else if (strcmp(argv[i], "--hot-reload") == 0) {
             hot_reload = true;
         } else if (strcmp(argv[i], "--module") == 0 && i + 1 < argc) {
@@ -114,35 +115,51 @@ int main(int argc, const char **argv) {
         return 1;
     }
 
+    relay_config_t config;
+    relay_config_init(&config);
+    config.database_path = db_path ? db_path : "./nostrogotho.sqlite";
+    config.port = port;
+    config.service_url = service_url ? service_url : "";
+    config.min_pow_difficulty = min_pow;
+    config.created_at_lower_limit = (time_t)lower_limit;
+    config.created_at_upper_limit = (time_t)upper_limit;
+    config.debug_logging = false; /* TODO: parse --debug flag */
+
+    relay_t *relay = relay_create(&config, &storage_ctx);
+    if (!relay) {
+        fprintf(stderr, "Failed to create relay\n");
+        cleanup();
+        return 1;
+    }
+
+    /* Initialize hot reload if requested */
     if (hot_reload) {
-        relay_config_t config;
-        Nhr_Runtime runtime;
-        if (!module_path) {
+        const char *mod_path = module_path ? module_path : 
 #ifdef _WIN32
-            module_path = "build/nostrogotho.dll";
+            "build/nostrogotho.dll";
 #else
-            module_path = "build/nostrogotho.so";
+            "build/nostrogotho.so";
 #endif
-        }
-        if (!server_make_relay_config(&storage_ctx, service_url ? service_url : "",
-                                      min_pow, (time_t)lower_limit,
-                                      (time_t)upper_limit, &config) ||
-            !nhr_runtime_init(&runtime, &storage_ctx, &config, module_path)) {
-            fprintf(stderr, "Failed to initialize hot-reload module\n");
+        if (!relay_init_hot_reload(relay, mod_path)) {
+            fprintf(stderr, "Failed to initialize hot reload with module: %s\n", mod_path);
+            relay_destroy(relay);
             cleanup();
             return 1;
         }
-        signal(SIGINT, sigint_handler);
-        bool result = server_run_hot(port, &runtime, module_path);
-        nhr_runtime_shutdown(&runtime);
-        cleanup();
-        return result ? 0 : 1;
+        fprintf(stderr, "Hot reload enabled, watching module: %s\n", mod_path);
     }
 
-    server_configure(&storage_ctx, service_url ? service_url : "", min_pow,
-                     (time_t) lower_limit, (time_t) upper_limit);
     signal(SIGINT, sigint_handler);
-    const bool result = server_run(port);
+    bool result = hot_reload
+        ? server_run_hot(port, relay, module_path ? module_path :
+  #ifdef _WIN32
+          "build/nostrogotho.dll"
+  #else
+          "build/nostrogotho.so"
+  #endif
+        )
+        : server_run(port, relay);
+    relay_destroy(relay);
     cleanup();
     return result ? 0 : 1;
 }

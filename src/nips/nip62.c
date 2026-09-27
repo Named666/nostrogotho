@@ -1,9 +1,28 @@
-#include <stdio.h>
-#include "nip62.h"
-#include "nip_event.h"
-#include "nip01.h"
-#include "nip_plugin.h"
+/* ============================================================================
+ * NIP-62: Request to Vanish (kind 62)
+ *
+ * Single-file NIP: vanish policy + storage sweep + kind handler + capability
+ * table + self-registration. Compiling this file enables the NIP; deleting
+ * it removes it. No header, no registration list.
+ *
+ * A kind-62 event MUST tag at least one `relay`. When it targets this relay
+ * ("ALL_RELAYS" or our service URL), all of the author's older events
+ * (except the vanish request itself) are deleted through the generic storage
+ * API — the NIP never touches SQLite.
+ * ============================================================================ */
+
+#include "nip_capability.h"
+#include "model/event_util.h"
 #include "../storage.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Check whether a Request to Vanish applies to this relay. */
+static bool nip62_should_vanish(const event_t *event, const char *service_url) {
+    return event_has_tag(event, "relay", "ALL_RELAYS") ||
+           (service_url && *service_url && event_has_relay_tag(event, service_url));
+}
 
 static bool nip62_select_all(const event_t *event, void *userdata) {
     (void)event;
@@ -32,60 +51,83 @@ static bool nip62_delete_events(storage_context_t *storage, const char *pubkey,
     return true;
 }
 
-bool nip62_should_vanish(const event_t *event, const char *service_url) {
-    return nip_event_has_tag(event, "relay", "ALL_RELAYS") ||
-           (service_url && *service_url && nip_event_has_relay_tag(event, service_url));
+static bool nip62_kind_handler_handles_kind(int kind, void *ctx);
+static nip01_process_result_t nip62_kind_handler_process_event(
+    uintptr_t connection_id, const event_t *event,
+    storage_context_t *storage, const char *relay_url, void *ctx);
+
+/* Single capability table. Hooks ignore ctx, so .ctx is NULL (no
+ * allocation, nothing to leak across reloads). */
+static nip_capability_t nip62_caps[] = {
+    {
+        .name = "nip62-kind-handler",
+        .type = NIP_CAP_KIND_HANDLER,
+        .ctx = NULL,
+        .caps.kind_handler = {
+            .handles_kind = nip62_kind_handler_handles_kind,
+            .process_event = nip62_kind_handler_process_event,
+        },
+        .next = NULL,
+    },
+};
+
+static bool nip62_kind_handler_handles_kind(int kind, void *ctx) {
+    (void)ctx;
+    return kind == 62;
 }
 
-/* Listener for kind 62 (Request to Vanish) events. */
-static nip01_process_result_t nip62_listener(
-    struct mg_connection *connection,
-    const event_t *event,
-    storage_context_t *storage,
-    const char *relay_url) {
-
-    (void)connection;
+static nip01_process_result_t nip62_kind_handler_process_event(
+    uintptr_t connection_id, const event_t *event,
+    storage_context_t *storage, const char *relay_url, void *ctx) {
+    (void)connection_id;
+    (void)ctx;
 
     /* NIP-62: "The tag list MUST include at least one `relay` value."
      * Reject kind-62 events that tag no relay at all. */
-    if (!nip_event_has_tag(event, "relay", NULL)) {
-        return nip_plugin_reject("invalid: kind 62 requires at least one relay tag");
+    if (!event_has_tag(event, "relay", NULL)) {
+        nip01_process_result_t result = {0};
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg), "invalid: kind 62 requires at least one relay tag");
+        return result;
     }
 
     if (!storage) {
-        return nip_plugin_reject("error: storage unavailable");
+        nip01_process_result_t result = {0};
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg), "error: storage unavailable");
+        return result;
     }
 
     if (nip62_should_vanish(event, relay_url)) {
         /* Delete all of the author's events except the vanish request itself
          * (kind 62). The exclusion is a NIP-62 policy decision, so it lives
-         * here in the plugin — the storage layer stays generic. */
+         * here in the NIP — the storage layer stays generic. */
         if (!storage->delete_matching ||
             !nip62_delete_events(storage, event->pubkey, event->created_at,
                                  event->kind)) {
-            return nip_plugin_reject("error: failed to vanish events");
+            nip01_process_result_t result = {0};
+            result.accepted = false;
+            snprintf(result.response_msg, sizeof(result.response_msg), "error: failed to vanish events");
+            return result;
         }
     }
 
-    return nip_plugin_store_and_broadcast(storage, event);
+    /* Accept with broadcast — the relay core handles storage and delivery
+     * through the composition layer. NIP-62 never sends WebSocket frames. */
+    nip01_process_result_t result = {0};
+    result.accepted = true;
+    result.should_broadcast = true;
+    return result;
 }
 
-/* ============================================================================
- * Plugin registration
- *
- * NIP-62 listens for kind 62 (Request to Vanish) events. Declaring the kind
- * in the plugin struct is the only wiring needed — nip_plugin_register()
- * hands it to the NIP-01 dispatcher.
- * ============================================================================ */
+void nip62_register(nip_registry_t *registry) {
+    if (!registry) return;
+    for (size_t i = 0; i < sizeof(nip62_caps) / sizeof(nip62_caps[0]); i++)
+        nip_registry_register(registry, &nip62_caps[i]);
+}
 
-static nip_plugin_t nip62_plugin = {
-    .name = "nip62",
-    .kinds = { NIP_PLUGIN_KIND(62) },
-    .kinds_count = 1,
-    .on_event = nip62_listener,
-};
-
-/* Auto-register this NIP's plugin at program startup */
-__attribute__((constructor)) static void nip62_register_at_startup(void) {
-    nip_plugin_register(&nip62_plugin);
+/* Self-registration: compiling this file enables the NIP; deleting it
+ * removes the capability without touching protocol/transport code. */
+__attribute__((constructor)) static void nip62_register_provider(void) {
+    nip_capability_add_provider(nip62_register);
 }

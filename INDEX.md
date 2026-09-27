@@ -1,4 +1,4 @@
-# Documentation Index
+﻿# Documentation Index
 
 - [README.md](README.md): relay capabilities, supported NIPs, limits, and all runtime options.
 - [QUICKSTART.md](QUICKSTART.md): Windows build, local execution, deployment, and validation.
@@ -50,19 +50,19 @@ nostrogotho/
 │   └── main.c                 ← Example main entry point
 │
 ├── 📁 NIP Plugins (src/nips/)
-│   ├── nip01.c/h              ← Basic Protocol Flow, replaceable events, addressable events
-│   ├── nip09.c/h              ← Event Deletion Request
-│   ├── nip11.c/h              ← Relay Information Document (HTTP)
-│   ├── nip13.c/h              ← Proof of Work
-│   ├── nip17.c/h              ← Private Direct Messages
-│   ├── nip26.c/h              ← Delegated Event Signing
-│   ├── nip40.c/h              ← Expiration Timestamp
-│   ├── nip42.c/h              ← Client Authentication
-│   ├── nip45.c/h              ← Event Counts (COUNT queries)
-│   ├── nip62.c/h              ← Request to Vanish
-│   ├── nip67.c/h              ← EOSE Completeness Hint
-│   ├── nip_event.c/h          ← Shared event-tag inspection
-│   └── nip_plugin.c/h         ← Plugin registration architecture
+│   ├── nip01.c              ← Basic Protocol Flow, replaceable events, addressable events
+│   ├── nip09.c              ← Event Deletion Request
+│   ├── nip11.c              ← Relay Information Document (HTTP)
+│   ├── nip13.c              ← Proof of Work
+│   ├── nip17.c              ← Private Direct Messages
+│   ├── nip26.c              ← Delegated Event Signing
+│   ├── nip40.c              ← Expiration Timestamp
+│   ├── nip42.c              ← Client Authentication
+│   ├── nip45.c              ← Event Counts (COUNT queries)
+│   ├── nip62.c              ← Request to Vanish
+│   ├── nip67.c              ← EOSE Completeness Hint
+│   ├── nip_template.c           - New-NIP scaffold (excluded from build)
+│   └── nip_capability.c/h          - Capability registry + composition
 │
 ├── 📁 Third-party (thirdparty/)
 │   ├── sqlite3.c/h            ← SQLite3 source amalgamation

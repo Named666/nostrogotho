@@ -10,6 +10,16 @@
  * JSON Parsing Utilities
  * ============================================================================ */
 
+bool mg_str_contains(struct mg_str haystack, const char *needle) {
+    size_t needle_len = needle ? strlen(needle) : 0;
+    size_t i;
+    if (needle_len == 0 || needle_len > haystack.len) return false;
+    for (i = 0; i + needle_len <= haystack.len; i++) {
+        if (memcmp(haystack.buf + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
 /* Skip whitespace in JSON string */
 static const char *skip_whitespace(const char *p) {
     while (p && *p && isspace((unsigned char)*p)) p++;
@@ -36,34 +46,67 @@ static bool skip_json_string(const char **p) {
     return false;
 }
 
-static bool skip_json_value(const char **p) {
-    const char *cursor = skip_whitespace(*p);
-    if (!cursor || !*cursor) return false;
+/* Maximum nesting depth for JSON values. Prevents stack exhaustion from
+ * malicious inputs like `[[[[...` with millions of open brackets. */
+#define JSON_MAX_DEPTH 64
 
+/**
+ * \brief           Skip one JSON value with recursion depth limit
+ * \param[in,out]   p: Cursor pointer, updated past the value
+ * \param[in]       depth: Current nesting depth
+ * \return          `1` on success, `0` otherwise
+ */
+static uint8_t
+prv_skip_json_value_depth(const char **p, size_t depth) {
+    const char *cursor = NULL;
+    if (p == NULL || *p == NULL) {
+        return 0;
+    }
+    if (depth > JSON_MAX_DEPTH) {
+        return 0;
+    }
+    cursor = skip_whitespace(*p);
+    if (cursor == NULL || *cursor == '\0') {
+        return 0;
+    }
     if (*cursor == '"') {
-        if (!skip_json_string(&cursor)) return false;
+        if (!skip_json_string(&cursor)) {
+            return 0;
+        }
     } else if (*cursor == '[' || *cursor == '{') {
-        const char open = *cursor++;
-        const char close = open == '[' ? ']' : '}';
-        bool needs_value = false;
+        char open = *cursor++;
+        char close = (open == '[') ? ']' : '}';
+        uint8_t needs_value = 0;
         cursor = skip_whitespace(cursor);
-        while (*cursor && *cursor != close) {
+        while (*cursor != '\0' && *cursor != close) {
             if (needs_value) {
-                if (*cursor != ',') return false;
+                if (*cursor != ',') {
+                    return 0;
+                }
                 cursor = skip_whitespace(cursor + 1);
-                if (*cursor == close) return false;
+                if (*cursor == close) {
+                    return 0;
+                }
             }
             if (open == '{') {
-                if (*cursor != '"' || !skip_json_string(&cursor)) return false;
+                if (*cursor != '"' || !skip_json_string(&cursor)) {
+                    return 0;
+                }
                 cursor = skip_whitespace(cursor);
-                if (*cursor != ':') return false;
+                if (*cursor != ':') {
+                    return 0;
+                }
                 cursor++;
             }
-            if (!skip_json_value(&cursor)) return false;
+            if (!prv_skip_json_value_depth(&cursor, depth + 1)) {
+                return 0;
+            }
             cursor = skip_whitespace(cursor);
-            needs_value = true;
+            needs_value = 1;
         }
-        if (*cursor != close) return false;
+        if (*cursor != close) {
+            return 0;
+        }
         cursor++;
     } else if (strncmp(cursor, "true", 4) == 0) {
         cursor += 4;
@@ -72,14 +115,25 @@ static bool skip_json_value(const char **p) {
     } else if (strncmp(cursor, "null", 4) == 0) {
         cursor += 4;
     } else {
-        char *end;
+        char *end = NULL;
         (void)strtod(cursor, &end);
-        if (end == cursor) return false;
+        if (end == cursor) {
+            return 0;
+        }
         cursor = end;
     }
-
     *p = cursor;
-    return true;
+    return 1;
+}
+
+/**
+ * \brief           Skip one JSON value
+ * \param[in,out]   p: Cursor pointer, updated past the value
+ * \return          `1` on success, `0` otherwise
+ */
+static bool
+skip_json_value(const char **p) {
+    return prv_skip_json_value_depth(p, 0) != 0;
 }
 
 static char *copy_json_value(const char *start, const char *end) {
@@ -416,7 +470,8 @@ static void json_builder_escape_string(json_builder_t *builder, const char *valu
             builder->buffer[builder->pos++] = 't';
         } else if (c < 0x20) {
             if (!json_builder_ensure_space(builder, 6)) return;
-            builder->pos += snprintf(&builder->buffer[builder->pos], 6, "\\u%04x", c);
+            snprintf(&builder->buffer[builder->pos], 7, "\\u%04x", c);
+            builder->pos += 6;
         } else {
             if (!json_builder_ensure_space(builder, 1)) return;
             builder->buffer[builder->pos++] = c;
@@ -490,25 +545,78 @@ void json_builder_object_key_string(json_builder_t *builder, const char *key, co
     }
 }
 
-void json_builder_object_key_number(json_builder_t *builder, const char *key, long long value) {
+/**
+ * \brief           Append `"<key>":<number>` to the builder with truncation guard
+ * \param[in,out]   builder: Builder under construction
+ * \param[in]       key: Object key, must not be `NULL`
+ * \param[in]       value: Number value
+ */
+void
+json_builder_object_key_number(json_builder_t *builder, const char *key, long long value) {
+    int32_t written = 0;
+    size_t space = 0;
+    if (builder == NULL || key == NULL) {
+        return;
+    }
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 128)) {
-        builder->pos += snprintf(&builder->buffer[builder->pos], 128, "\"%s\":%lld", key, value);
+    if (!json_builder_ensure_space(builder, 128)) {
+        return;
+    }
+    space = sizeof(builder->buffer) - builder->pos;
+    written = snprintf(&builder->buffer[builder->pos], space, "\"%s\":%lld", key, value);
+    if (written > 0) {
+        size_t avail = space - 1;
+        builder->pos += ((size_t)written > avail) ? avail : (size_t)written;
     }
 }
 
-void json_builder_object_key_bool(json_builder_t *builder, const char *key, bool value) {
+/**
+ * \brief           Append `"<key>":<bool>` to the builder with truncation guard
+ * \param[in,out]   builder: Builder under construction
+ * \param[in]       key: Object key, must not be `NULL`
+ * \param[in]       value: Boolean value
+ */
+void
+json_builder_object_key_bool(json_builder_t *builder, const char *key, bool value) {
+    int32_t written = 0;
+    size_t space = 0;
+    if (builder == NULL || key == NULL) {
+        return;
+    }
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 128)) {
-        builder->pos += snprintf(&builder->buffer[builder->pos], 128, "\"%s\":%s", 
-                                 key, value ? "true" : "false");
+    if (!json_builder_ensure_space(builder, 128)) {
+        return;
+    }
+    space = sizeof(builder->buffer) - builder->pos;
+    written = snprintf(&builder->buffer[builder->pos], space, "\"%s\":%s",
+                       key, value ? "true" : "false");
+    if (written > 0) {
+        size_t avail = space - 1;
+        builder->pos += ((size_t)written > avail) ? avail : (size_t)written;
     }
 }
 
-void json_builder_object_start_nested(json_builder_t *builder, const char *key) {
+/**
+ * \brief           Start a nested object value `"<key>":{`
+ * \param[in,out]   builder: Builder under construction
+ * \param[in]       key: Object key, must not be `NULL`
+ */
+void
+json_builder_object_start_nested(json_builder_t *builder, const char *key) {
+    int32_t written = 0;
+    size_t space = 0;
+    if (builder == NULL || key == NULL) {
+        return;
+    }
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 128)) {
-        builder->pos += snprintf(&builder->buffer[builder->pos], 128, "\"%s\":{", key);
+    if (!json_builder_ensure_space(builder, 128)) {
+        return;
+    }
+    space = sizeof(builder->buffer) - builder->pos;
+    written = snprintf(&builder->buffer[builder->pos], space, "\"%s\":{", key);
+    if (written > 0) {
+        size_t avail = space - 1;
+        builder->pos += ((size_t)written > avail) ? avail : (size_t)written;
     }
 }
 
@@ -821,9 +929,11 @@ bool json_parse_event(const char *json_str, event_t *event) {
         free(id); free(pubkey); free(content); free(sig);
         return false;
     }
-    strcpy(event->id, id);
-    strcpy(event->pubkey, pubkey);
-    strcpy(event->sig, sig);
+    /* Lengths already validated above (`64/64/128`), use bounded copy so a
+     * future caller bypass cannot overflow the fixed buffers. */
+    snprintf(event->id, sizeof(event->id), "%s", id);
+    snprintf(event->pubkey, sizeof(event->pubkey), "%s", pubkey);
+    snprintf(event->sig, sizeof(event->sig), "%s", sig);
     event->created_at = (time_t) created_at;
     event->kind = (int) kind;
     event->content = content;
@@ -865,15 +975,15 @@ size_t json_serialized_event_size(const event_t *event) {
     int written;
 
     size_t n = 1; /* '{' */
-    n += 5 + 1 + escaped_length(event->id) + 1;           /* "id": */
-    n += 1 + 9 + 1 + escaped_length(event->pubkey) + 1;   /* "pubkey": */
+    n += 1 + 5 + 2 + escaped_length(event->id);           /* ,"id":"..." */
+    n += 1 + 9 + 2 + escaped_length(event->pubkey);       /* ,"pubkey":"..." */
     written = snprintf(num, sizeof(num), "%lld", (long long) event->created_at);
     n += 1 + 13 + (size_t) (written > 0 ? written : 20);  /* "created_at": */
     written = snprintf(num, sizeof(num), "%d", event->kind);
     n += 1 + 7 + (size_t) (written > 0 ? written : 11);   /* "kind": */
-    n += 1 + 7 + (event->tags_json ? event->tags_json_len : 4); /* "tags": or null */
-    n += 1 + 10 + 1 + escaped_length(event->content ? event->content : "") + 1;
-    n += 1 + 6 + 1 + escaped_length(event->sig) + 1;      /* "sig": */
+    n += 1 + 7 + (event->tags_json ? event->tags_json_len : 4) - 1; /* "tags": or null; no separate comma after previous numeric field */
+    n += 1 + 10 + 2 + escaped_length(event->content ? event->content : "");
+    n += 1 + 6 + 2 + escaped_length(event->sig);          /* ,"sig":"..." */
     n += 1; /* '}' */
     return n;
 }

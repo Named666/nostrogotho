@@ -1,4 +1,4 @@
-# nostrogotho
+﻿# nostrogotho
 
 `nostrogotho` is a C99 Nostr relay with SQLite persistence. It uses bundled
 Mongoose for HTTP/WebSocket transport and bundled libsecp256k1 for Schnorr
@@ -31,19 +31,19 @@ nostrogotho/
 │   ├── mongoose/            WebSocket library
 │   └── secp256k1/           Schnorr signature library
 └── src/nips/                NIP protocol plugins
-    ├── nip01.c/h            Basic Protocol Flow
-    ├── nip09.c/h            Event Deletion Request
-    ├── nip11.c/h            Relay Information Document
-    ├── nip13.c/h            Proof of Work
-    ├── nip17.c/h            Private Direct Messages
-    ├── nip26.c/h            Delegated Event Signing
-    ├── nip40.c/h            Expiration Timestamp
-    ├── nip42.c/h            Client Authentication
-    ├── nip45.c/h            Event Counts
-    ├── nip62.c/h            Request to Vanish
-    ├── nip67.c/h            EOSE Completeness Hint
-    ├── nip_event.c/h        Shared event-tag inspection
-    └── nip_plugin.c/h       Plugin registration architecture
+    ├── nip01.c            Basic Protocol Flow
+    ├── nip09.c            Event Deletion Request
+    ├── nip11.c            Relay Information Document
+    ├── nip13.c            Proof of Work
+    ├── nip17.c            Private Direct Messages
+    ├── nip26.c            Delegated Event Signing
+    ├── nip40.c            Expiration Timestamp
+    ├── nip42.c            Client Authentication
+    ├── nip45.c            Event Counts
+    ├── nip62.c            Request to Vanish
+    ├── nip67.c            EOSE Completeness Hint
+    ├── nip_template.c        New-NIP scaffold (excluded from build)
+    └── nip_capability.c/h       Capability registry + composition
 ```
 
 ## Quick Build & Run (Windows PowerShell)

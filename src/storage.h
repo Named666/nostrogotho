@@ -16,6 +16,39 @@
  * ============================================================================ */
 
 /* ============================================================================
+ * Result Types
+ * ============================================================================ */
+
+/* storage_result_t - Typed result for storage operations
+ * 
+ * Distinguishes between different failure modes so callers can handle
+ * each appropriately. In particular, duplicate vs failure must be
+ * distinguishable because the current helper interprets any false result
+ * as a duplicate, which is unsafe if the storage backend can fail for
+ * another reason.
+ */
+typedef enum {
+    STORAGE_OK = 0,           /* Operation succeeded */
+    STORAGE_DUPLICATE,        /* Event already exists (unique constraint) */
+    STORAGE_NOT_FOUND,        /* Event not found */
+    STORAGE_ERROR,            /* Database/storage error */
+    STORAGE_INVALID_ARGUMENT  /* Invalid input parameters */
+} storage_result_t;
+
+/* storage_insert_result_t - Result of insert operation with detail */
+typedef struct {
+    storage_result_t result;
+    char error_message[256];
+} storage_insert_result_t;
+
+/* storage_delete_result_t - Result of delete operation with count */
+typedef struct {
+    storage_result_t result;
+    int deleted_count;
+    char error_message[256];
+} storage_delete_result_t;
+
+/* ============================================================================
  * Callback Types
  * ============================================================================ */
 
@@ -27,10 +60,11 @@
  * Args: json_event - JSON-formatted event string (EVENT or COUNT response)
  *                    Format: ["EVENT", subscription_id, event] or
  *                            ["COUNT", subscription_id, {count: N}]
+ *       userdata - opaque context passed to send_records
  * 
  * Note: json_event is valid only for the duration of the callback
  */
-typedef void (*send_records_callback_t)(const char *json_event);
+typedef void (*send_records_callback_t)(const char *json_event, void *userdata);
 
 /* Optional column-level narrowing for generic event walks. Tag interpretation
  * is deliberately left to the caller's synchronous predicate callback. */
@@ -114,12 +148,14 @@ typedef struct {
     
     /* insert_record - Store a new event
      * Args: ev - event to store (must be valid, call check_event() first)
-     * Returns: true if inserted, false if duplicate or error
+     *        indexed_tags - optional tag index entries
+     *        indexed_tags_count - number of tag index entries
+     * Returns: storage_insert_result_t with result and error details
      * Note: May enforce uniqueness on event ID
      */
-    bool (*insert_record)(const event_t *ev,
-                          const storage_tag_match_t *indexed_tags,
-                          size_t indexed_tags_count);
+    storage_insert_result_t (*insert_record)(const event_t *ev,
+                                             const storage_tag_match_t *indexed_tags,
+                                             size_t indexed_tags_count);
     
     /* ====================================================================
      * Event Deletion Operations
@@ -127,20 +163,20 @@ typedef struct {
     
     /* delete_record_by_id_and_pubkey - Delete a specific event (NIP-09)
      * Args: id - event ID, pubkey - author pubkey
-     * Returns: number of records deleted (0 or 1), or -1 on error
+     * Returns: storage_delete_result_t with result and deleted count
      * Used for NIP-09 deletion events
      */
-    int (*delete_record_by_id_and_pubkey)(const char *id, const char *pubkey);
+    storage_delete_result_t (*delete_record_by_id_and_pubkey)(const char *id, const char *pubkey);
     
     /* delete_record_by_kind_and_pubkey - Delete replaceable events (NIP-09, NIP-16)
      * Args:
      *   kind - event kind (0, 3, or 10000-20000 range)
      *   pubkey - author pubkey
      *   created_at - delete events with created_at < this timestamp
-     * Returns: number of records deleted, or -1 on error
+     * Returns: storage_delete_result_t with result and deleted count
      * Used for replaceable events where newer overwrites older
      */
-    int (*delete_record_by_kind_and_pubkey)(int kind, const char *pubkey, time_t created_at);
+    storage_delete_result_t (*delete_record_by_kind_and_pubkey)(int kind, const char *pubkey, time_t created_at);
     
     /* delete_matching - Delete events narrowed by generic columns and
      * selected by a caller-supplied synchronous predicate. The callback may
@@ -163,38 +199,40 @@ typedef struct {
      * Event Query and Streaming
      * ==================================================================== */
     
-    /* send_records - Query and stream events matching filters (NIP-01, NIP-67)
-     * 
-     * Searches database for events matching filter criteria and calls
-     * the sender callback for each matching event. Also supports COUNT queries.
-     * 
-     * Args:
-     *   sender - callback function called for each result
-     *   sub - subscription ID (included in response)
-     *   filters - array of filter structures
-     *   filters_count - number of filters in array
-     *   do_count - if true, count matching events instead of streaming.
-     *              When counting, the sender is NOT invoked; the total is
-     *              returned via out_count (NIP-45) and the caller builds the
-     *              COUNT response.
-     *   has_more - if not NULL, set to true if more events exist beyond limit
-     *   out_count - when do_count is true, receives the aggregated count.
-     *               May be NULL when do_count is false.
-     * 
-     * Returns: true on success, false on database error
-     * 
-     * Behavior:
-     *   - Multiple filters are OR'd (send if ANY filter matches)
-     *   - Within a filter, criteria are AND'd
-     *   - If do_count is true, reports the count via out_count instead of
-     *     emitting a COUNT response (NIP-45)
-     *   - Fetches limit+1 events to determine has_more flag (NIP-67)
-     */
+/* send_records - Query and stream events matching filters (NIP-01, NIP-67)
+ * 
+ * Searches database for events matching filter criteria and calls
+ * the sender callback for each matching event. Also supports COUNT queries.
+ * 
+ * Args:
+ *   sender - callback function called for each result
+ *   sub - subscription ID (included in response)
+ *   filters - array of filter structures
+ *   filters_count - number of filters in array
+ *   do_count - if true, count matching events instead of streaming.
+ *              When counting, the sender is NOT invoked; the total is
+ *              returned via out_count (NIP-45) and the caller builds the
+ *              COUNT response.
+ *   has_more - if not NULL, set to true if more events exist beyond limit
+ *   out_count - when do_count is true, receives the aggregated count.
+ *               May be NULL when do_count is false.
+ *   userdata - opaque context passed to sender callback
+ * 
+ * Returns: true on success, false on database error
+ * 
+ * Behavior:
+ *   - Multiple filters are OR'd (send if ANY filter matches)
+ *   - Within a filter, criteria are AND'd
+ *   - If do_count is true, reports the count via out_count instead of
+ *     emitting a COUNT response (NIP-45)
+ *   - Fetches limit+1 events to determine has_more flag (NIP-67)
+ */
     bool (*send_records)(send_records_callback_t sender, const char *sub,
-                        const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more, int *out_count,
-                        const storage_tag_match_t *indexed_tags,
-                        size_t indexed_tags_count);
+                         const filter_t *filters, size_t filters_count,
+                         bool do_count, bool *has_more, int *out_count,
+                         const storage_tag_match_t *indexed_tags,
+                         size_t indexed_tags_count,
+                         void *userdata);
     /* Return a module-owned array of generic tag index keys extracted from an
      * event, for use in the next insert_record call. Caller releases it with
      * free_tag_matches(). Storage stores only the supplied opaque pairs. */

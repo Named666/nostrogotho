@@ -1,208 +1,228 @@
 /* ============================================================================
- * NIP-XX Template — copy this file to create a new NIP plugin.
+ * NIP-XX Template — copy this file to create a new NIP.
  *
- * A plugin is a self-contained module in src/nips/. It links itself into the
- * relay purely by being compiled: the build tool globs src/nips/*.c, and the
- * __attribute__((constructor)) below registers the plugin at startup.
+ * A NIP is a single self-contained file in src/nips/. It links itself into
+ * the relay purely by being compiled: the build globs src/nips/*.c (except
+ * nip_template.c), and the constructor below registers the NIP at startup
+ * in monolithic builds and on every hot-reload activation in -hr builds.
+ * No header, no registration list: logic + capability table + constructor
+ * all live here.
  *
  * To create a new NIP:
- *   1. Copy this file to src/nips/nipXX.c (and nipXX.h if you need to export
- *      symbols to other modules).
- *   2. Rename every "nipXX_" / "nip_xx" symbol below.
- *   3. Fill in the hooks you need; delete the ones you don't (NULL = unused).
- *   4. Rebuild with .\nob.exe — nothing else to wire up.
+ *   1. Copy this file to src/nips/nipXX.c.
+ *   2. Rename every "nipxx_" symbol below.
+ *   3. Fill in ONLY the hooks you need; delete the rest.
+ *   4. Rebuild: `nob` (monolithic) or save while `nob [win|linux] -hr`
+ *      watches — the new behavior swaps in without dropping sockets.
  *
- * The plugin interface (nip_plugin_t) is documented in nip_plugin.h.
+ * Rules (enforced by the architecture, not just convention):
+ *   - NIP code NEVER sees Mongoose (`struct mg_connection`) or SQLite.
+ *     Connections are opaque `connection_id_t`; storage goes through
+ *     `storage_context_t`; replies are built with protocol_serialize_* and
+ *     sent with relay_send_json() (host) / nhr_module_send_json() (module).
+ *   - No NIP sends OK/EOSE/CLOSED itself for the normal EVENT/REQ flow.
+ *     Return a policy decision; the relay core owns framing + transport.
+ *   - State that must survive `nob -hr` reloads lives in host-owned
+ *     connection_session_t (challenge/pubkey) or is re-derivable in
+ *     lifecycle init. Module statics die with the old .so/.dll — never
+ *     rely on them across a reload. Empty migration state is valid.
+ *   - Composition is deterministic, never registration-order dependent:
+ *       publication policy : ALL must permit (AND)
+ *       delivery policy    : ANY may veto
+ *       kind handlers      : disjoint kinds; first ACCEPT wins, all
+ *                            rejections are collected for the OK reason
+ *       maintenance        : ALL run every interval tick
+ *       EOSE/COUNT/metadata: FIRST non-NULL wins (explicit priority)
+ *
+ * The capability interface is documented in nip_capability.h.
  * ============================================================================
  */
 
-#include "nip_plugin.h"
-#include "nip01.h"
-#include "nip_event.h"
+#include "nip_capability.h"
+#include "model/event_util.h"
+#include "protocol/protocol.h"
+#include "relay/connection_session.h"
+#include "relay/relay.h"            /* host builds: relay_send_json() */
+#ifdef NHR_BUILD_MODULE
+#include "nhr_module.h"             /* module builds: nhr_module_send_json() */
+#endif
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
- * Per-plugin state
+ * Per-NIP state
  *
- * Instead of file-scope static globals, keep state in a struct and point
- * plugin.ctx at it. Every hook receives ctx back, so the plugin is fully
- * re-entrant and self-contained.
+ * Prefer NO state. When you need config, keep a small static ctx shared by
+ * all caps of this NIP (module statics are per-generation: they are fresh
+ * after every reload, which is exactly what you want for re-derivable
+ * state). Heap-allocating per register call leaks across reloads because
+ * the registry never frees ctx (several caps share one ctx); if you must
+ * heap-allocate, free it once in lifecycle shutdown guarded against
+ * repeated calls, or in module shutdown.
  * ============================================================================
  */
 
 typedef struct {
-    const char *service_url;   /* captured from relay_config_t in init() */
-    int some_counter;          /* example state */
-} nip_xx_state_t;
+    char service_url[256];          /* captured from relay_config_t in init() */
+} nipxx_ctx_t;
 
-static nip_xx_state_t nip_xx_state;
+static nipxx_ctx_t nipxx_ctx;
+
+/* Send a JSON frame without touching transport types. */
+static void nipxx_send_json(connection_id_t id, const char *json) {
+    if (!json) return;
+#ifdef NHR_BUILD_MODULE
+    nhr_module_send_json(id, json, strlen(json));
+#else
+    relay_send_json(id, json);
+#endif
+}
 
 /* ============================================================================
- * Kind listener
- *
- * Declare the event kinds this plugin handles in plugin.kinds[] and provide
- * on_event. The NIP-01 dispatcher calls on_event for every event whose kind
- * falls inside a declared range. The first listener to accept wins; if every
- * matching listener rejects, the event is rejected.
- *
- * Use the ergonomic result constructors instead of hand-rolling the struct:
- *   nip_plugin_accept()                          -> accepted + broadcast
- *   nip_plugin_reject("invalid: ...")            -> rejected with reason
- *   nip_plugin_store_and_broadcast(storage, ev)  -> insert + accept
- *   nip_plugin_store_only(storage, ev)           -> insert, no broadcast
+ * Capability hooks — implement only what your NIP needs, delete the rest.
  * ============================================================================
  */
 
-static nip01_process_result_t nip_xx_on_event(
-    struct mg_connection *connection,
-    const event_t *event,
-    storage_context_t *storage,
-    const char *relay_url) {
+/* Called once per process (monolithic) or per module generation (-hr init /
+ * post_reload) before any traffic. */
+static void nipxx_lifecycle_init(const relay_config_t *config, void *ctx) {
+    nipxx_ctx_t *c = (nipxx_ctx_t *)ctx;
+    if (c && config && config->service_url)
+        snprintf(c->service_url, sizeof(c->service_url), "%s", config->service_url);
+}
 
-    (void) connection;
-    (void) relay_url;
+static void nipxx_lifecycle_shutdown(void *ctx) {
+    (void)ctx;
+    /* Free heap ctx here ONLY if you heap-allocated it (guard: runs once
+     * per cap sharing the ctx — prefer the static ctx above instead). */
+}
 
-    /* Example: reject events whose content is empty. */
-    if (!event->content || !event->content[0]) {
-        return nip_plugin_reject("invalid: empty content");
+/* Connection open/close (e.g. NIP-42 sends its AUTH challenge here). */
+static void nipxx_on_connect(connection_id_t id, void *ctx) {
+    (void)id; (void)ctx;
+}
+
+static void nipxx_on_disconnect(connection_id_t id, void *ctx) {
+    (void)id; (void)ctx;
+}
+
+/* Intercept a parsed protocol message. Return true ONLY if this NIP fully
+ * consumed it (custom verb, AUTH response). Otherwise return false and the
+ * relay runs default REQ/COUNT/CLOSE/EVENT dispatch. */
+static bool nipxx_on_message(connection_id_t id, const protocol_message_t *msg, void *ctx) {
+    (void)id; (void)msg; (void)ctx;
+    return false;
+}
+
+/* Publication policy: return false + fill `reason` to reject an EVENT
+ * before kind dispatch (e.g. expiry, auth-required). ALL policies must
+ * permit for the event to proceed. */
+static bool nipxx_accept_publish(connection_id_t id, const event_t *event,
+                                 char *reason, size_t reason_size, void *ctx) {
+    (void)id; (void)event; (void)reason; (void)reason_size; (void)ctx;
+    return true;
+}
+
+/* Kind handler: claim disjoint kinds in handles_kind; process_event performs
+ * any storage work through storage_context_t and returns a policy decision
+ * (accepted / should_broadcast), never transport output. */
+static bool nipxx_handles_kind(int kind, void *ctx) {
+    (void)ctx;
+    return kind == 12345;           /* replace with your NIP's kind(s) */
+}
+
+static nip01_process_result_t nipxx_process_event(connection_id_t id, const event_t *event,
+                                                  storage_context_t *storage,
+                                                  const char *relay_url, void *ctx) {
+    (void)id; (void)relay_url; (void)ctx;
+    nip01_process_result_t r = {0};
+    storage_insert_result_t sr = storage->insert_record(event, NULL, 0);
+    if (sr.result == STORAGE_OK || sr.result == STORAGE_DUPLICATE) {
+        r.accepted = true;
+        r.should_store = true;
+        r.should_broadcast = true;
+    } else {
+        snprintf(r.response_msg, sizeof(r.response_msg), "error: %s", sr.error_message);
     }
-
-    /* Example: store and broadcast. */
-    return nip_plugin_store_and_broadcast(storage, event);
+    return r;
 }
 
-/* ============================================================================
- * Lifecycle hooks (optional — delete the ones you don't need)
- * ============================================================================
- */
-
-/* Called once during server_configure() with the relay's runtime config. */
-static void nip_xx_init(const relay_config_t *config, void *ctx) {
-    nip_xx_state_t *state = (nip_xx_state_t *) ctx;
-    state->service_url = config->service_url;
-}
-
-/* Connection opened / closed (e.g. NIP-42 sends its AUTH challenge here). */
-static void nip_xx_on_connect(struct mg_connection *connection, void *ctx) {
-    (void) connection;
-    (void) ctx;
-}
-
-static void nip_xx_on_disconnect(struct mg_connection *connection, void *ctx) {
-    (void) connection;
-    (void) ctx;
-}
-
-/* Return true if the plugin consumed the message (e.g. NIP-42 "AUTH"). */
-static bool nip_xx_on_message(struct mg_connection *connection,
-                              json_value_t *values, size_t count, void *ctx) {
-    (void) connection;
-    (void) values;
-    (void) count;
-    (void) ctx;
-    return false;
-}
-
-/* Publish policy. Return false and fill `reason` to reject an EVENT before
- * kind dispatch (e.g. NIP-40 expiry, NIP-42 restricted tags). */
-static bool nip_xx_accept_publish(struct mg_connection *connection,
-                                  const event_t *event,
-                                  char *reason, size_t reason_size, void *ctx) {
-    (void) connection;
-    (void) event;
-    (void) reason;
-    (void) reason_size;
-    (void) ctx;
+/* Delivery policy: return false to suppress an event for this connection on
+ * BOTH stored queries and live broadcasts. ANY veto wins. */
+static bool nipxx_can_deliver(const event_t *event, connection_id_t id, void *ctx) {
+    (void)event; (void)id; (void)ctx;
     return true;
 }
 
-/* Delivery policy. Return false to suppress an event for this connection on
- * both stored queries and broadcasts (NIP-40, NIP-17). */
-static bool nip_xx_can_deliver(const event_t *event,
-                               struct mg_connection *connection, void *ctx) {
-    (void) event;
-    (void) connection;
-    (void) ctx;
-    return true;
+/* Periodic maintenance, driven by the smallest registered interval_ms
+ * (e.g. expired-event GC). Every registered timer runs each tick. */
+static void nipxx_timer(storage_context_t *storage, void *ctx) {
+    (void)storage; (void)ctx;
 }
 
-/* Called when a REQ finishes. May emit its own protocol traffic and returns
- * true to make the EOSE carry the "auth" completeness hint (NIP-17/67). */
-static bool nip_xx_eose_auth_hint(struct mg_connection *connection,
-                                  const filter_t *filters, size_t count,
-                                  void *ctx) {
-    (void) connection;
-    (void) filters;
-    (void) count;
-    (void) ctx;
-    return false;
-}
-
-/* Build the ["EOSE", ...] / ["COUNT", ...] response (malloc'd, caller frees).
- * The first plugin providing the hook wins; otherwise the server falls back
- * to a bare protocol-default response. */
-static char *nip_xx_build_eose(const char *sub, bool has_more, bool auth_hint,
-                               void *ctx) {
-    (void) sub;
-    (void) has_more;
-    (void) auth_hint;
-    (void) ctx;
-    return NULL;
-}
-
-static char *nip_xx_build_count(const char *sub, unsigned long count, void *ctx) {
-    (void) sub;
-    (void) count;
-    (void) ctx;
-    return NULL;
-}
-
-/* Periodic maintenance, driven every timer_interval_ms inside the event
- * loop (e.g. NIP-40 expired-event GC). */
-static void nip_xx_timer(storage_context_t *storage, void *ctx) {
-    (void) storage;
-    (void) ctx;
-}
-
-/* NIP-11 relay information document (HTTP, Accept: application/nostr+json). */
-static const char *nip_xx_info_document(void *ctx) {
-    (void) ctx;
+/* NIP-11 relay information document fragment (HTTP). First non-NULL wins. */
+static const char *nipxx_info_document(void *ctx) {
+    (void)ctx;
     return NULL;
 }
 
 /* ============================================================================
- * Plugin registration
- *
- * This is the ONLY registration call a plugin needs. Declaring kinds[] and
- * on_event wires the plugin into the NIP-01 event dispatcher; every other
- * hook is optional. The constructor runs before main() on MinGW/GCC.
+ * Capability descriptors — one per capability type you implement.
+ * `ctx` points at the shared static above: no alloc, no leak, no
+ * cross-reload dangling (registry deep-copies the descriptor; the static
+ * dies with its own module generation).
  * ============================================================================
  */
 
-static nip_plugin_t nip_xx_plugin = {
-    .name = "nipXX",
-    .ctx = &nip_xx_state,
-    .kinds = {
-        NIP_PLUGIN_KIND(1),        /* listen for a single kind */
-        /* { 10000, 19999 },       /* or a range of kinds */
+static nip_capability_t nipxx_caps[] = {
+    {
+        .name = "nipxx-lifecycle", .type = NIP_CAP_LIFECYCLE, .ctx = &nipxx_ctx,
+        .caps.lifecycle = { .init = nipxx_lifecycle_init, .shutdown = nipxx_lifecycle_shutdown },
     },
-    .kinds_count = 1,
-    .on_event = nip_xx_on_event,
-    .init = nip_xx_init,
-    .on_connect = nip_xx_on_connect,
-    .on_disconnect = nip_xx_on_disconnect,
-    .on_message = nip_xx_on_message,
-    .accept_publish = nip_xx_accept_publish,
-    .can_deliver = nip_xx_can_deliver,
-    .eose_auth_hint = nip_xx_eose_auth_hint,
-    .build_eose = nip_xx_build_eose,
-    .build_count = nip_xx_build_count,
-    .timer = nip_xx_timer,
-    .timer_interval_ms = 0,        /* 0 = no periodic timer */
-    .info_document = nip_xx_info_document,
+    {
+        .name = "nipxx-connection", .type = NIP_CAP_CONNECTION, .ctx = &nipxx_ctx,
+        .caps.connection = { .on_connect = nipxx_on_connect, .on_disconnect = nipxx_on_disconnect },
+    },
+    /* Uncomment the capabilities your NIP actually needs:
+    {
+        .name = "nipxx-message", .type = NIP_CAP_MESSAGE_INTERCEPT, .ctx = &nipxx_ctx,
+        .caps.message_intercept = { .on_message = nipxx_on_message },
+    },
+    {
+        .name = "nipxx-publication", .type = NIP_CAP_PUBLICATION_POLICY, .ctx = &nipxx_ctx,
+        .caps.publication_policy = { .accept_publish = nipxx_accept_publish },
+    },
+    {
+        .name = "nipxx-kind", .type = NIP_CAP_KIND_HANDLER, .ctx = &nipxx_ctx,
+        .caps.kind_handler = { .handles_kind = nipxx_handles_kind, .process_event = nipxx_process_event },
+    },
+    {
+        .name = "nipxx-delivery", .type = NIP_CAP_DELIVERY_POLICY, .ctx = &nipxx_ctx,
+        .caps.delivery_policy = { .can_deliver = nipxx_can_deliver },
+    },
+    {
+        .name = "nipxx-maintenance", .type = NIP_CAP_MAINTENANCE, .ctx = &nipxx_ctx,
+        .caps.maintenance = { .timer = nipxx_timer, .interval_ms = 60 * 1000 },
+    },
+    {
+        .name = "nipxx-metadata", .type = NIP_CAP_METADATA, .ctx = &nipxx_ctx,
+        .caps.metadata = { .info_document = nipxx_info_document },
+    },
+     */
 };
 
-__attribute__((constructor)) static void nip_xx_register_at_startup(void) {
-    nip_plugin_register(&nip_xx_plugin);
+/* Trim the table above to what you implement, then register it. This is the
+ * ONLY registration call a NIP needs. */
+void nipxx_register(nip_registry_t *registry) {
+    if (!registry) return;
+    for (size_t i = 0; i < sizeof(nipxx_caps) / sizeof(nipxx_caps[0]); i++)
+        nip_registry_register(registry, &nipxx_caps[i]);
+}
+
+/* Compiling this file enables the NIP; deleting it removes the capability
+ * without touching protocol/transport code — in both monolithic and -hr
+ * builds. The constructor runs before main() on GCC/MinGW. */
+__attribute__((constructor)) static void nipxx_register_provider(void) {
+    nip_capability_add_provider(nipxx_register);
 }

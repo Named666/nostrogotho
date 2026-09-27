@@ -1,36 +1,59 @@
-#include <mongoose.h>
+/* ============================================================================
+ * NIP-09: Event Deletion (kind 5)
+ *
+ * Single-file NIP: deletion authorization + target handling + capability
+ * table + self-registration. Compiling this file enables the NIP; deleting
+ * it removes it. No header, no registration list, no build edits.
+ * ============================================================================ */
+
+#include "nip_capability.h"
+#include "model/event_util.h"
+#include "storage.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "nip09.h"
-#include "nip_event.h"
-#include "nip01.h"
-#include "nip_plugin.h"
 
-/* ---------------------------------------------------------------------------
- * NIP-09 — Event Deletion Request
- *
- * A kind 5 event references targets via "e" tags (specific events) and "a"
- * tags (replaceable/addressable events, "<kind>:<pubkey>:<d-identifier>").
- * The relay deletes a referenced event only when it has knowledge of it and
- * the referenced event shares the deletion request's author pubkey.
- *
- * Optional "k" tags list the kinds being deleted; when present, a target is
- * only deleted if its kind is among them (requested-vs-actual kind check).
- * ------------------------------------------------------------------------- */
+/* ============================================================================
+ * NIP-09 Capability Implementation
+ * 
+ * Event deletion using the new transport-agnostic capability interface.
+ * ============================================================================ */
 
-/* Return true if the deletion event has no "k" tags, or if `kind` is listed
- * among them. Lets the relay validate requested-vs-actual kind. */
+/* Forward declarations */
+static bool nip09_kind_handler_handles_kind(int kind, void *ctx);
+static nip01_process_result_t nip09_kind_handler_process_event(
+    connection_id_t connection_id, const event_t *event,
+    storage_context_t *storage, const char *relay_url, void *ctx);
+
+/* Single capability table. Hooks ignore ctx, so .ctx is NULL (no
+ * allocation, nothing to leak across reloads). */
+static nip_capability_t nip09_caps[] = {
+    {
+        .name = "nip09-kind-handler",
+        .type = NIP_CAP_KIND_HANDLER,
+        .ctx = NULL,
+        .caps.kind_handler = {
+            .handles_kind = nip09_kind_handler_handles_kind,
+            .process_event = nip09_kind_handler_process_event,
+        },
+        .next = NULL,
+    },
+};
+
+/* ============================================================================
+ * Helper Functions (adapted from nip09.c)
+ * ============================================================================ */
+
 static bool kind_is_requested(const event_t *event, int kind) {
     struct mg_str key, tag, tags = mg_str(event->tags_json);
     size_t offset = 0;
     bool has_k = false;
 
     while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
+        char *name = event_tag_element(tag.buf, 0);
         if (name && strcmp(name, "k") == 0) {
             has_k = true;
-            char *value = nip_tag_element(tag, 1);
+            char *value = event_tag_element(tag.buf, 1);
             if (value) {
                 char *end = NULL;
                 long parsed = strtol(value, &end, 10);
@@ -47,8 +70,6 @@ static bool kind_is_requested(const event_t *event, int kind) {
     return !has_k;
 }
 
-/* Parse an "a" tag value of the form "<kind>:<pubkey>:<d-identifier>".
- * Returns true on success. `d_identifier` points into `a` (may be empty). */
 static bool parse_a_tag(const char *a, int *kind, char *pubkey,
                         size_t pubkey_size, const char **d_identifier) {
     const char *first = strchr(a, ':');
@@ -63,7 +84,6 @@ static bool parse_a_tag(const char *a, int *kind, char *pubkey,
 
     second = strchr(first + 1, ':');
     if (!second) {
-        /* No d-identifier — treat as a replaceable event with empty id. */
         len = strlen(first + 1);
         if (len == 0 || len >= pubkey_size) return false;
         memcpy(pubkey, first + 1, len);
@@ -94,9 +114,9 @@ static bool nip09_event_has_exact_tag_value(const event_t *event, void *userdata
     struct mg_str key, tag, tags = mg_str(event->tags_json ? event->tags_json : "[]");
     size_t offset = 0;
     while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
+        char *name = event_tag_element(tag.buf, 0);
         if (name && strcmp(name, match->tag_name) == 0) {
-            char *value = nip_tag_element(tag, 1);
+            char *value = event_tag_element(tag.buf, 1);
             bool result = strcmp(value ? value : "", match->tag_value) == 0;
             free(value);
             free(name);
@@ -128,34 +148,25 @@ static bool nip09_delete_matching(storage_context_t *storage,
     return true;
 }
 
-/* Delete a replaceable/addressable event referenced by an "a" tag.
- * Returns false only on a storage error; targets the relay has no knowledge
- * of, or that fail author/kind validation, are skipped without failing. */
 static bool delete_a_target(const event_t *event, storage_context_t *storage,
                             const char *a) {
     int kind;
     char pubkey[MAX_PUBKEY_SIZE + 1];
     const char *d_identifier;
-    int result;
 
     if (!parse_a_tag(a, &kind, pubkey, sizeof(pubkey), &d_identifier)) {
-        return true;  /* Malformed "a" tag — nothing to act on. */
+        return true;
     }
 
-    /* Author-scoped: the "a" tag pubkey must match the deletion author,
-     * either directly or because the deletion author delegated to it
-     * (NIP-26: the delegator may delete delegatee events). */
     if (strcmp(pubkey, event->pubkey) != 0) return true;
 
-    /* Validate requested kind against any "k" tags. */
     if (!kind_is_requested(event, kind)) return true;
 
     if (*d_identifier == '\0') {
-        /* Replaceable event (e.g. kind 0, 3, 10000-20000). */
-        result = storage->delete_record_by_kind_and_pubkey(kind, pubkey,
+        storage_delete_result_t result = storage->delete_record_by_kind_and_pubkey(kind, pubkey,
                                                            event->created_at);
+        return result.result == STORAGE_OK && result.deleted_count >= 0;
     } else {
-        /* Addressable event (kind 30000-40000) with a "d" identifier. */
         storage_event_scope_t scope = {0};
         nip09_tag_match_t match = {"d", d_identifier, true};
         size_t deleted;
@@ -169,32 +180,20 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
                                     nip09_event_has_exact_tag_value, &match,
                                     &deleted);
     }
-    return result >= 0;
 }
 
-/* Return true when `event` (the deletion author) is authorized to delete
- * `target`. Direct authorship matches, and per NIP-26 the delegator may
- * delete events published by their delegatee (target carries a delegation
- * tag naming the delegator). */
 static bool deletion_authorized(const event_t *event, const event_t *target) {
     if (strcmp(target->pubkey, event->pubkey) == 0) return true;
-    /* NIP-26: delegator can delete delegatee events. */
-    return nip_event_has_tag(target, "delegation", event->pubkey);
+    return event_has_tag(target, "delegation", event->pubkey);
 }
 
-/* Delete a specific event referenced by an "e" tag.
- * Returns false only on a storage error; targets the relay has no knowledge
- * of, or that fail author/kind validation, are skipped without failing. */
 static bool delete_e_target(const event_t *event, storage_context_t *storage,
                             const char *id) {
     event_t *target = storage->get_event_by_id(id);
     bool ok = true;
 
-    if (!target) return true;  /* No knowledge of this event — nothing to do. */
+    if (!target) return true;
 
-    /* Author-scoped: only delete if the deletion author matches the target's
-     * pubkey (directly or via NIP-26 delegation), and (when "k" tags are
-     * present) the target's kind is requested. */
     if (deletion_authorized(event, target) &&
         kind_is_requested(event, target->kind)) {
         if (target->kind == 1059) {
@@ -209,33 +208,32 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
                                       nip09_event_has_exact_tag_value, &match,
                                       &deleted) || deleted == 0) ok = false;
         } else {
-            int result = storage->delete_record_by_id_and_pubkey(id, event->pubkey);
-            if (result <= 0) ok = false;
+            storage_delete_result_t result = storage->delete_record_by_id_and_pubkey(id, event->pubkey);
+            if (result.result != STORAGE_OK || result.deleted_count <= 0) ok = false;
         }
     }
     event_free(target);
     return ok;
 }
 
-/* Apply the authorized targets in a NIP-09 deletion event. */
-bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
+static bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
     struct mg_str key, tag, tags = mg_str(event->tags_json);
     size_t offset = 0;
     bool failed = false;
 
     while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
+        char *name = event_tag_element(tag.buf, 0);
         if (!name) continue;
         if (strcmp(name, "e") == 0) {
             for (size_t index = 1;; index++) {
-                char *id = nip_tag_element(tag, index);
+                char *id = event_tag_element(tag.buf, index);
                 if (!id) break;
                 if (!delete_e_target(event, storage, id)) failed = true;
                 free(id);
             }
         } else if (strcmp(name, "a") == 0) {
             for (size_t index = 1;; index++) {
-                char *a = nip_tag_element(tag, index);
+                char *a = event_tag_element(tag.buf, index);
                 if (!a) break;
                 if (!delete_a_target(event, storage, a)) failed = true;
                 free(a);
@@ -246,24 +244,43 @@ bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
     return !failed;
 }
 
-/* Listener for kind 5 (Event Deletion) events. */
-static nip01_process_result_t nip09_listener(
-    struct mg_connection *connection,
-    const event_t *event,
-    storage_context_t *storage,
-    const char *relay_url) {
+/* ============================================================================
+ * Kind Handler Implementation
+ * ============================================================================ */
 
-    (void)connection;
+static bool nip09_kind_handler_handles_kind(int kind, void *ctx) {
+    (void)ctx;
+    return kind == 5;  /* NIP-09: Event Deletion (kind 5) */
+}
+
+static nip01_process_result_t nip09_kind_handler_process_event(
+    connection_id_t connection_id, const event_t *event,
+    storage_context_t *storage, const char *relay_url, void *ctx) {
+    (void)connection_id;
+    (void)ctx;
     (void)relay_url;
-
+    
+    nip01_process_result_t result = {0};
+    
     if (!storage) {
-        return nip_plugin_reject("error: storage unavailable");
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg), "error: storage unavailable");
+        return result;
     }
 
     bool deleted = nip09_delete_targets(event, storage);
     /* Deletion events are accepted but not broadcast (NIP-09). */
-    nip01_process_result_t result = nip_plugin_store_only(storage, event);
-    if (result.accepted && !deleted) {
+    storage_insert_result_t insert_result = storage->insert_record(event, NULL, 0);
+    result.accepted = true;
+    result.should_store = true;
+    result.should_broadcast = false;
+    if (insert_result.result == STORAGE_OK || insert_result.result == STORAGE_DUPLICATE) {
+        result.response_msg[0] = '\0';
+    } else {
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                 "deletion failed: %s", insert_result.error_message);
+    }
+    if (!deleted) {
         snprintf(result.response_msg, sizeof(result.response_msg),
                  "deletion failed");
     }
@@ -271,21 +288,17 @@ static nip01_process_result_t nip09_listener(
 }
 
 /* ============================================================================
- * Plugin registration
- *
- * NIP-09 listens for kind 5 (Event Deletion) events. Declaring the kind in
- * the plugin struct is the only wiring needed — nip_plugin_register() hands
- * it to the NIP-01 dispatcher.
+ * Registration
  * ============================================================================ */
 
-static nip_plugin_t nip09_plugin = {
-    .name = "nip09",
-    .kinds = { NIP_PLUGIN_KIND(5) },
-    .kinds_count = 1,
-    .on_event = nip09_listener,
-};
+void nip09_register(nip_registry_t *registry) {
+    if (!registry) return;
+    for (size_t i = 0; i < sizeof(nip09_caps) / sizeof(nip09_caps[0]); i++)
+        nip_registry_register(registry, &nip09_caps[i]);
+}
 
-/* Auto-register this NIP's plugin at program startup */
-__attribute__((constructor)) static void nip09_register_at_startup(void) {
-    nip_plugin_register(&nip09_plugin);
+/* Self-registration: compiling this file enables the NIP; deleting it
+ * removes the capability without touching protocol/transport code. */
+__attribute__((constructor)) static void nip09_register_provider(void) {
+    nip_capability_add_provider(nip09_register);
 }

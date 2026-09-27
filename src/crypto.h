@@ -156,6 +156,27 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
 bool check_event(const event_t *ev);
 bool check_event_core(const event_t *ev);
 
+/* check_event_id - Verify event ID matches computed hash
+ * 
+ * Verifies that the event's ID field matches the SHA256 hash of the
+ * serialized event data (NIP-01 format).
+ * 
+ * Args: ev - event to validate (must not be NULL)
+ * 
+ * Returns: true if ID matches, false otherwise
+ */
+bool check_event_id(const event_t *ev);
+
+/* check_signature - Verify Schnorr signature
+ * 
+ * Verifies the event's signature against its ID hash and public key.
+ * 
+ * Args: ev - event to validate (must not be NULL)
+ * 
+ * Returns: true if signature is valid, false otherwise
+ */
+bool check_signature(const event_t *ev);
+
 /* check_delegation - Verify a delegation tag (NIP-26)
  * 
  * Validates a delegation tag that allows one key to act on behalf of another.

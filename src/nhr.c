@@ -1,6 +1,7 @@
 #include "nhr.h"
 #include "nhr_loader.h"
 #include "crypto.h"
+#include "relay/connection_session.h"
 #include <mongoose.h>
 #include <stdlib.h>
 #include <time.h>
@@ -42,27 +43,34 @@ static bool NHR_CALL host_storage_get_event(void *userdata, const char *id,
     return true;
 }
 
-static bool NHR_CALL host_storage_insert(void *userdata, const event_t *event,
-                                         const storage_tag_match_t *tags,
-                                         size_t tags_count) {
+static storage_insert_result_t NHR_CALL host_storage_insert(void *userdata, const event_t *event,
+                                                            const storage_tag_match_t *tags,
+                                                            size_t tags_count) {
     Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    return runtime && runtime->storage && runtime->storage->insert_record
-        ? runtime->storage->insert_record(event, tags, tags_count) : false;
+    storage_insert_result_t result = {0};
+    result.result = STORAGE_ERROR;
+    snprintf(result.error_message, sizeof(result.error_message), "not implemented");
+    if (runtime && runtime->storage && runtime->storage->insert_record) {
+        return runtime->storage->insert_record(event, tags, tags_count);
+    }
+    return result;
 }
 
 static int NHR_CALL host_storage_delete_id(void *userdata, const char *id,
                                           const char *pubkey) {
     Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    return runtime && runtime->storage && runtime->storage->delete_record_by_id_and_pubkey
-        ? runtime->storage->delete_record_by_id_and_pubkey(id, pubkey) : -1;
+    if (!runtime || !runtime->storage || !runtime->storage->delete_record_by_id_and_pubkey) return -1;
+    storage_delete_result_t result = runtime->storage->delete_record_by_id_and_pubkey(id, pubkey);
+    return result.result == STORAGE_OK ? result.deleted_count : -1;
 }
 
 static int NHR_CALL host_storage_delete_kind(void *userdata, int kind,
                                             const char *pubkey,
                                             time_t created_at) {
     Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    return runtime && runtime->storage && runtime->storage->delete_record_by_kind_and_pubkey
-        ? runtime->storage->delete_record_by_kind_and_pubkey(kind, pubkey, created_at) : -1;
+    if (!runtime || !runtime->storage || !runtime->storage->delete_record_by_kind_and_pubkey) return -1;
+    storage_delete_result_t result = runtime->storage->delete_record_by_kind_and_pubkey(kind, pubkey, created_at);
+    return result.result == STORAGE_OK ? result.deleted_count : -1;
 }
 
 static bool NHR_CALL host_storage_delete_matching(
@@ -81,12 +89,13 @@ static bool NHR_CALL host_storage_send_records(
     void *userdata, send_records_callback_t sender, const char *sub,
     const filter_t *filters, size_t filters_count, bool do_count,
     bool *has_more, int *out_count, const storage_tag_match_t *indexed_tags,
-    size_t indexed_tags_count) {
+    size_t indexed_tags_count, void *sender_userdata) {
     Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
     return runtime && runtime->storage && runtime->storage->send_records
         ? runtime->storage->send_records(sender, sub, filters, filters_count,
                                          do_count, has_more, out_count,
-                                         indexed_tags, indexed_tags_count)
+                                         indexed_tags, indexed_tags_count,
+                                         sender_userdata)
         : false;
 }
 
@@ -133,16 +142,60 @@ static uintptr_t NHR_CALL host_connection_id(void *userdata, void *connection) {
 }
 
 static size_t NHR_CALL host_connection_snapshot(void *userdata,
-                                               Nhr_Connection *connections,
-                                               size_t capacity) {
-    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    size_t count = 0;
-    if (!runtime || !connections) return 0;
-    for (Nhr_Connection_Node *node = runtime->connections;
-         node && count < capacity; node = node->next) {
-        connections[count++] = node->connection;
-    }
-    return count;
+                                                connection_snapshot_t *connections,
+                                                size_t capacity) {
+    (void)userdata;
+    /* Enumerate the relay's host-owned session list (populated by the live
+     * relay path), not the legacy NHR connection list. Nhr_Connection and
+     * connection_snapshot_t share the {id, connection} layout. */
+    if (!connections || !capacity) return 0;
+    return connection_session_snapshot(connections, capacity);
+}
+
+/* Session-auth services (ABI v2). Backed by the relay's host-owned
+ * connection_session list — the same list the live relay path populates —
+ * so NIP-42 challenge/pubkey state survives module reload with no copy. */
+static const char *NHR_CALL host_connection_get_challenge(void *userdata,
+                                                           uintptr_t connection_id) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    return session ? connection_session_get_challenge(session) : NULL;
+}
+
+static bool NHR_CALL host_connection_set_challenge(void *userdata,
+                                                    uintptr_t connection_id,
+                                                    const char *challenge) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    if (!session) return false;
+    connection_session_set_challenge(session, challenge);
+    return true;
+}
+
+static const char *NHR_CALL host_connection_get_auth_pubkey(void *userdata,
+                                                             uintptr_t connection_id) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    return session ? connection_session_get_auth_pubkey(session) : NULL;
+}
+
+static bool NHR_CALL host_connection_set_auth(void *userdata,
+                                               uintptr_t connection_id,
+                                               const char *pubkey) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    if (!session) return false;
+    connection_session_set_auth(session, pubkey);
+    return true;
+}
+
+static void NHR_CALL host_connection_clear_auth(void *userdata,
+                                                 uintptr_t connection_id) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    if (!session) return;
+    connection_session_set_auth(session, NULL);
+    connection_session_set_challenge(session, NULL);
 }
 
 void nhr_runtime_connection_closed(Nhr_Runtime *runtime, void *connection) {
@@ -166,6 +219,7 @@ static bool nhr_runtime_load_generation(Nhr_Runtime *runtime,
     char unique_path[1024];
     if (!runtime || !source_path || !library) return false;
     runtime->generation++;
+    if (runtime->generation == 0) runtime->generation++;
 #ifdef _WIN32
     snprintf(unique_path, sizeof(unique_path), "build/nhr_%lu_%u.dll",
              (unsigned long)GetCurrentProcessId(), runtime->generation);
@@ -178,7 +232,10 @@ static bool nhr_runtime_load_generation(Nhr_Runtime *runtime,
                 source_path, unique_path);
         return false;
     }
-    if (!nhr_library_open(library, unique_path)) return false;
+    if (!nhr_library_open(library, unique_path)) {
+        remove(unique_path);
+        return false;
+    }
     snprintf(library->source_path, sizeof(library->source_path), "%s", source_path);
     return true;
 }
@@ -228,6 +285,7 @@ bool nhr_library_open(Nhr_Library *out, const char *path) {
 void nhr_library_close(Nhr_Library *library) {
     if (!library) return;
     if (library->handle) nhr_platform_close(library->handle);
+    if (library->loaded_path[0]) remove(library->loaded_path);
     memset(library, 0, sizeof(*library));
 }
 
@@ -258,6 +316,11 @@ bool nhr_runtime_init(Nhr_Runtime *runtime, storage_context_t *storage,
     runtime->services.crypto_count_leading_zero_bits = host_crypto_count_leading_zero_bits;
     runtime->services.connection_id = host_connection_id;
     runtime->services.connection_snapshot = host_connection_snapshot;
+    runtime->services.connection_get_challenge = host_connection_get_challenge;
+    runtime->services.connection_set_challenge = host_connection_set_challenge;
+    runtime->services.connection_get_auth_pubkey = host_connection_get_auth_pubkey;
+    runtime->services.connection_set_auth = host_connection_set_auth;
+    runtime->services.connection_clear_auth = host_connection_clear_auth;
     runtime->services.alloc = host_alloc;
     runtime->services.free = host_free;
     /* Loader startup is LOAD -> ABI VALIDATION -> INIT -> RUN. */

@@ -1,0 +1,86 @@
+#ifndef SUBSCRIPTION_MANAGER_H_
+#define SUBSCRIPTION_MANAGER_H_
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "nostrogotho.h"
+#include "relay/connection_session.h"
+#include "storage.h"
+
+/* ============================================================================
+ * SUBSCRIPTION_MANAGER.H - Subscription Lifecycle Management
+ * 
+ * Extracts subscription management from server.c into a dedicated module.
+ * Handles connection association, subscription lifecycle, filter matching,
+ * and delivery coordination.
+ * ============================================================================ */
+
+typedef struct subscription_manager subscription_manager_t;
+
+/* Create and initialize a new subscription manager. Limits come from
+ * relay_config_t (single source of truth); 0 keeps the built-in default. */
+subscription_manager_t *subscription_manager_create(size_t max_subscriptions_per_connection,
+                                                    size_t max_filters_per_subscription,
+                                                    size_t max_subscription_id_length);
+
+/* Destroy and free subscription manager */
+void subscription_manager_destroy(subscription_manager_t *manager);
+
+/* Create a new subscription for a connection */
+bool subscription_manager_create_subscription(subscription_manager_t *manager,
+                                              connection_id_t connection_id,
+                                              const char *id,
+                                              filter_t *filters,
+                                              size_t filters_count);
+
+/* Close a specific subscription by ID */
+void subscription_manager_close_subscription(subscription_manager_t *manager,
+                                             connection_id_t connection_id,
+                                             const char *id);
+
+/* Remove all subscriptions for a connection (on disconnect) */
+void subscription_manager_remove_connection(subscription_manager_t *manager,
+                                            connection_id_t connection_id);
+
+/* Check if an event matches any subscription filters and deliver if so */
+void subscription_manager_match_and_deliver(subscription_manager_t *manager,
+                                            const event_t *event,
+                                            bool (*can_deliver)(const event_t *, connection_id_t, void *),
+                                            void *can_deliver_ctx,
+                                            void (*send_event)(struct mg_connection *, const char *, const event_t *),
+                                            void *send_ctx);
+
+/* Execute a stored query for a subscription.
+ *
+ * Stored results pass through the SAME pipeline as live broadcasts: the
+ * shared filter matcher decides candidacy and the composed NIP delivery
+ * policy may veto each event. needs_auth_hint/send_auth_challenge (with
+ * protocol_response_ctx) implement the NIP-17/NIP-67 "auth" EOSE hint for
+ * gift-wrap queries on unauthenticated connections. */
+bool subscription_manager_query(subscription_manager_t *manager,
+                                storage_context_t *storage,
+                                struct mg_connection *connection,
+                                const char *sub,
+                                filter_t *filters,
+                                size_t filters_count,
+                                bool do_count,
+                                void (*send_json)(struct mg_connection *, const char *),
+                                void *send_ctx,
+                                bool (*can_deliver)(const event_t *, connection_id_t, void *),
+                                void *can_deliver_ctx,
+                                char *(*build_eose)(const char *sub, bool has_more, bool auth_hint),
+                                char *(*build_count)(const char *sub, unsigned long count),
+                                bool (*needs_auth_hint)(const filter_t *filters,
+                                                        size_t filters_count,
+                                                        connection_id_t connection_id,
+                                                        void *ctx),
+                                void (*send_auth_challenge)(connection_id_t connection_id,
+                                                            void *ctx),
+                                void *protocol_response_ctx);
+
+/* Get subscription count for a connection */
+size_t subscription_manager_count_for_connection(subscription_manager_t *manager,
+                                                 connection_id_t connection_id);
+
+#endif /* SUBSCRIPTION_MANAGER_H_ */

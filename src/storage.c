@@ -223,43 +223,46 @@ static event_t *get_event_by_id(const char *id) {
     
     event_t *ev = NULL;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *col_id = (const char *)sqlite3_column_text(stmt, 0);
+        const char *col_pubkey = (const char *)sqlite3_column_text(stmt, 1);
+        const char *col_sig = (const char *)sqlite3_column_text(stmt, 6);
         ev = event_alloc();
         if (ev) {
-            strncpy(ev->id, (const char *)sqlite3_column_text(stmt, 0), MAX_ID_SIZE);
-            ev->id[MAX_ID_SIZE] = '\0';
-            strncpy(ev->pubkey, (const char *)sqlite3_column_text(stmt, 1), MAX_PUBKEY_SIZE);
-            ev->pubkey[MAX_PUBKEY_SIZE] = '\0';
-            ev->created_at = (time_t)sqlite3_column_int(stmt, 2);
+            /* Column text can be NULL on a corrupt/attacker-controlled DB.
+             * Treat NULL as empty so we never dereference NULL. */
+            snprintf(ev->id, sizeof(ev->id), "%s", col_id != NULL ? col_id : "");
+            snprintf(ev->pubkey, sizeof(ev->pubkey), "%s", col_pubkey != NULL ? col_pubkey : "");
+            ev->created_at = (time_t)sqlite3_column_int64(stmt, 2);
             ev->kind = sqlite3_column_int(stmt, 3);
-            
+
             const char *tags_json = (const char *)sqlite3_column_text(stmt, 4);
             if (tags_json) {
                 ev->tags_json_len = strlen(tags_json);
                 ev->tags_json = (char *)malloc(ev->tags_json_len + 1);
                 if (ev->tags_json) {
-                    strcpy(ev->tags_json, tags_json);
+                    memcpy(ev->tags_json, tags_json, ev->tags_json_len + 1);
                 } else {
                     sqlite3_finalize(stmt);
                     free(ev);
                     return NULL;
                 }
             }
-            
+
             const char *content = (const char *)sqlite3_column_text(stmt, 5);
             if (content) {
                 ev->content_len = strlen(content);
                 ev->content = (char *)malloc(ev->content_len + 1);
                 if (!ev->content) {
                     free(ev->tags_json);
+                    ev->tags_json = NULL;
                     sqlite3_finalize(stmt);
                     free(ev);
                     return NULL;
                 }
-                strcpy(ev->content, content);
+                memcpy(ev->content, content, ev->content_len + 1);
             }
-            
-            strncpy(ev->sig, (const char *)sqlite3_column_text(stmt, 6), MAX_SIG_SIZE);
-            ev->sig[MAX_SIG_SIZE] = '\0';
+
+            snprintf(ev->sig, sizeof(ev->sig), "%s", col_sig != NULL ? col_sig : "");
         }
     }
     
@@ -274,47 +277,55 @@ static event_t *get_event_by_id(const char *id) {
  * 
  * Args: ev - event to insert (must not be NULL)
  * 
- * Returns: true on success, false if:
- *   - ev is NULL or db_conn is NULL
- *   - Database error (e.g., unique constraint violation)
- *   - Prepared statement fails
+ * Returns: storage_insert_result_t with result and error details
  * 
  * Database columns: id, pubkey, created_at, kind, tags, content, sig
  * Indexes enforce: UNIQUE on id
  * 
  * Note: Does NOT duplicate-check before insert (relies on DB unique constraint)
  */
-static bool insert_record(const event_t *ev,
-                          const storage_tag_match_t *indexed_tags,
-                          size_t indexed_tags_count) {
-    if (!db_conn || !ev) return false;
+static storage_insert_result_t insert_record(const event_t *ev,
+                                             const storage_tag_match_t *indexed_tags,
+                                             size_t indexed_tags_count) {
+    storage_insert_result_t result = {0};
+    result.result = STORAGE_ERROR;
+    snprintf(result.error_message, sizeof(result.error_message), "not implemented");
+    
+    if (!db_conn || !ev) return result;
     
     const char *sql = "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES (?, ?, ?, ?, ?, ?, ?)";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        return false;
+        snprintf(result.error_message, sizeof(result.error_message), "SQL error: %s", sqlite3_errmsg(db_conn));
+        return result;
     }
     
     sqlite3_bind_text(stmt, 1, ev->id, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, ev->pubkey, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, (int)ev->created_at);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)ev->created_at);
     sqlite3_bind_int(stmt, 4, ev->kind);
     sqlite3_bind_text(stmt, 5, ev->tags_json ? ev->tags_json : "[]", -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, ev->content ? ev->content : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 7, ev->sig, -1, SQLITE_TRANSIENT);
     
-    bool result = (sqlite3_step(stmt) == SQLITE_DONE);
-    if (!result) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+    int step_result = sqlite3_step(stmt);
+    if (step_result == SQLITE_DONE) {
+        result.result = STORAGE_OK;
+    } else if (step_result == SQLITE_CONSTRAINT) {
+        result.result = STORAGE_DUPLICATE;
+        snprintf(result.error_message, sizeof(result.error_message), "duplicate event id");
+    } else {
+        result.result = STORAGE_ERROR;
+        snprintf(result.error_message, sizeof(result.error_message), "SQL error: %s", sqlite3_errmsg(db_conn));
     }
     
     sqlite3_finalize(stmt);
 
     /* Index generic tag key/value pairs only after the event row exists so
      * the foreign key is satisfied. */
-    if (result) {
+    if (result.result == STORAGE_OK) {
         for (size_t i = 0; i < indexed_tags_count; i++) {
             if (!index_event_tag(ev->id, indexed_tags[i].tag_name,
                                  indexed_tags[i].tag_value)) {
@@ -328,8 +339,13 @@ static bool insert_record(const event_t *ev,
 /* Delete record by ID and pubkey */
 static void free_event_tag_indexes(const char *event_id);
 
-static int delete_record_by_id_and_pubkey(const char *id, const char *pubkey) {
-    if (!db_conn || !id) return -1;
+static storage_delete_result_t delete_record_by_id_and_pubkey(const char *id, const char *pubkey) {
+    storage_delete_result_t result = {0};
+    if (!db_conn || !id) {
+        result.result = STORAGE_INVALID_ARGUMENT;
+        snprintf(result.error_message, sizeof(result.error_message), "invalid arguments");
+        return result;
+    }
     
     const char *sql = pubkey
         ? "DELETE FROM event WHERE id = ? AND pubkey = ?"
@@ -337,23 +353,28 @@ static int delete_record_by_id_and_pubkey(const char *id, const char *pubkey) {
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        return -1;
+        result.result = STORAGE_ERROR;
+        snprintf(result.error_message, sizeof(result.error_message), "SQL error: %s", sqlite3_errmsg(db_conn));
+        return result;
     }
     
     sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
     if (pubkey) sqlite3_bind_text(stmt, 2, pubkey, -1, SQLITE_TRANSIENT);
     
     if (sqlite3_step(stmt) != SQLITE_DONE) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        result.result = STORAGE_ERROR;
+        snprintf(result.error_message, sizeof(result.error_message), "SQL error: %s", sqlite3_errmsg(db_conn));
         sqlite3_finalize(stmt);
-        return -1;
+        return result;
     }
     
     sqlite3_finalize(stmt);
     int changes = sqlite3_changes(db_conn);
     if (changes > 0) free_event_tag_indexes(id);
-    return changes;
+    
+    result.result = STORAGE_OK;
+    result.deleted_count = changes;
+    return result;
 }
 
 static void free_event_tag_indexes(const char *event_id) {
@@ -368,20 +389,26 @@ static void free_event_tag_indexes(const char *event_id) {
 }
 
 /* Delete record by kind and pubkey */
-static int delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t created_at) {
-    if (!db_conn || !pubkey) return -1;
+static storage_delete_result_t delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t created_at) {
+    storage_delete_result_t result = {0};
+    if (!db_conn || !pubkey) {
+        result.result = STORAGE_INVALID_ARGUMENT;
+        snprintf(result.error_message, sizeof(result.error_message), "invalid arguments");
+        return result;
+    }
     
     const char *sql = "SELECT id FROM event WHERE kind = ? AND pubkey = ? AND created_at < ?";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        return -1;
+        result.result = STORAGE_ERROR;
+        snprintf(result.error_message, sizeof(result.error_message), "SQL error: %s", sqlite3_errmsg(db_conn));
+        return result;
     }
     
     sqlite3_bind_int(stmt, 1, kind);
     sqlite3_bind_text(stmt, 2, pubkey, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, (int)created_at);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)created_at);
     
     char **ids = NULL;
     size_t count = 0;
@@ -394,7 +421,9 @@ static int delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t
             for (size_t i = 0; i < count; i++) free(ids[i]);
             free(ids);
             sqlite3_finalize(stmt);
-            return -1;
+            result.result = STORAGE_ERROR;
+            snprintf(result.error_message, sizeof(result.error_message), "out of memory");
+            return result;
         }
         ids = grown;
         ids[count] = string_dup(event_id);
@@ -402,20 +431,30 @@ static int delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t
             for (size_t i = 0; i < count; i++) free(ids[i]);
             free(ids);
             sqlite3_finalize(stmt);
-            return -1;
+            result.result = STORAGE_ERROR;
+            snprintf(result.error_message, sizeof(result.error_message), "out of memory");
+            return result;
         }
         count++;
     }
     sqlite3_finalize(stmt);
     int deleted = 0;
     for (size_t i = 0; i < count; i++) {
-        int result = delete_record_by_id_and_pubkey(ids[i], pubkey);
-        if (result < 0) deleted = -1;
-        else if (deleted >= 0) deleted += result;
+        storage_delete_result_t del_result = delete_record_by_id_and_pubkey(ids[i], pubkey);
+        if (del_result.result != STORAGE_OK) {
+            result.result = del_result.result;
+            snprintf(result.error_message, sizeof(result.error_message), "%s", del_result.error_message);
+            for (size_t j = i; j < count; j++) free(ids[j]);
+            free(ids);
+            return result;
+        }
+        deleted += del_result.deleted_count;
         free(ids[i]);
     }
     free(ids);
-    return deleted;
+    result.result = STORAGE_OK;
+    result.deleted_count = deleted;
+    return result;
 }
 
 static bool conditions_append(char *conditions, size_t size, const char *text);
@@ -528,9 +567,9 @@ static bool delete_matching_sqlite3(const storage_event_scope_t *scope,
         sqlite3_finalize(stmt);
         if (ok) {
             for (size_t i = 0; i < ids_count; i++) {
-                int result = delete_record_by_id_and_pubkey(ids[i], pubkeys[i]);
-                if (result < 0) ok = false;
-                else deleted += (size_t)result;
+                storage_delete_result_t result = delete_record_by_id_and_pubkey(ids[i], pubkeys[i]);
+                if (result.result != STORAGE_OK) ok = false;
+                else deleted += (size_t)result.deleted_count;
                 free(ids[i]);
                 free(pubkeys[i]);
             }
@@ -662,10 +701,11 @@ static bool append_tag_like_condition(char *conditions, size_t conditions_size,
  *   TODO: Replace fixed buffers with dynamic allocation for arbitrary filter sizes
  */
 static bool send_records(send_records_callback_t sender, const char *sub,
-                        const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more, int *out_count,
-                        const storage_tag_match_t *indexed_tags,
-                        size_t indexed_tags_count) {
+                         const filter_t *filters, size_t filters_count,
+                         bool do_count, bool *has_more, int *out_count,
+                         const storage_tag_match_t *indexed_tags,
+                         size_t indexed_tags_count,
+                         void *userdata) {
     if (!db_conn || !sender) return false;
     if (has_more) *has_more = false;
     if (do_count && out_count) *out_count = 0;
@@ -1000,19 +1040,27 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 
                 event_t event = {0};
                 json_builder_t builder;
-                snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
-                snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
+                const char *col_id = (const char *)sqlite3_column_text(stmt, 0);
+                const char *col_pubkey = (const char *)sqlite3_column_text(stmt, 1);
+                const char *col_sig = (const char *)sqlite3_column_text(stmt, 6);
+                /* Skip corrupt rows instead of dereferencing NULL text. */
+                if (col_id == NULL || col_pubkey == NULL || col_sig == NULL) {
+                    continue;
+                }
+                snprintf(event.id, sizeof(event.id), "%s", col_id);
+                snprintf(event.pubkey, sizeof(event.pubkey), "%s", col_pubkey);
                 event.created_at = (time_t) sqlite3_column_int64(stmt, 2);
                 event.kind = sqlite3_column_int(stmt, 3);
                 event.tags_json = (char *) sqlite3_column_text(stmt, 4);
                 event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
                 event.content = (char *) sqlite3_column_text(stmt, 5);
-                snprintf(event.sig, sizeof(event.sig), "%s", (const char *) sqlite3_column_text(stmt, 6));
+                event.content_len = event.content ? strlen(event.content) : 0;
+                snprintf(event.sig, sizeof(event.sig), "%s", col_sig);
                 json_builder_start(&builder);
                 json_builder_append_string(&builder, "EVENT");
                 json_builder_append_string(&builder, sub);
                 json_serialize_event(&event, &builder);
-                sender(json_builder_finish(&builder));
+                sender(json_builder_finish(&builder), userdata);
             }
             
             sqlite3_finalize(stmt);
@@ -1174,9 +1222,8 @@ static void storage_deinit_sqlite3(void) {
  * 
  *   storage_context_t ctx = {0};
  *   storage_context_init_sqlite3(&ctx);
- *   ctx.init("file:nostrogotho.sqlite");  // opens database
- *   // ... use ctx.get_event_by_id(), ctx.insert_record(), etc.
- *   ctx.deinit();  // closes database
+ *   ctx.init("file:nostrogotho.sqlite");  -- opens database --
+ *   ctx.deinit();  -- closes database --
  * 
  * Args: ctx - storage context structure (must not be NULL)
  * 

@@ -1,65 +1,88 @@
-#include "nip17.h"
-#include "nip_event.h"
-#include "nip_plugin.h"
-#include "nip42.h"
-
-bool nip17_can_deliver(const event_t *event, const char *authenticated_pubkey) {
-    return (event->kind != 1059 && event->kind != 21059) ||
-           (authenticated_pubkey && nip_event_has_tag(event, "p", authenticated_pubkey));
-}
-
 /* ============================================================================
- * NIP-17: Private Direct Messages (plugin registration)
+ * NIP-17: Private Direct Messages (gift-wrap gating)
  *
- * Gift-wrapped events (kinds 1059 / 21059) are only delivered to the "p"-tag
- * recipient after NIP-42 authentication. Unauthenticated subscribers querying
- * gift-wrap kinds additionally get a fresh NIP-42 AUTH challenge plus the
- * NIP-67 "auth" completeness hint on EOSE.
+ * Single-file NIP: gift-wrap delivery rules + auth-hint decision + capability
+ * table + self-registration. Compiling this file enables the NIP; deleting
+ * it removes it. No header, no registration list, no build edits.
  * ============================================================================ */
 
-static bool nip17_plugin_can_deliver(const event_t *event, struct mg_connection *connection,
-                                     void *ctx) {
-    (void) ctx;
-    return nip17_can_deliver(event, nip42_authenticated_pubkey(connection));
-}
+#include "nip_capability.h"
+#include "model/event_util.h"
+#include "protocol/protocol.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-static bool nip17_filter_targets_gift_wraps(const filter_t *filter) {
+/* Gift-wrap kinds whose visibility may require NIP-42 auth. */
+static bool nip17_targets_gift_wraps(const filter_t *filter) {
+    if (!filter) return false;
     for (size_t i = 0; i < filter->kinds_count; i++) {
         if (filter->kinds[i] == 1059 || filter->kinds[i] == 21059) return true;
     }
     return false;
 }
 
-/* Before EOSE: when an unauthenticated client subscribes to gift-wrap kinds,
- * more results may exist behind NIP-42 auth. Send a fresh AUTH challenge and
- * ask the server to flag the EOSE with the "auth" hint. */
-static bool nip17_plugin_eose_auth_hint(struct mg_connection *connection,
-                                        const filter_t *filters, size_t count,
-                                        void *ctx) {
-    (void) ctx;
-    if (nip42_authenticated_pubkey(connection)) return false;
-    for (size_t i = 0; i < count; i++) {
-        if (nip17_filter_targets_gift_wraps(&filters[i])) {
-            char challenge[17];
-            if (nip42_open_challenge(connection, challenge)) {
-                json_builder_t builder;
-                json_builder_start(&builder);
-                json_builder_append_string(&builder, "AUTH");
-                json_builder_append_string(&builder, challenge);
-                nip_plugin_send_json(connection, json_builder_finish(&builder));
-            }
-            return true;
-        }
+/* Enforce authenticated-recipient delivery for gift-wrap events. */
+static bool nip17_is_visible_to(const event_t *event, const char *authenticated_pubkey) {
+    return (event->kind != 1059 && event->kind != 21059) ||
+           (authenticated_pubkey && event_has_tag(event, "p", authenticated_pubkey));
+}
+
+static bool nip17_delivery_policy_can_deliver(const event_t *event, uintptr_t connection_id, void *ctx);
+static bool nip17_protocol_response_needs_auth_hint(const filter_t *filters, size_t filters_count,
+                                                    uintptr_t connection_id, void *ctx);
+
+/* Single capability table. Hooks ignore ctx, so .ctx is NULL (no
+ * allocation, nothing to leak across reloads). */
+static nip_capability_t nip17_caps[] = {
+    {
+        .name = "nip17-delivery-policy",
+        .type = NIP_CAP_DELIVERY_POLICY,
+        .ctx = NULL,
+        .caps.delivery_policy = { .can_deliver = nip17_delivery_policy_can_deliver },
+        .next = NULL,
+    },
+    /* NIP-17 contributes only the auth-hint decision; EOSE framing is owned
+     * by NIP-67 (sole build_eose provider, so composition is
+     * order-independent). */
+    {
+        .name = "nip17-protocol-response",
+        .type = NIP_CAP_PROTOCOL_RESPONSE,
+        .ctx = NULL,
+        .caps.protocol_response = { .build_eose = NULL, .build_count = NULL,
+                                    .needs_auth_hint = nip17_protocol_response_needs_auth_hint,
+                                    .send_auth_challenge = NULL },
+        .next = NULL,
+    },
+};
+
+static bool nip17_delivery_policy_can_deliver(const event_t *event, uintptr_t connection_id, void *ctx) {
+    (void)ctx;
+    const char *authenticated_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
+    return nip17_is_visible_to(event, authenticated_pubkey);
+}
+
+static bool nip17_protocol_response_needs_auth_hint(const filter_t *filters, size_t filters_count,
+                                                    uintptr_t connection_id, void *ctx) {
+    (void)ctx;
+    /* Unauthenticated gift-wrap subscriptions may hide results behind NIP-42
+     * auth: hint the client (and refresh its challenge) before EOSE. */
+    if (nip42_authenticated_pubkey_by_id(connection_id)) return false;
+    if (!filters) return false;
+    for (size_t i = 0; i < filters_count; i++) {
+        if (nip17_targets_gift_wraps(&filters[i])) return true;
     }
     return false;
 }
 
-static nip_plugin_t nip17_plugin = {
-    .name = "nip17",
-    .can_deliver = nip17_plugin_can_deliver,
-    .eose_auth_hint = nip17_plugin_eose_auth_hint,
-};
+void nip17_register(nip_registry_t *registry) {
+    if (!registry) return;
+    for (size_t i = 0; i < sizeof(nip17_caps) / sizeof(nip17_caps[0]); i++)
+        nip_registry_register(registry, &nip17_caps[i]);
+}
 
-__attribute__((constructor)) static void nip17_register_at_startup(void) {
-    nip_plugin_register(&nip17_plugin);
+/* Self-registration: compiling this file enables the NIP; deleting it
+ * removes the capability without touching protocol/transport code. */
+__attribute__((constructor)) static void nip17_register_provider(void) {
+    nip_capability_add_provider(nip17_register);
 }

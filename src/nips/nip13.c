@@ -1,41 +1,69 @@
-#include "crypto.h"
-#include "nip13.h"
-#include "nip_event.h"
-#include "nip_plugin.h"
-#include <stdio.h>
-#include <stdlib.h>
-
 /* ============================================================================
  * NIP-13: Proof of Work
  *
- * difficulty = number of leading zero bits of the NIP-01 event id.
- *
- * When the event carries a ["nonce", "<value>", "<target>"] tag with a
- * committed target difficulty (third element), the committed target is the
- * authoritative requirement: an id that happens to exceed a lower committed
- * target is not enough. This protects against bulk spammers committing to a
- * low difficulty and getting lucky with a higher one (spec: "Committing to a
- * target difficulty is something all honest miners should be ok with").
- *
- * Enforcement is a plugin publish-policy hook (same architecture as NIP-40):
- * when the relay is configured with min_pow_difficulty > 0, every EVENT must
- * present at least that many leading zero bits before it is dispatched.
- * Removing nip13.c from the build removes PoW enforcement with it.
+ * Single-file NIP: PoW verification + minimum-difficulty policy + capability
+ * table + self-registration. Compiling this file enables the NIP; deleting
+ * it removes it. No header, no registration list, no build edits.
  * ============================================================================ */
 
-static int nip13_min_difficulty;
+#include "nip_capability.h"
+#include "crypto.h"
+#include "model/event_util.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
 
-/* nip13_committed_target - Return the nonce tag's committed target difficulty,
- * or 0 when the event does not commit to one. */
+/* ============================================================================
+ * NIP-13 Capability Implementation
+ * 
+ * Proof of Work using the new transport-agnostic capability interface.
+ * ============================================================================ */
+
+typedef struct {
+    int min_difficulty;
+} nip13_ctx_t;
+
+/* Shared static ctx: re-derived in lifecycle init on every startup/reload,
+ * so no heap allocation and nothing to leak or migrate. */
+static nip13_ctx_t nip13_ctx;
+
+/* Forward declarations */
+static void nip13_lifecycle_init(const relay_config_t *config, void *ctx);
+static bool nip13_publication_policy_accept_publish(
+    connection_id_t connection_id, const event_t *event,
+    char *reason, size_t reason_size, void *ctx);
+
+/* Single capability table. */
+static nip_capability_t nip13_caps[] = {
+    {
+        .name = "nip13-lifecycle",
+        .type = NIP_CAP_LIFECYCLE,
+        .ctx = &nip13_ctx,
+        .caps.lifecycle = { .init = nip13_lifecycle_init, .shutdown = NULL },
+        .next = NULL,
+    },
+    {
+        .name = "nip13-publication-policy",
+        .type = NIP_CAP_PUBLICATION_POLICY,
+        .ctx = &nip13_ctx,
+        .caps.publication_policy = { .accept_publish = nip13_publication_policy_accept_publish },
+        .next = NULL,
+    },
+};
+
+/* ============================================================================
+ * Helper Functions (adapted from nip13.c)
+ * ============================================================================ */
+
 static int nip13_committed_target(const event_t *event) {
     struct mg_str key, tag, tags = mg_str(event->tags_json);
     size_t offset = 0;
     int target = 0;
 
     while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
+        char *name = event_tag_element(tag.buf, 0);
         if (name && strcmp(name, "nonce") == 0) {
-            char *value = nip_tag_element(tag, 2);
+            char *value = event_tag_element(tag.buf, 2);
             free(name);
             if (value) {
                 char *end = NULL;
@@ -52,38 +80,33 @@ static int nip13_committed_target(const event_t *event) {
     return target;
 }
 
-bool nip13_meets_difficulty(const event_t *event, int minimum_difficulty) {
-    if (minimum_difficulty <= 0) return true;
+/* ============================================================================
+ * Lifecycle Implementation
+ * ============================================================================ */
 
-    int committed = nip13_committed_target(event);
-    int required = committed > minimum_difficulty ? committed : minimum_difficulty;
-    return count_leading_zero_bits(event->id) >= required;
+static void nip13_lifecycle_init(const relay_config_t *config, void *ctx) {
+    nip13_ctx_t *cap_ctx = (nip13_ctx_t *)ctx;
+    if (cap_ctx) {
+        cap_ctx->min_difficulty = config->min_pow_difficulty;
+    }
 }
 
 /* ============================================================================
- * Plugin registration
- *
- * Publish policy: when the relay requires PoW, verify the id actually carries
- * the committed/configured work. The rejection message follows the spec's
- * example format ("pow: difficulty 25>=24") so clients can see how close they
- * were.
+ * Publication Policy Implementation
  * ============================================================================ */
 
-static void nip13_plugin_init(const relay_config_t *config, void *ctx) {
-    (void) ctx;
-    nip13_min_difficulty = config->min_pow_difficulty;
-}
-
-static bool nip13_accept_publish(struct mg_connection *connection,
-                                 const event_t *event,
-                                 char *reason, size_t reason_size,
-                                 void *ctx) {
-    (void) connection;
-    (void) ctx;
-    if (nip13_min_difficulty <= 0) return true;
+static bool nip13_publication_policy_accept_publish(
+    connection_id_t connection_id, const event_t *event,
+    char *reason, size_t reason_size, void *ctx) {
+    (void)connection_id;
+    
+    nip13_ctx_t *cap_ctx = (nip13_ctx_t *)ctx;
+    int min_difficulty = cap_ctx ? cap_ctx->min_difficulty : 0;
+    
+    if (min_difficulty <= 0) return true;
 
     int committed = nip13_committed_target(event);
-    int required = committed > nip13_min_difficulty ? committed : nip13_min_difficulty;
+    int required = committed > min_difficulty ? committed : min_difficulty;
     int bits = count_leading_zero_bits(event->id);
     if (bits >= required) return true;
 
@@ -91,12 +114,18 @@ static bool nip13_accept_publish(struct mg_connection *connection,
     return false;
 }
 
-static nip_plugin_t nip13_plugin = {
-    .name = "nip13",
-    .init = nip13_plugin_init,
-    .accept_publish = nip13_accept_publish,
-};
+/* ============================================================================
+ * Registration
+ * ============================================================================ */
 
-__attribute__((constructor)) static void nip13_register_at_startup(void) {
-    nip_plugin_register(&nip13_plugin);
+void nip13_register(nip_registry_t *registry) {
+    if (!registry) return;
+    for (size_t i = 0; i < sizeof(nip13_caps) / sizeof(nip13_caps[0]); i++)
+        nip_registry_register(registry, &nip13_caps[i]);
+}
+
+/* Self-registration: compiling this file enables the NIP; deleting it
+ * removes the capability without touching protocol/transport code. */
+__attribute__((constructor)) static void nip13_register_provider(void) {
+    nip_capability_add_provider(nip13_register);
 }

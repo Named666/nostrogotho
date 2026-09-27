@@ -1,6 +1,6 @@
 #include "crypto.h"
 #ifndef NHR_DYNAMIC_MODULE
-#include "nips/nip26.h"
+#include "nips/nip_capability.h" /* nip26_check_delegation (NIP-26 lives in src/nips/nip26.c) */
 #endif
 #include <string.h>
 #include <stdio.h>
@@ -767,6 +767,124 @@ bool check_event(const event_t *ev) {
 #else
 bool check_event(const event_t *ev) { return check_event_core(ev); }
 #endif
+
+/* check_event_id - Verify event ID matches computed hash
+ * 
+ * Verifies that the event's ID field matches the SHA256 hash of the
+ * serialized event data (NIP-01 format).
+ * 
+ * Args: ev - event to validate (must not be NULL)
+ * 
+ * Returns: true if ID matches, false otherwise
+ */
+bool check_event_id(const event_t *ev) {
+    if (!ev) return false;
+    
+    /* Build the event hash input: [0, pubkey, created_at, kind, tags, content] */
+    char escaped_pubkey[MAX_PUBKEY_SIZE * 2 + 1];
+    
+    if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
+        return false;
+    }
+    
+    const char *content = ev->content ? ev->content : "";
+    size_t content_len = strlen(content);
+    size_t escaped_content_cap = content_len * 6 + 1;
+    char *escaped_content = (char *)malloc(escaped_content_cap);
+    if (!escaped_content) return false;
+    if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
+        free(escaped_content);
+        return false;
+    }
+    
+    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
+    size_t tags_len = strlen(tags_json);
+    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
+    char *buffer = (char *)malloc(buffer_cap);
+    if (!buffer) {
+        free(escaped_content);
+        return false;
+    }
+    
+    int written = snprintf(buffer, buffer_cap,
+                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
+                          escaped_pubkey, (long long)ev->created_at, ev->kind,
+                          tags_json,
+                          escaped_content);
+    free(escaped_content);
+    
+    if (written < 0 || (size_t)written >= buffer_cap) {
+        free(buffer);
+        return false;
+    }
+    
+    uint8_t digest[32];
+    sha256((const uint8_t *)buffer, strlen(buffer), digest);
+    free(buffer);
+    
+    char *id_hex = bytes_to_hex(digest, 32);
+    if (!id_hex) return false;
+    
+    bool id_matches = (strcmp(id_hex, ev->id) == 0);
+    free(id_hex);
+    
+    return id_matches;
+}
+
+/* check_signature - Verify Schnorr signature
+ * 
+ * Verifies the event's signature against its ID hash and public key.
+ * 
+ * Args: ev - event to validate (must not be NULL)
+ * 
+ * Returns: true if signature is valid, false otherwise
+ */
+bool check_signature(const event_t *ev) {
+    if (!ev) return false;
+    
+    /* Build the event hash input to get the digest */
+    char escaped_pubkey[MAX_PUBKEY_SIZE * 2 + 1];
+    if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
+        return false;
+    }
+    
+    const char *content = ev->content ? ev->content : "";
+    size_t content_len = strlen(content);
+    size_t escaped_content_cap = content_len * 6 + 1;
+    char *escaped_content = (char *)malloc(escaped_content_cap);
+    if (!escaped_content) return false;
+    if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
+        free(escaped_content);
+        return false;
+    }
+    
+    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
+    size_t tags_len = strlen(tags_json);
+    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
+    char *buffer = (char *)malloc(buffer_cap);
+    if (!buffer) {
+        free(escaped_content);
+        return false;
+    }
+    
+    int written = snprintf(buffer, buffer_cap,
+                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
+                          escaped_pubkey, (long long)ev->created_at, ev->kind,
+                          tags_json,
+                          escaped_content);
+    free(escaped_content);
+    
+    if (written < 0 || (size_t)written >= buffer_cap) {
+        free(buffer);
+        return false;
+    }
+    
+    uint8_t digest[32];
+    sha256((const uint8_t *)buffer, strlen(buffer), digest);
+    free(buffer);
+    
+    return signature_verify(ev->sig, ev->pubkey, digest);
+}
 
 /* ============================================================================
  * Proof of Work (NIP-13)

@@ -72,6 +72,13 @@ typedef struct {
  */
 size_t json_array_parse(const char *json_str, json_value_t *values, size_t max_values);
 
+/* Bounded substring search on a Mongoose string view (which is not
+ * NUL-terminated, so strstr does not apply). Forward-declared to keep this
+ * header free of the Mongoose include; callers pass views obtained from
+ * Mongoose or json_util parsing. */
+struct mg_str;
+bool mg_str_contains(struct mg_str haystack, const char *needle);
+
 /* Free all string values in a parsed JSON array
  * 
  * Args:

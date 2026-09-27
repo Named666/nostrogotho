@@ -11,4 +11,17 @@ NHR_MODULE_FUNCTIONS(NHR_DECLARE_MODULE_FUNCTION)
 /* No extra ABI declarations: all module exports are declared by
  * NHR_MODULE_FUNCTIONS above. */
 
+/* Host-session shims (implemented in nhr_module.c, module builds only).
+ * Forward NIP session-auth state to the host-owned connection_session list
+ * so it survives reload. Borrowed strings follow the Nhr_Host lifetime
+ * rule: valid until the next session mutation, copy if retained. */
+const char *nhr_module_session_challenge(uintptr_t connection_id);
+bool nhr_module_session_set_challenge(uintptr_t connection_id,
+                                      const char *challenge);
+const char *nhr_module_session_auth_pubkey(uintptr_t connection_id);
+bool nhr_module_session_set_auth(uintptr_t connection_id, const char *pubkey);
+void nhr_module_session_clear_auth(uintptr_t connection_id);
+size_t nhr_module_session_snapshot(connection_snapshot_t *out, size_t capacity);
+bool nhr_module_send_json(uintptr_t connection_id, const char *json, size_t length);
+
 #endif /* NHR_MODULE_H_ */
