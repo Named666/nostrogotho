@@ -13,7 +13,6 @@
 
 #include "nip_capability.h"
 #include "../json_util.h"
-#include "model/event_util.h"
 #include <stdlib.h>
 #include <string.h>
 

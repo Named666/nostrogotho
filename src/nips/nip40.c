@@ -14,7 +14,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/tag_iter.h"
+#include "model/event_tags.h"
 #include "../storage.h"
 #include <stdio.h>
 #include <time.h>
@@ -37,7 +37,7 @@
 static bool nip40_event_is_expired(const event_t *event) {
     if (!event || !event->tags_json) return false;
 
-    char *expiration_str = tag_find_value(event, "expiration");
+    char *expiration_str = event_tag_value(event, "expiration");
     if (!expiration_str) return false;
     
     time_t expiration = (time_t) strtoll(expiration_str, NULL, 10);

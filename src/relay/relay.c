@@ -4,7 +4,6 @@
 #include "crypto.h"
 #include "json_util.h"
 #include "nostrogotho.h"
-#include "model/event_util.h"
 #include "subscriptions/subscription_manager.h"
 #include "relay/connection_session.h"
 #include "protocol/protocol.h"

@@ -28,7 +28,7 @@
 #endif
 #include "nip_capability.h"
 #include "crypto.h"
-#include "model/tag_iter.h"
+#include "model/event_tags.h"
 #include "relay/connection_session.h"
 #include "protocol/protocol.h"
 #include "relay/relay.h"            /* host builds: relay_send_json() */
@@ -166,8 +166,8 @@ bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *even
     challenge = NIP42_SESS_CHALLENGE(connection_id);
     if (!challenge || !challenge[0] || event->kind != 22242 || !valid_event ||
         llabs((long long) now - (long long) event->created_at) > 600 ||
-        !tag_has(event, "challenge", challenge) ||
-        !tag_has(event, "relay", service_url)) return false;
+        !event_tag_has_value(event, "challenge", challenge) ||
+        !event_tag_has_value(event, "relay", service_url)) return false;
     return NIP42_SESS_SET_PUBKEY(connection_id, event->pubkey);
 }
 
@@ -424,7 +424,7 @@ static bool nip42_publication_policy_fn(connection_id_t connection_id, const eve
     (void)ctx;
     (void)connection_id;
 
-    if (!tag_has(event, "-", NULL)) return true;
+    if (!event_tag_has(event, "-")) return true;
 
     const char *auth_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
     if (!auth_pubkey) {

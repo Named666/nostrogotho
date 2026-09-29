@@ -7,6 +7,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
+#include "model/event_tags.h"
 #include "model/tag_iter.h"
 #include "storage.h"
 #include <stdlib.h>
@@ -80,28 +81,67 @@ static bool parse_a_tag(const char *a, int *kind, char *pubkey,
     return true;
 }
 
-static bool nip09_delete_matching(storage_context_t *storage,
-                                  const storage_event_scope_t *scope,
-                                  storage_event_predicate_t predicate,
-                                  void *userdata, size_t *deleted_total) {
-    storage_event_scope_t page = *scope;
-    char cursor[MAX_ID_SIZE + 1] = "";
-    bool more = false;
-    size_t total = 0;
-    do {
-        size_t deleted = 0;
-        char next_id[MAX_ID_SIZE + 1] = "";
-        page.after_id = cursor[0] ? cursor : NULL;
-        if (!storage->delete_matching(&page, predicate, userdata, &deleted,
-                                      next_id, sizeof(next_id), &more)) return false;
-        total += deleted;
-        snprintf(cursor, sizeof(cursor), "%s", next_id);
-    } while (more);
-    if (deleted_total) *deleted_total = total;
-    return true;
+static bool deletion_authorized(const event_t *event, const event_t *target) {
+    if (strcmp(target->pubkey, event->pubkey) == 0) return true;
+    return event_tag_has_value(target, "delegation", event->pubkey);
 }
 
-static bool delete_a_target(const event_t *event, storage_context_t *storage,
+static bool delete_e_target(const event_t *event, storage_context_t *storage,
+                            const char *id) {
+    event_t *target = storage->get_event_by_id(id);
+    bool ok = true;
+
+    if (!target) return true;
+
+    if (deletion_authorized(event, target) &&
+        kind_is_requested(event, target->kind)) {
+        if (target->kind == 1059) {
+            /* Kind 1059 (live event): also check 'p' tag */
+            storage_event_scope_t scope = {0};
+            scope.id = id;
+            scope.has_kind = true;
+            scope.kind = 1059;
+            scope.pubkey = event->pubkey;  /* Only delete if p tag matches */
+            
+            event_t **events = NULL;
+            size_t count = 0;
+            if (!storage_find_events(&scope, &events, &count) || count == 0) {
+                ok = false;
+            } else {
+                /* Verify p tag matches */
+                bool p_matched = false;
+                for (size_t i = 0; i < count; i++) {
+                    if (event_tag_has_value(events[i], "p", event->pubkey)) {
+                        p_matched = true;
+                        break;
+                    }
+                }
+                if (!p_matched) ok = false;
+                
+                for (size_t i = 0; i < count; i++) event_free(events[i]);
+                free(events);
+            }
+            
+            if (ok) {
+                storage_event_scope_t del_scope = { .id = id };
+                size_t deleted = 0;
+                if (!storage_delete_events(&del_scope, &deleted) || deleted == 0) ok = false;
+            }
+        } else {
+            /* Direct deletion by ID + pubkey authorization */
+            storage_event_scope_t scope = {
+                .id = id,
+                .pubkey = event->pubkey
+            };
+            size_t deleted = 0;
+            if (!storage_delete_events(&scope, &deleted) || deleted == 0) ok = false;
+        }
+    }
+    event_free(target);
+    return ok;
+}
+
+static bool delete_a_target(const event_t *event, storage_context_t *storage __attribute__((unused)),
                             const char *a) {
     int kind;
     char pubkey[MAX_PUBKEY_SIZE + 1];
@@ -116,57 +156,48 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
     if (!kind_is_requested(event, kind)) return true;
 
     if (*d_identifier == '\0') {
-        storage_delete_result_t result = storage->delete_record_by_kind_and_pubkey(kind, pubkey,
-                                                           event->created_at);
-        return result.result == STORAGE_OK && result.deleted_count >= 0;
+        /* No 'd' tag: delete all replaceable events of this kind/pubkey older than this */
+        storage_event_scope_t scope = {
+            .pubkey = pubkey,
+            .has_kind = true,
+            .kind = kind,
+            .has_created_at_before = true,
+            .created_at_before = event->created_at
+        };
+        size_t deleted = 0;
+        return storage_delete_events(&scope, &deleted);
     } else {
-        storage_event_scope_t scope = {0};
-        tag_match_name_value_opt_t match = {"d", d_identifier, true};
-        size_t deleted;
-        scope.pubkey = pubkey;
-        scope.has_kind = true;
-        scope.kind = kind;
-        scope.has_created_at_before = true;
-        scope.created_at_before = event->created_at;
-        return storage->delete_matching &&
-               nip09_delete_matching(storage, &scope,
-                                    tag_predicate_match_name_value_opt, &match,
-                                    &deleted);
-    }
-}
-
-static bool deletion_authorized(const event_t *event, const event_t *target) {
-    if (strcmp(target->pubkey, event->pubkey) == 0) return true;
-    return tag_has(target, "delegation", event->pubkey);
-}
-
-static bool delete_e_target(const event_t *event, storage_context_t *storage,
-                            const char *id) {
-    event_t *target = storage->get_event_by_id(id);
-    bool ok = true;
-
-    if (!target) return true;
-
-    if (deletion_authorized(event, target) &&
-        kind_is_requested(event, target->kind)) {
-        if (target->kind == 1059) {
-            storage_event_scope_t scope = {0};
-            tag_match_name_value_opt_t match = {"p", event->pubkey, false};
-            size_t deleted = 0;
-            scope.id = id;
-            scope.has_kind = true;
-            scope.kind = 1059;
-            if (!storage->delete_matching ||
-                !nip09_delete_matching(storage, &scope,
-                                      tag_predicate_match_name_value_opt, &match,
-                                      &deleted) || deleted == 0) ok = false;
-        } else {
-            storage_delete_result_t result = storage->delete_record_by_id_and_pubkey(id, event->pubkey);
-            if (result.result != STORAGE_OK || result.deleted_count <= 0) ok = false;
+        /* Has 'd' tag: find addressable events matching pubkey+kind+created_at_before, 
+         * then filter by 'd' tag value */
+        storage_event_scope_t scope = {
+            .pubkey = pubkey,
+            .has_kind = true,
+            .kind = kind,
+            .has_created_at_before = true,
+            .created_at_before = event->created_at
+        };
+        
+        event_t **events = NULL;
+        size_t count = 0;
+        if (!storage_find_events(&scope, &events, &count)) {
+            return false;
         }
+        
+        bool ok = true;
+        for (size_t i = 0; i < count; i++) {
+            if (event_tag_has_value(events[i], "d", d_identifier)) {
+                storage_event_scope_t del_scope = { .id = events[i]->id };
+                size_t deleted = 0;
+                if (!storage_delete_events(&del_scope, &deleted) || deleted == 0) {
+                    ok = false;
+                }
+            }
+        }
+        
+        for (size_t i = 0; i < count; i++) event_free(events[i]);
+        free(events);
+        return ok;
     }
-    event_free(target);
-    return ok;
 }
 
 static bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {

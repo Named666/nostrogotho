@@ -12,7 +12,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/tag_iter.h"
+#include "model/event_tags.h"
 #include "../storage.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,35 +20,23 @@
 
 /* Check whether a Request to Vanish applies to this relay. */
 static bool nip62_should_vanish(const event_t *event, const char *service_url) {
-    return tag_has(event, "relay", "ALL_RELAYS") ||
-           (service_url && *service_url && tag_has(event, "relay", service_url));
+    return event_tag_has_value(event, "relay", "ALL_RELAYS") ||
+           (service_url && *service_url && event_tag_has_value(event, "relay", service_url));
 }
 
-static bool nip62_select_all(const event_t *event, void *userdata) {
-    (void)event;
-    (void)userdata;
-    return true;
-}
-
+/* Delete all events by pubkey up to created_at, excluding keep_kind */
 static bool nip62_delete_events(storage_context_t *storage, const char *pubkey,
                                 time_t created_at, int keep_kind) {
+    (void)storage;  /* Not needed with new API */
     storage_event_scope_t scope = {0};
-    char cursor[MAX_ID_SIZE + 1] = "";
-    bool more = false;
     scope.pubkey = pubkey;
     scope.has_created_at_at_or_before = true;
     scope.created_at_at_or_before = created_at;
     scope.has_excluded_kind = true;
     scope.excluded_kind = keep_kind;
-    do {
-        size_t deleted = 0;
-        char next_id[MAX_ID_SIZE + 1] = "";
-        scope.after_id = cursor[0] ? cursor : NULL;
-        if (!storage->delete_matching(&scope, nip62_select_all, NULL, &deleted,
-                                      next_id, sizeof(next_id), &more)) return false;
-        snprintf(cursor, sizeof(cursor), "%s", next_id);
-    } while (more);
-    return true;
+    
+    size_t deleted = 0;
+    return storage_delete_events(&scope, &deleted);
 }
 
 static bool nip62_kind_handler_handles_kind(int kind, void *ctx);
@@ -84,7 +72,7 @@ static nip01_process_result_t nip62_kind_handler_process_event(
 
     /* NIP-62: "The tag list MUST include at least one `relay` value."
      * Reject kind-62 events that tag no relay at all. */
-    if (!tag_has(event, "relay", NULL)) {
+    if (!event_tag_has(event, "relay")) {
         nip01_process_result_t result = {0};
         result.accepted = false;
         snprintf(result.response_msg, sizeof(result.response_msg), "invalid: kind 62 requires at least one relay tag");

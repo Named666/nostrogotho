@@ -7,6 +7,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
+#include "model/event_tags.h"
 #include "model/tag_iter.h"
 #include "storage.h"
 #include <stdio.h>
@@ -83,9 +84,48 @@ static nip01_process_result_t nip01_kind_handler_process_event(
  * NIP-16 Replaceable Events (moved to NIP-01)
  * ============================================================================ */
 
-static bool nip01_replace_event(const event_t *event, storage_context_t *storage) {
-    storage_delete_result_t result = storage->delete_record_by_kind_and_pubkey(event->kind, event->pubkey, event->created_at);
-    return result.result == STORAGE_OK && result.deleted_count >= 0;
+/* Helper: Extract indexable tags (e, p, a) from event for tag index */
+static void nip01_extract_indexed_tags(const event_t *event,
+                                       storage_tag_match_t *indexed_tags,
+                                       size_t *indexed_tags_count) {
+    char **tags_e = event_tag_get(event, "e");
+    if (tags_e) {
+        for (size_t i = 0; tags_e[i]; i++) {
+            if (*indexed_tags_count < 64) {
+                indexed_tags[*indexed_tags_count].tag_name = "e";
+                indexed_tags[*indexed_tags_count].tag_value = tags_e[i];
+                indexed_tags[*indexed_tags_count].filter_index = 0;
+                (*indexed_tags_count)++;
+            }
+        }
+        event_tag_free(tags_e);
+    }
+    
+    char **tags_p = event_tag_get(event, "p");
+    if (tags_p) {
+        for (size_t i = 0; tags_p[i]; i++) {
+            if (*indexed_tags_count < 64) {
+                indexed_tags[*indexed_tags_count].tag_name = "p";
+                indexed_tags[*indexed_tags_count].tag_value = tags_p[i];
+                indexed_tags[*indexed_tags_count].filter_index = 0;
+                (*indexed_tags_count)++;
+            }
+        }
+        event_tag_free(tags_p);
+    }
+    
+    char **tags_a = event_tag_get(event, "a");
+    if (tags_a) {
+        for (size_t i = 0; tags_a[i]; i++) {
+            if (*indexed_tags_count < 64) {
+                indexed_tags[*indexed_tags_count].tag_name = "a";
+                indexed_tags[*indexed_tags_count].tag_value = tags_a[i];
+                indexed_tags[*indexed_tags_count].filter_index = 0;
+                (*indexed_tags_count)++;
+            }
+        }
+        event_tag_free(tags_a);
+    }
 }
 
 static nip01_process_result_t nip01_replaceable_listener(const event_t *event, storage_context_t *storage) {
@@ -96,15 +136,14 @@ static nip01_process_result_t nip01_replaceable_listener(const event_t *event, s
         return result;
     }
     
-    if (!nip01_replace_event(event, storage)) {
-        nip01_process_result_t result = {0};
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg), "error: failed to replace event");
-        return result;
-    }
+    /* Extract indexed tags for tag index */
+    storage_tag_match_t indexed_tags[64];
+    size_t indexed_tags_count = 0;
+    nip01_extract_indexed_tags(event, indexed_tags, &indexed_tags_count);
     
-    /* Store the event and indicate it should be broadcast */
-    storage_insert_result_t insert_result = storage->insert_record(event, NULL, 0);
+    /* Use new atomic upsert for replaceable events */
+    storage_insert_result_t insert_result = storage_upsert_replaceable(event, indexed_tags, indexed_tags_count);
+    
     nip01_process_result_t result = {0};
     if (insert_result.result == STORAGE_OK || insert_result.result == STORAGE_DUPLICATE) {
         result.accepted = true;
@@ -122,36 +161,6 @@ static nip01_process_result_t nip01_replaceable_listener(const event_t *event, s
  * NIP-33 Addressable (Parameterized Replaceable) Events
  * ============================================================================ */
 
-static bool nip01_delete_addressable(const event_t *event, storage_context_t *storage, const char *identifier) {
-    storage_event_scope_t scope = {0};
-    char cursor[MAX_ID_SIZE + 1] = "";
-    bool more;
-    
-    if (!storage || !storage->delete_matching) return false;
-    scope.pubkey = event->pubkey;
-    scope.has_kind = true;
-    scope.kind = event->kind;
-    scope.has_created_at_before = true;
-    scope.created_at_before = event->created_at;
-    
-    do {
-        size_t deleted = 0;
-        char next_id[MAX_ID_SIZE + 1] = "";
-        scope.after_id = cursor[0] ? cursor : NULL;
-        if (!storage->delete_matching(&scope, tag_predicate_match_d_tag, (void *)identifier, &deleted, next_id, sizeof(next_id), &more)) return false;
-        (void)deleted;
-        snprintf(cursor, sizeof(cursor), "%s", next_id);
-    } while (more);
-    return true;
-}
-
-static bool nip01_replace_addressable_event(const event_t *event, storage_context_t *storage) {
-    char *dvalue = tag_find_value(event, "d");
-    bool replaced = nip01_delete_addressable(event, storage, dvalue);
-    free(dvalue);
-    return replaced;
-}
-
 static nip01_process_result_t nip01_addressable_listener(const event_t *event, storage_context_t *storage) {
     nip01_process_result_t result = {0};
     if (!storage) {
@@ -160,14 +169,23 @@ static nip01_process_result_t nip01_addressable_listener(const event_t *event, s
         return result;
     }
     
-    if (!nip01_replace_addressable_event(event, storage)) {
+    /* Extract d tag value */
+    char *dvalue = event_tag_value(event, "d");
+    if (!dvalue) {
         result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg), "error: failed to replace event");
+        snprintf(result.response_msg, sizeof(result.response_msg), "error: missing d tag");
         return result;
     }
     
-    /* Store the event and indicate it should be broadcast */
-    storage_insert_result_t insert_result = storage->insert_record(event, NULL, 0);
+    /* Extract indexed tags for tag index */
+    storage_tag_match_t indexed_tags[64];
+    size_t indexed_tags_count = 0;
+    nip01_extract_indexed_tags(event, indexed_tags, &indexed_tags_count);
+    
+    /* Use new atomic upsert for addressable events */
+    storage_insert_result_t insert_result = storage_upsert_addressable(event, dvalue, indexed_tags, indexed_tags_count);
+    free(dvalue);
+    
     result.accepted = true;
     result.should_store = true;
     result.should_broadcast = true;

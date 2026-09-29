@@ -69,20 +69,63 @@ typedef void (*send_records_callback_t)(const char *json_event, void *userdata);
 /* Optional column-level narrowing for generic event walks. Tag interpretation
  * is deliberately left to the caller's synchronous predicate callback. */
 typedef struct {
+    /* Exact ID match (single) */
     const char *id;
     const char *after_id;
+
+    /* Multiple ID match (IN query) */
+    const char **ids;
+    size_t ids_count;
+
+    /* Exact author match (single) */
     const char *pubkey;
+
+    /* Multiple author match (IN query) */
+    const char **pubkeys;
+    size_t pubkeys_count;
+
+    /* Kind filter (single) */
     bool has_kind;
     int kind;
+
+    /* Multiple kind filter (IN query) */
+    int *kinds;
+    size_t kinds_count;
+
+    /* Timestamp range (strict upper bound, <) */
     bool has_created_at_before;
     time_t created_at_before;
+
+    /* Timestamp range (inclusive upper bound, <=) */
     bool has_created_at_at_or_before;
     time_t created_at_at_or_before;
+
+    /* Timestamp range (strict lower bound, >) */
     bool has_created_at_after;
     time_t created_at_after;
+
+    /* Timestamp range (inclusive lower bound, >=) */
+    bool has_created_at_at_or_after;
+    time_t created_at_at_or_after;
+
+    /* Excluded kind (NIP-62) */
     bool has_excluded_kind;
     int excluded_kind;
-    size_t limit; /* Maximum rows examined; zero uses the backend default. */
+
+    /* Multiple excluded kinds */
+    int *excluded_kinds;
+    size_t excluded_kinds_count;
+
+    /* Tag filter: match events having ALL of these tag name/value pairs (AND) */
+    const char **tag_names;
+    const char **tag_values;
+    size_t tag_count;
+
+    /* Result limit (0 = backend default) */
+    size_t limit;
+
+    /* Offset for pagination (0 = no offset) */
+    size_t offset;
 } storage_event_scope_t;
 
 /* Called synchronously with a borrowed event view. Return true to select the
@@ -237,6 +280,105 @@ typedef struct {
      * event, for use in the next insert_record call. Caller releases it with
      * free_tag_matches(). Storage stores only the supplied opaque pairs. */
 } storage_context_t;
+
+/* ============================================================================
+ * New Unified Storage API (per NOSTR_EVENT_STORAGE_SPEC.md)
+ * ============================================================================ */
+
+/* storage_count_result_t - Result of count operation */
+typedef struct {
+    storage_result_t result;
+    size_t count;
+    char error_message[256];
+} storage_count_result_t;
+
+/* storage_transaction_t - Opaque transaction handle */
+typedef struct storage_transaction_t storage_transaction_t;
+
+/* storage_find_events - Find events matching scope
+ *
+ * Args:
+ *   scope - selection scope (NULL = no filter, subject to backend safety)
+ *   out_events - receives caller-owned array of caller-owned event_t*
+ *   out_count - receives number of returned events
+ *
+ * Returns: true on success (including zero matches), false on database error
+ *
+ * Contract:
+ *   - Zero matches = success with count 0
+ *   - Ordering: ORDER BY created_at DESC, id DESC
+ *   - limit == 0 means no limit
+ *   - offset skips first N matching events
+ *   - Caller releases: event_free() each event, free() the array
+ */
+bool storage_find_events(const storage_event_scope_t *scope,
+                         event_t ***out_events, size_t *out_count);
+
+/* storage_count_events - Count events matching scope
+ *
+ * Args:
+ *   scope - selection scope (same semantics as storage_find_events)
+ *   out_count - receives total matching count
+ *
+ * Returns: true on success (including zero matches), false on database error
+ *
+ * Contract:
+ *   - Same scope semantics as storage_find_events
+ *   - Returns total matching count without materializing events
+ *   - Zero matches = success with *out_count == 0
+ *   - Ignores limit and offset
+ */
+bool storage_count_events(const storage_event_scope_t *scope,
+                          size_t *out_count);
+
+/* storage_delete_events - Delete events matching scope
+ *
+ * Args:
+ *   scope - selection scope (same semantics as storage_find_events)
+ *   out_deleted - receives number of deleted rows (may be NULL)
+ *
+ * Returns: true on success (including zero matches), false on database error
+ *
+ * Contract:
+ *   - Same scope semantics as storage_find_events
+ *   - Zero matches = success with *out_deleted == 0
+ *   - Atomic from storage call perspective
+ *   - limit controls maximum deleted rows (symmetry with find)
+ *   - offset skips first N matching events before deleting
+ */
+bool storage_delete_events(const storage_event_scope_t *scope,
+                           size_t *out_deleted);
+
+/* Transaction API */
+storage_transaction_t *storage_transaction_begin(void);
+bool storage_transaction_commit(storage_transaction_t *tx);
+void storage_transaction_rollback(storage_transaction_t *tx);
+
+bool storage_delete_events_tx(const storage_event_scope_t *scope,
+                              storage_transaction_t *tx, size_t *out_deleted);
+bool storage_find_events_tx(const storage_event_scope_t *scope,
+                            storage_transaction_t *tx,
+                            event_t ***out_events, size_t *out_count);
+
+/* Replaceable event upsert (atomic delete-older-then-insert) */
+storage_insert_result_t storage_upsert_replaceable(const event_t *ev,
+                                                    const storage_tag_match_t *indexed_tags,
+                                                    size_t indexed_tags_count);
+
+/* Addressable event upsert (atomic delete-older-then-insert) */
+storage_insert_result_t storage_upsert_addressable(const event_t *ev,
+                                                     const char *d_tag_value,
+                                                     const storage_tag_match_t *indexed_tags,
+                                                     size_t indexed_tags_count);
+
+/* Compound tag index lookup (AND of multiple tag name/value pairs) */
+bool storage_find_ids_by_tags(const char *const *tag_names,
+                              const char *const *tag_values,
+                              size_t tag_count,
+                              char ***ids_out, size_t *count_out);
+
+/* Free ID list from storage_find_ids_by_tag or storage_find_ids_by_tags */
+void storage_free_id_list(char **ids, size_t count);
 
 /* ============================================================================
  * Backend Initialization

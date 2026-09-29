@@ -824,7 +824,7 @@ static bool validate_event_tags(struct mg_str tags) {
         size_t element_offset = 0;
         size_t element_count = 0;
         if (key.buf != NULL || ++tag_count > 100 || tag.len < 2 || tag.buf[0] != '[') return false;
-        /* Per-tag element cap must match event_find_tag() in event_util.c: its
+        /* Per-tag element cap must match tag_find() in tag_iter.c: its
          * scanner aborts (returning NULL) beyond MAX_TAG_ELEMENTS elements,
          * which used to silently skip delegation-tag verification while the
          * mongoose-based tag lookups still honored the tag. Keep both

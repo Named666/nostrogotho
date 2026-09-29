@@ -2,7 +2,8 @@
 #include "nostrogotho.h"
 #include "storage.h"
 #include "json_util.h"
-#include "model/event_util.h"
+#include "model/tag_iter.h"
+#include "model/event_tags.h"
 #include "nips/nip_capability.h"
 #include "protocol/protocol.h"
 #include <mongoose.h>
@@ -10,6 +11,243 @@
 #include <string.h>
 
 /* mg_str_contains() is shared from json_util.h. */
+
+/* Forward declaration */
+struct query_context;
+
+/* ============================================================================
+ * New Query Implementation using Unified Storage API (NOSTR_EVENT_STORAGE_SPEC.md)
+ * ============================================================================ */
+
+/* Convert filter_t to storage_event_scope_t */
+static void filter_to_scope(const filter_t *filter, storage_event_scope_t *scope) {
+    memset(scope, 0, sizeof(*scope));
+    
+    if (filter->ids_count > 0) {
+        scope->ids = (const char **)filter->ids;
+        scope->ids_count = filter->ids_count;
+    }
+    if (filter->authors_count > 0) {
+        scope->pubkeys = (const char **)filter->authors;
+        scope->pubkeys_count = filter->authors_count;
+    }
+    if (filter->kinds_count > 0) {
+        scope->kinds = filter->kinds;
+        scope->kinds_count = filter->kinds_count;
+    }
+    
+    /* Tag filters: convert #e, #p, #a tags to tag_names/tag_values arrays */
+    if (filter->tags_count > 0) {
+        /* Count total tag values across all tags */
+        size_t total_values = 0;
+        for (size_t i = 0; i < filter->tags_count; i++) {
+            total_values += filter->tags[i].count - 1;  /* -1 for tag name */
+        }
+        
+        if (total_values > 0) {
+            scope->tag_names = (const char **)malloc(total_values * sizeof(char *));
+            scope->tag_values = (const char **)malloc(total_values * sizeof(char *));
+            if (scope->tag_names && scope->tag_values) {
+                size_t idx = 0;
+                for (size_t i = 0; i < filter->tags_count; i++) {
+                    const tag_t *tag = &filter->tags[i];
+                    for (size_t v = 1; v < tag->count; v++) {
+                        scope->tag_names[idx] = tag->elements[0];
+                        scope->tag_values[idx] = tag->elements[v];
+                        idx++;
+                    }
+                }
+                scope->tag_count = total_values;
+            }
+        }
+    }
+    
+    if (filter->since > 0) {
+        scope->has_created_at_at_or_after = true;
+        scope->created_at_at_or_after = filter->since;
+    }
+    if (filter->until > 0) {
+        scope->has_created_at_at_or_before = true;
+        scope->created_at_at_or_before = filter->until;
+    }
+    
+    if (filter->limit > 0) {
+        scope->limit = filter->limit;
+    }
+    
+    /* Note: search filter not yet supported in new scope API */
+}
+
+static void free_scope_tags(storage_event_scope_t *scope) {
+    if (scope->tag_names) {
+        free((void *)scope->tag_names);
+        scope->tag_names = NULL;
+    }
+    if (scope->tag_values) {
+        free((void *)scope->tag_values);
+        scope->tag_values = NULL;
+    }
+    scope->tag_count = 0;
+}
+
+/* Query context structure - forward declared above */
+struct query_context {
+    struct mg_connection *connection;
+    const char *sub;
+    const filter_t *query_filters;
+    size_t query_filters_count;
+    bool do_count;
+    void (*send_json)(struct mg_connection *, const char *);
+    bool (*can_deliver)(const event_t *, connection_id_t, void *);
+    void *can_deliver_ctx;
+    char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx);
+    char *(*build_count)(const char *sub, unsigned long count, void *ctx);
+    bool (*needs_auth_hint)(const filter_t *, size_t, connection_id_t, void *);
+    void (*send_auth_challenge)(connection_id_t, void *);
+    void *protocol_response_ctx;
+    bool has_more;
+    int total_count;
+    connection_id_t connection_id;
+};
+
+/* Query using new unified storage API */
+static bool query_with_new_api(subscription_manager_t *manager,
+                               storage_context_t *storage,
+                               struct mg_connection *connection,
+                               const char *sub,
+                               filter_t *filters,
+                               size_t filters_count,
+                               bool do_count,
+                               void (*send_json)(struct mg_connection *, const char *),
+                               bool (*can_deliver)(const event_t *, connection_id_t, void *),
+                               void *can_deliver_ctx,
+                               char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx),
+                               char *(*build_count)(const char *sub, unsigned long count, void *ctx),
+                               bool (*needs_auth_hint)(const filter_t *filters,
+                                                       size_t filters_count,
+                                                       connection_id_t connection_id,
+                                                       void *ctx),
+                               void (*send_auth_challenge)(connection_id_t connection_id,
+                                                           void *ctx),
+                               void *protocol_response_ctx) {
+    if (!manager || !storage || !connection || !sub || !filters || filters_count == 0 || !send_json) return false;
+
+    /* Resolve the connection ID from the live session */
+    connection_session_t *session = connection_session_get_by_mg_connection(connection);
+    connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
+
+    bool success = true;
+    size_t total_count = 0;
+    bool has_more = false;
+
+    if (do_count) {
+        /* COUNT: sum counts from each filter (OR semantics) */
+        for (size_t f = 0; f < filters_count; f++) {
+            storage_event_scope_t scope = {0};
+            filter_to_scope(&filters[f], &scope);
+            
+            size_t count = 0;
+            if (storage_count_events(&scope, &count)) {
+                total_count += count;
+            }
+            free_scope_tags(&scope);
+        }
+    } else {
+        /* REQ: find events for each filter (OR semantics) */
+        int limit = 500;
+        if (filters[0].limit > 0 && filters[0].limit < limit) limit = filters[0].limit;
+        
+        int sent_count = 0;
+        
+        for (size_t f = 0; f < filters_count && !has_more; f++) {
+            storage_event_scope_t scope = {0};
+            filter_to_scope(&filters[f], &scope);
+            
+            /* Fetch limit+1 to detect has_more */
+            scope.limit = limit + 1;
+            
+            event_t **events = NULL;
+            size_t count = 0;
+            if (storage_find_events(&scope, &events, &count)) {
+                for (size_t i = 0; i < count && !has_more; i++) {
+                    if (sent_count >= limit) {
+                        has_more = true;
+                        break;
+                    }
+                    
+                    /* Check delivery policy */
+                    bool allowed = true;
+                    if (can_deliver) {
+                        allowed = can_deliver(events[i], conn_id, can_deliver_ctx);
+                    }
+                    
+                    if (allowed) {
+                        /* Build JSON event and send */
+                        json_builder_t builder;
+                        json_builder_start(&builder);
+                        json_builder_append_string(&builder, "EVENT");
+                        json_builder_append_string(&builder, sub);
+                        json_serialize_event(events[i], &builder);
+                        send_json(connection, json_builder_finish(&builder));
+                        sent_count++;
+                    }
+                    event_free(events[i]);
+                }
+                free(events);
+            }
+            free_scope_tags(&scope);
+        }
+        has_more = has_more;
+        total_count = sent_count;
+    }
+
+    if (!success) {
+        return false;
+    }
+
+    /* Send EOSE for REQ or COUNT response for COUNT */
+    if (!do_count) {
+        bool auth_hint = false;
+        if (needs_auth_hint) {
+            auth_hint = needs_auth_hint(filters, filters_count,
+                                        conn_id,
+                                        protocol_response_ctx);
+            if (auth_hint && send_auth_challenge) {
+                send_auth_challenge(conn_id,
+                                    protocol_response_ctx);
+            }
+        }
+        if (build_eose) {
+            char *eose = build_eose(sub, has_more, auth_hint, protocol_response_ctx);
+            if (eose) {
+                send_json(connection, eose);
+                free(eose);
+            }
+        } else {
+            char *eose = protocol_serialize_eose(sub, has_more, auth_hint);
+            if (eose) {
+                send_json(connection, eose);
+                free(eose);
+            }
+        }
+    } else {
+        if (build_count) {
+            char *count_resp = build_count(sub, (unsigned long)total_count, protocol_response_ctx);
+            if (count_resp) {
+                send_json(connection, count_resp);
+                free(count_resp);
+            }
+        } else {
+            char *count_resp = protocol_serialize_count(sub, (unsigned long)total_count);
+            if (count_resp) {
+                send_json(connection, count_resp);
+                free(count_resp);
+            }
+        }
+    }
+
+    return true;
+}
 
 /* ============================================================================
  * SUBSCRIPTION_MANAGER.C - Subscription Lifecycle Implementation
@@ -190,7 +428,7 @@ static bool matches_filter(const filter_t *filter, const event_t *event) {
         bool matched = false;
         tag_t *tag = &filter->tags[i];
         for (size_t j = 1; j < tag->count; j++) {
-            if (event_has_tag(event, tag->elements[0], tag->elements[j])) {
+            if (event_tag_has_value(event, tag->elements[0], tag->elements[j])) {
                 matched = true;
                 break;
             }
@@ -233,25 +471,6 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
         }
     }
 }
-
-struct query_context {
-    struct mg_connection *connection;
-    const char *sub;
-    const filter_t *query_filters;
-    size_t query_filters_count;
-    bool do_count;
-    void (*send_json)(struct mg_connection *, const char *);
-    bool (*can_deliver)(const event_t *, connection_id_t, void *);
-    void *can_deliver_ctx;
-    char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx);
-    char *(*build_count)(const char *sub, unsigned long count, void *ctx);
-    bool (*needs_auth_hint)(const filter_t *, size_t, connection_id_t, void *);
-    void (*send_auth_challenge)(connection_id_t, void *);
-    void *protocol_response_ctx;
-    bool has_more;
-    int total_count;
-    connection_id_t connection_id;
-};
 
 /* Shared delivery pipeline for stored results: parse the stored
  * ["EVENT", sub, {...}] frame once, apply the same matcher and the same
@@ -312,88 +531,10 @@ bool subscription_manager_query(subscription_manager_t *manager,
                                 void (*send_auth_challenge)(connection_id_t connection_id,
                                                             void *ctx),
                                 void *protocol_response_ctx) {
-    if (!manager || !storage || !connection || !sub || !filters || filters_count == 0 || !send_json) return false;
-
-    /* Resolve the connection ID from the live session (works for REQ and
-     * for COUNT, which owns no subscription). */
-    connection_session_t *session = connection_session_get_by_mg_connection(connection);
-    connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
-
-    struct query_context ctx = {
-        .connection = connection,
-        .sub = sub,
-        .query_filters = filters,
-        .query_filters_count = filters_count,
-        .do_count = do_count,
-        .send_json = send_json,
-        .can_deliver = can_deliver,
-        .can_deliver_ctx = can_deliver_ctx,
-        .build_eose = build_eose,
-        .build_count = build_count,
-        .needs_auth_hint = needs_auth_hint,
-        .send_auth_challenge = send_auth_challenge,
-        .protocol_response_ctx = protocol_response_ctx,
-        .has_more = false,
-        .total_count = 0,
-        .connection_id = conn_id
-    };
-    
-    /* Use storage to query events */
-    bool success = storage->send_records(query_sender, sub, filters, filters_count,
-                                         do_count, &ctx.has_more, &ctx.total_count,
-                                         NULL, 0, &ctx);
-    
-    if (!success) {
-        return false;
-    }
-    
-    /* Send EOSE for REQ or COUNT response for COUNT */
-    if (!do_count) {
-        /* For REQ, send EOSE with completeness/auth hints. A fresh AUTH
-         * challenge goes out before EOSE when a provider requests it. */
-        bool auth_hint = false;
-        if (ctx.needs_auth_hint) {
-            auth_hint = ctx.needs_auth_hint(filters, filters_count,
-                                            ctx.connection_id,
-                                            ctx.protocol_response_ctx);
-            if (auth_hint && ctx.send_auth_challenge) {
-                ctx.send_auth_challenge(ctx.connection_id,
-                                        ctx.protocol_response_ctx);
-            }
-        }
-        if (ctx.build_eose) {
-            char *eose = ctx.build_eose(sub, ctx.has_more, auth_hint, ctx.protocol_response_ctx);
-            if (eose) {
-                ctx.send_json(connection, eose);
-                free(eose);
-            }
-        } else {
-            /* Fallback to default EOSE */
-            char *eose = protocol_serialize_eose(sub, ctx.has_more, auth_hint);
-            if (eose) {
-                ctx.send_json(connection, eose);
-                free(eose);
-            }
-        }
-    } else {
-        /* For COUNT, send COUNT response */
-        if (ctx.build_count) {
-            char *count_resp = ctx.build_count(sub, (unsigned long)ctx.total_count, ctx.protocol_response_ctx);
-            if (count_resp) {
-                ctx.send_json(connection, count_resp);
-                free(count_resp);
-            }
-        } else {
-            /* Fallback to default COUNT */
-            char *count_resp = protocol_serialize_count(sub, (unsigned long)ctx.total_count);
-            if (count_resp) {
-                ctx.send_json(connection, count_resp);
-                free(count_resp);
-            }
-        }
-    }
-    
-    return true;
+    return query_with_new_api(manager, storage, connection, sub, filters, filters_count,
+                              do_count, send_json, can_deliver, can_deliver_ctx,
+                              build_eose, build_count, needs_auth_hint,
+                              send_auth_challenge, protocol_response_ctx);
 }
 
 size_t subscription_manager_count_for_connection(subscription_manager_t *manager,

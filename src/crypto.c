@@ -2,7 +2,8 @@
 #ifndef NHR_DYNAMIC_MODULE
 #include "nips/nip_capability.h" /* nip26_check_delegation (NIP-26 lives in src/nips/nip26.c) */
 #endif
-#include "model/event_util.h"
+#include "model/tag_iter.h"
+#include "model/event_tags.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -466,8 +467,7 @@ bool check_event(const event_t *ev) {
     if (!ev->tags_json) {
         /* No tags, skip delegation check */
     } else {
-        size_t count = 0;
-        char **delegation_tag = event_find_tag(ev, "delegation", &count);
+        char **delegation_tag = event_tag_get(ev, "delegation");
         if (!delegation_tag) {
             /* Fail closed: an unparseable tags blob must not skip
              * delegation verification. Tags accepted by the parse-time
@@ -476,18 +476,18 @@ bool check_event(const event_t *ev) {
             return false;
         }
         
-        if (count >= 4) {
+        if (delegation_tag[1] && delegation_tag[2] && delegation_tag[3]) {
             const char *delegator_pubkey = delegation_tag[1];
             const char *conditions = delegation_tag[2];
             const char *delegation_sig = delegation_tag[3];
             
             if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
-                event_free_tag(delegation_tag);
+                event_tag_free(delegation_tag);
                 return false;
             }
         }
         
-        event_free_tag(delegation_tag);
+        event_tag_free(delegation_tag);
     }
     
     return true;

@@ -7,7 +7,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/tag_iter.h"
+#include "model/event_tags.h"
 #include "protocol/protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,7 +25,7 @@ static bool nip17_targets_gift_wraps(const filter_t *filter) {
 /* Enforce authenticated-recipient delivery for gift-wrap events. */
 static bool nip17_is_visible_to(const event_t *event, const char *authenticated_pubkey) {
     return (event->kind != 1059 && event->kind != 21059) ||
-           (authenticated_pubkey && tag_has(event, "p", authenticated_pubkey));
+           (authenticated_pubkey && event_tag_has_value(event, "p", authenticated_pubkey));
 }
 
 static bool nip17_delivery_policy_can_deliver(const event_t *event, uintptr_t connection_id, void *ctx);
