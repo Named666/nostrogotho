@@ -132,6 +132,8 @@ static bool query_with_new_api(subscription_manager_t *manager,
                                void *protocol_response_ctx) {
     if (!manager || !storage || !connection || !sub || !filters || filters_count == 0 || !send_json) return false;
 
+    fprintf(stderr, "[DEBUG] query_with_new_api: START sub=%s filters=%zu do_count=%d\n", sub, filters_count, do_count);
+
     /* Resolve the connection ID from the live session */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
@@ -169,6 +171,7 @@ static bool query_with_new_api(subscription_manager_t *manager,
             event_t **events = NULL;
             size_t count = 0;
             if (storage_find_events(&scope, &events, &count)) {
+                fprintf(stderr, "[DEBUG] query_with_new_api: filter[%zu] found %zu events\n", f, count);
                 for (size_t i = 0; i < count && !has_more; i++) {
                     if (sent_count >= limit) {
                         has_more = true;
@@ -202,6 +205,7 @@ static bool query_with_new_api(subscription_manager_t *manager,
     }
 
     if (!success) {
+        fprintf(stderr, "[DEBUG] query_with_new_api: FAILED\n");
         return false;
     }
 
@@ -245,6 +249,8 @@ static bool query_with_new_api(subscription_manager_t *manager,
             }
         }
     }
+
+    fprintf(stderr, "[DEBUG] query_with_new_api: END sub=%s sent=%zu has_more=%d\n", sub, total_count, has_more);
 
     return true;
 }
@@ -310,11 +316,16 @@ bool subscription_manager_create_subscription(subscription_manager_t *manager,
     if (strlen(id) > manager->max_subscription_id_length) return false;
     if (filters_count > manager->max_filters_per_subscription) return false;
     
+    fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: conn_id=%u sub=%s filters=%zu\n", 
+            (unsigned)connection_id, id, filters_count);
+    
     /* Count existing subscriptions for this connection */
     size_t count = 0;
     for (subscription_t *s = manager->subscriptions; s; s = s->next) {
         if (s->connection_id == connection_id) count++;
     }
+    fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: existing subscriptions for conn_id=%u: %zu\n", 
+            (unsigned)connection_id, count);
     if (count >= manager->max_subscriptions_per_connection) return false;
     
     /* Remove any existing subscription with same ID for this connection */
@@ -322,6 +333,8 @@ bool subscription_manager_create_subscription(subscription_manager_t *manager,
     while (*link) {
         subscription_t *sub = *link;
         if (sub->connection_id == connection_id && strcmp(sub->id, id) == 0) {
+            fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: removing existing sub=%s for conn_id=%u\n", 
+                    id, (unsigned)connection_id);
             *link = sub->next;
             for (size_t i = 0; i < sub->filters_count; i++) filter_release(&sub->filters[i]);
             free(sub->filters);
@@ -348,6 +361,9 @@ bool subscription_manager_create_subscription(subscription_manager_t *manager,
     subscription->next = manager->subscriptions;
     manager->subscriptions = subscription;
     
+    fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: created sub=%s for conn_id=%u (total now %zu)\n", 
+            id, (unsigned)connection_id, count + 1);
+    
     return true;
 }
 
@@ -355,6 +371,9 @@ void subscription_manager_close_subscription(subscription_manager_t *manager,
                                              connection_id_t connection_id,
                                              const char *id) {
     if (!manager || !connection_id || !id) return;
+    
+    fprintf(stderr, "[DEBUG] subscription_manager_close_subscription: conn_id=%u sub=%s\n", 
+            (unsigned)connection_id, id);
     
     subscription_t **link = &manager->subscriptions;
     while (*link) {
@@ -365,6 +384,8 @@ void subscription_manager_close_subscription(subscription_manager_t *manager,
             free(sub->filters);
             free(sub->id);
             free(sub);
+            fprintf(stderr, "[DEBUG] subscription_manager_close_subscription: removed sub=%s for conn_id=%u\n", 
+                    id, (unsigned)connection_id);
             break;
         } else {
             link = &sub->next;
@@ -376,7 +397,10 @@ void subscription_manager_remove_connection(subscription_manager_t *manager,
                                             connection_id_t connection_id) {
     if (!manager || !connection_id) return;
     
+    fprintf(stderr, "[DEBUG] subscription_manager_remove_connection: conn_id=%u\n", (unsigned)connection_id);
+    
     subscription_t **link = &manager->subscriptions;
+    size_t removed = 0;
     while (*link) {
         subscription_t *sub = *link;
         if (sub->connection_id == connection_id) {
@@ -385,10 +409,14 @@ void subscription_manager_remove_connection(subscription_manager_t *manager,
             free(sub->filters);
             free(sub->id);
             free(sub);
+            removed++;
         } else {
             link = &sub->next;
         }
     }
+    
+    fprintf(stderr, "[DEBUG] subscription_manager_remove_connection: removed %zu subscriptions for conn_id=%u\n", 
+            removed, (unsigned)connection_id);
 }
 
 static bool matches_filter(const filter_t *filter, const event_t *event) {
@@ -447,6 +475,10 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
                                             void (*send_event)(struct mg_connection *, const char *, const event_t *)) {
     if (!manager || !event || !send_event) return;
     
+    fprintf(stderr, "[DEBUG] subscription_manager_match_and_deliver: event kind=%d id=%.16s...\n", 
+            event->kind, event->id);
+    
+    size_t delivered = 0;
     for (subscription_t *sub = manager->subscriptions; sub; sub = sub->next) {
         bool matched = false;
         for (size_t i = 0; i < sub->filters_count; i++) {
@@ -465,11 +497,16 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
                 connection_session_t *session = connection_session_get(sub->connection_id);
                 struct mg_connection *conn = session ? connection_session_get_mg_connection(session) : NULL;
                 if (conn) {
+                    fprintf(stderr, "[DEBUG] subscription_manager_match_and_deliver: delivering to conn_id=%u sub=%s\n", 
+                            (unsigned)sub->connection_id, sub->id);
                     send_event(conn, sub->id, event);
+                    delivered++;
                 }
             }
         }
     }
+    
+    fprintf(stderr, "[DEBUG] subscription_manager_match_and_deliver: delivered to %zu connections\n", delivered);
 }
 
 /* Shared delivery pipeline for stored results: parse the stored
@@ -531,6 +568,8 @@ bool subscription_manager_query(subscription_manager_t *manager,
                                 void (*send_auth_challenge)(connection_id_t connection_id,
                                                             void *ctx),
                                 void *protocol_response_ctx) {
+    fprintf(stderr, "[DEBUG] subscription_manager_query: sub=%s filters=%zu do_count=%d\n", 
+            sub, filters_count, do_count);
     return query_with_new_api(manager, storage, connection, sub, filters, filters_count,
                               do_count, send_json, can_deliver, can_deliver_ctx,
                               build_eose, build_count, needs_auth_hint,

@@ -32,7 +32,7 @@ static void send_event_json(struct mg_connection *connection, const char *sub, c
 static void query_events(relay_t *relay, struct mg_connection *connection, const char *sub,
                           filter_t *filters, size_t count, bool do_count);
 static void handle_req(relay_t *relay, struct mg_connection *connection,
-                       const char *sub, filter_t *filters, size_t filter_count, bool do_count);
+                       protocol_message_t *proto_msg, bool do_count);
 static void handle_event(relay_t *relay, struct mg_connection *connection, const event_t *event);
 static void handle_message(relay_t *relay, struct mg_connection *connection, struct mg_ws_message *message);
 static void log_timestamp(void);
@@ -235,15 +235,21 @@ bool relay_process_ws_message(relay_t *relay, struct mg_connection *connection,
 void relay_on_connect(relay_t *relay, struct mg_connection *connection) {
     if (!relay || !connection) return;
     log_message(relay, connection, "client connected (websocket open)");
+    fprintf(stderr, "[DEBUG] relay_on_connect: connection=%p\n", (void*)connection);
     
     /* Sessions are owned by the connection_session module; the relay hands
      * out IDs from a range that never collides with "no session" (0). */
     connection_id_t conn_id = connection_session_create(relay->next_connection_id++, connection);
-    if (!conn_id) return;
+    fprintf(stderr, "[DEBUG] relay_on_connect: conn_id=%u next_connection_id=%u\n", conn_id, relay->next_connection_id);
+    if (!conn_id) {
+        fprintf(stderr, "[DEBUG] relay_on_connect: failed to create session\n");
+        return;
+    }
     
     /* Notify NIP capabilities */
     for (nip_capability_t *cap = relay->nip_registry->capabilities; cap; cap = cap->next) {
         if (cap->type == NIP_CAP_CONNECTION && cap->caps.connection.on_connect) {
+            fprintf(stderr, "[DEBUG] relay_on_connect: calling on_connect for cap\n");
             cap->caps.connection.on_connect(conn_id, cap->ctx);
         }
     }
@@ -252,6 +258,7 @@ void relay_on_connect(relay_t *relay, struct mg_connection *connection) {
 void relay_on_disconnect(relay_t *relay, struct mg_connection *connection) {
     if (!relay || !connection) return;
     log_message(relay, connection, "client disconnected");
+    fprintf(stderr, "[DEBUG] relay_on_disconnect: connection=%p\n", (void*)connection);
     
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
@@ -263,6 +270,7 @@ void relay_on_disconnect(relay_t *relay, struct mg_connection *connection) {
     if (conn_id) {
         for (nip_capability_t *cap = relay->nip_registry->capabilities; cap; cap = cap->next) {
             if (cap->type == NIP_CAP_CONNECTION && cap->caps.connection.on_disconnect) {
+                fprintf(stderr, "[DEBUG] relay_on_disconnect: calling on_disconnect for cap conn_id=%u\n", conn_id);
                 cap->caps.connection.on_disconnect(conn_id, cap->ctx);
             }
         }
@@ -270,6 +278,7 @@ void relay_on_disconnect(relay_t *relay, struct mg_connection *connection) {
     
     /* Destroy connection session */
     if (session) {
+        fprintf(stderr, "[DEBUG] relay_on_disconnect: destroying session conn_id=%u\n", conn_id);
         connection_session_destroy(session);
     }
 }
@@ -336,7 +345,11 @@ static void remove_subscriptions(relay_t *relay, struct mg_connection *connectio
 static bool plugins_accept_publish(relay_t *relay, connection_id_t connection_id,
                                    const event_t *event, char *reason, size_t reason_size) {
     (void)relay;
-    return nip_composition_check_publication(relay->nip_registry, connection_id, event, reason, reason_size);
+    log_message(relay, NULL, "plugins_accept_publish: conn_id=%u event_kind=%d event_id=%.*s", 
+                connection_id, event->kind, (int)sizeof(event->id), event->id);
+    bool result = nip_composition_check_publication(relay->nip_registry, connection_id, event, reason, reason_size);
+    log_message(relay, NULL, "plugins_accept_publish: result=%s reason=%s", result ? "accept" : "reject", reason);
+    return result;
 }
 
 
@@ -349,6 +362,7 @@ static bool relay_can_deliver(const event_t *event, connection_id_t connection_i
 
 static void broadcast_event(relay_t *relay, const event_t *event) {
     if (!relay) return;
+    log_message(relay, NULL, "broadcast_event: kind=%d id=%.*s", event->kind, (int)sizeof(event->id), event->id);
     subscription_manager_match_and_deliver(relay->subscriptions, event,
         relay_can_deliver,
         relay->nip_registry,
@@ -391,6 +405,12 @@ static void send_query_json(struct mg_connection *connection, const char *json) 
 static void query_events(relay_t *relay, struct mg_connection *connection, const char *sub,
                           filter_t *filters, size_t count, bool do_count) {
     if (!relay) return;
+    log_message(relay, connection, "query_events: sub=%s filter_count=%zu do_count=%d", sub, count, do_count);
+    for (size_t i = 0; i < count; i++) {
+        log_message(relay, connection, "  filter[%zu]: ids=%zu authors=%zu kinds=%zu since=%lld until=%lld limit=%d",
+                    i, filters[i].ids_count, filters[i].authors_count, filters[i].kinds_count,
+                    (long long)filters[i].since, (long long)filters[i].until, filters[i].limit);
+    }
 
     subscription_manager_query(relay->subscriptions, relay->storage, connection, sub, filters, count, do_count,
         send_query_json,
@@ -404,52 +424,69 @@ static void query_events(relay_t *relay, struct mg_connection *connection, const
 }
 
 static void handle_req(relay_t *relay, struct mg_connection *connection,
-                       const char *sub, filter_t *filters, size_t filter_count, bool do_count) {
+                        protocol_message_t *proto_msg, bool do_count) {
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
     
+    const char *sub = do_count ? proto_msg->payload.count.subscription_id : proto_msg->payload.req.subscription_id;
+    filter_t *filters = do_count ? proto_msg->payload.count.filters : proto_msg->payload.req.filters;
+    size_t filter_count = do_count ? proto_msg->payload.count.filters_count : proto_msg->payload.req.filters_count;
+    
+    log_message(relay, connection, "[OWNERSHIP] handle_req: ENTRY sub=%s filter_count=%zu do_count=%d conn_id=%u filters_ptr=%p", 
+                sub, filter_count, do_count, conn_id, (void*)filters);
+    
     if (!sub || strlen(sub) > relay->config.max_subscription_id_length || filter_count == 0) {
+        log_message(relay, connection, "handle_req: invalid filter - sub=%s len=%zu filter_count=%zu", sub, sub ? strlen(sub) : 0, filter_count);
         char *closed = protocol_serialize_closed(sub, false, "error: invalid filter");
         if (closed) {
             transport_send_json(connection, closed);
             protocol_free_string(closed);
         }
-        if (!do_count) {
-            for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]);
-            free(filters);
-        }
+        /* DO NOT free filters here - protocol_message_free will handle it */
+        log_message(relay, connection, "[OWNERSHIP] handle_req: EXIT early (invalid filter), filters still owned by proto_msg");
         return;
     }
     
     if (!do_count) {
+        /* REQ: create subscription and query */
         size_t subscriptions_count = subscription_manager_count_for_connection(relay->subscriptions, conn_id);
         if (subscriptions_count >= relay->config.max_subscriptions_per_connection) {
-            for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]);
-            free(filters);
+            log_message(relay, connection, "handle_req: too many subscriptions (%zu >= %d)", subscriptions_count, relay->config.max_subscriptions_per_connection);
             char *closed = protocol_serialize_closed(sub, false, "error: too many subscriptions");
             if (closed) {
                 transport_send_json(connection, closed);
                 protocol_free_string(closed);
             }
+            /* DO NOT free filters - protocol_message_free will handle it */
+            log_message(relay, connection, "[OWNERSHIP] handle_req: EXIT early (too many subscriptions), filters still owned by proto_msg");
             return;
         }
+        log_message(relay, connection, "[OWNERSHIP] handle_req: calling subscription_manager_create_subscription, transferring filters ownership");
         if (!subscription_manager_create_subscription(relay->subscriptions, conn_id, sub, filters, filter_count)) {
-            for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]);
-            free(filters);
+            log_message(relay, connection, "handle_req: failed to create subscription");
             char *closed = protocol_serialize_closed(sub, false, "error: server unavailable");
             if (closed) {
                 transport_send_json(connection, closed);
                 protocol_free_string(closed);
             }
+            /* DO NOT free filters - protocol_message_free will handle it (ownership NOT transferred) */
+            log_message(relay, connection, "[OWNERSHIP] handle_req: EXIT early (create failed), filters still owned by proto_msg");
             return;
         }
+        /* Subscription created successfully - subscription manager now owns the filters.
+         * NULL out the filters in proto_msg so protocol_message_free doesn't double-free them. */
+        log_message(relay, connection, "[OWNERSHIP] handle_req: subscription created, NULLing proto_msg filters to transfer ownership");
+        proto_msg->payload.req.filters = NULL;
+        proto_msg->payload.req.filters_count = 0;
         query_events(relay, connection, sub, filters, filter_count, false);
     } else {
+        /* COUNT: query only, no subscription created. Filters remain owned by proto_msg.
+         * protocol_message_free will free them. */
+        log_message(relay, connection, "[OWNERSHIP] handle_req: COUNT query, filters borrowed (proto_msg retains ownership)");
         query_events(relay, connection, sub, filters, filter_count, true);
-        for (size_t i = 0; i < filter_count; i++) filter_release(&filters[i]);
-        free(filters);
     }
+    log_message(relay, connection, "[OWNERSHIP] handle_req: EXIT");
 }
 
 /* Validation stage of the EVENT pipeline: structure,
@@ -463,30 +500,39 @@ static void handle_req(relay_t *relay, struct mg_connection *connection,
  */
 static bool validate_event_for_publish(relay_t *relay, const event_t *event,
                                        char *reason, size_t reason_size) {
+    log_message(relay, NULL, "validate_event_for_publish: kind=%d id=%.*s pubkey=%.*s created_at=%lld",
+                event->kind, (int)sizeof(event->id), event->id,
+                (int)sizeof(event->pubkey), event->pubkey, (long long)event->created_at);
+    
     /* Check structure */
     if (!event) {
         snprintf(reason, reason_size, "event is null");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - event is null");
         return false;
     }
     
     if (!event->id[0] || !event->pubkey[0] || !event->sig[0]) {
         snprintf(reason, reason_size, "missing required fields");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - missing required fields");
         return false;
     }
     
     if (event->kind < 0) {
         snprintf(reason, reason_size, "invalid kind");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - invalid kind");
         return false;
     }
     
     if (event->created_at == 0) {
         snprintf(reason, reason_size, "invalid created_at");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - invalid created_at");
         return false;
     }
     
     size_t max_content = relay->config.max_event_content_length;
     if (max_content > 0 && event->content_len > max_content) {
         snprintf(reason, reason_size, "content too large");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - content too large (%zu > %zu)", event->content_len, max_content);
         return false;
     }
     
@@ -494,12 +540,14 @@ static bool validate_event_for_publish(relay_t *relay, const event_t *event,
     size_t serialized_size = json_serialized_event_size(event);
     if (serialized_size + 160 > 65536) {
         snprintf(reason, reason_size, "event serialization too large");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - event serialization too large (%zu)", serialized_size);
         return false;
     }
     
     /* Verify event ID */
     if (!check_event_id(event)) {
         snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - check_event_id failed");
         return false;
     }
     
@@ -507,12 +555,14 @@ static bool validate_event_for_publish(relay_t *relay, const event_t *event,
     size_t buffer_size = event_hash_input_size(event);
     if (buffer_size == 0) {
         snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - event_hash_input_size returned 0");
         return false;
     }
     
     char *buffer = (char *)malloc(buffer_size);
     if (!buffer) {
         snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - malloc failed for buffer");
         return false;
     }
     
@@ -520,6 +570,7 @@ static bool validate_event_for_publish(relay_t *relay, const event_t *event,
     if (len == 0) {
         free(buffer);
         snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - event_build_hash_input returned 0");
         return false;
     }
     
@@ -529,6 +580,7 @@ static bool validate_event_for_publish(relay_t *relay, const event_t *event,
     
     if (!signature_verify(event->sig, event->pubkey, digest)) {
         snprintf(reason, reason_size, "invalid: event id, signature or delegation is invalid");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - signature_verify failed");
         return false;
     }
     
@@ -537,69 +589,87 @@ static bool validate_event_for_publish(relay_t *relay, const event_t *event,
     if (relay->config.created_at_lower_limit > 0 && 
         event->created_at < now - relay->config.created_at_lower_limit) {
         snprintf(reason, reason_size, "invalid: created_at is out of the acceptable range");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - created_at too old (%lld < %lld)", (long long)event->created_at, (long long)(now - relay->config.created_at_lower_limit));
         return false;
     }
     
     if (relay->config.created_at_upper_limit > 0 && 
         event->created_at > now + relay->config.created_at_upper_limit) {
         snprintf(reason, reason_size, "invalid: created_at is out of the acceptable range");
+        log_message(relay, NULL, "validate_event_for_publish: FAIL - created_at too far in future (%lld > %lld)", (long long)event->created_at, (long long)(now + relay->config.created_at_upper_limit));
         return false;
     }
     
+    log_message(relay, NULL, "validate_event_for_publish: PASS");
     return true;
 }
 
 static void handle_event(relay_t *relay, struct mg_connection *connection, const event_t *event) {
-    event_t event_copy = *event;
+    /* Use the event directly - proto_msg owns the event data and will free it via protocol_message_free.
+     * Do NOT call event_release on a shallow copy as it causes double-free. */
+    const event_t *event_copy = event;
     char reject_reason[256] = {0};
     
-    log_message(relay, connection, "event kind=%d id=%.*s pubkey=%.*s created_at=%lld",
-                event_copy.kind, (int)sizeof(event_copy.id), event_copy.id,
-                (int)sizeof(event_copy.pubkey), event_copy.pubkey,
-                (long long)event_copy.created_at);
+    log_message(relay, connection, "handle_event: START kind=%d id=%.*s pubkey=%.*s created_at=%lld",
+                event_copy->kind, (int)sizeof(event_copy->id), event_copy->id,
+                (int)sizeof(event_copy->pubkey), event_copy->pubkey,
+                (long long)event_copy->created_at);
     
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
     
+    log_message(relay, connection, "handle_event: conn_id=%u", conn_id);
+    
     /* 1. Validate event FIRST (structure, ID, signature, delegation, timestamps, PoW)
      * Reject invalid events immediately without wasting compute on policy checks. */
-    if (!validate_event_for_publish(relay, &event_copy, reject_reason, sizeof(reject_reason))) {
-        char *ok = protocol_serialize_ok(event_copy.id, false, reject_reason);
+    log_message(relay, connection, "handle_event: step 1 - validate_event_for_publish");
+    if (!validate_event_for_publish(relay, event_copy, reject_reason, sizeof(reject_reason))) {
+        log_message(relay, connection, "handle_event: validation FAILED - %s", reject_reason);
+        char *ok = protocol_serialize_ok(event_copy->id, false, reject_reason);
         if (ok) {
             transport_send_json(connection, ok);
             protocol_free_string(ok);
         }
-        event_release(&event_copy);
+        /* DO NOT call event_release - proto_msg owns the event and will free it */
         return;
     }
+    log_message(relay, connection, "handle_event: step 1 - PASS");
     
     /* 2. Then check NIP publication policies (NIP-13 PoW, NIP-26 delegation, NIP-42 auth, etc.) */
-    if (!plugins_accept_publish(relay, conn_id, &event_copy, reject_reason, sizeof(reject_reason))) {
-        char *ok = protocol_serialize_ok(event_copy.id, false, reject_reason);
+    log_message(relay, connection, "handle_event: step 2 - plugins_accept_publish");
+    if (!plugins_accept_publish(relay, conn_id, event_copy, reject_reason, sizeof(reject_reason))) {
+        log_message(relay, connection, "handle_event: policy FAILED - %s", reject_reason);
+        char *ok = protocol_serialize_ok(event_copy->id, false, reject_reason);
         if (ok) {
             transport_send_json(connection, ok);
             protocol_free_string(ok);
         }
-        event_release(&event_copy);
+        /* DO NOT call event_release - proto_msg owns the event and will free it */
         return;
     }
+    log_message(relay, connection, "handle_event: step 2 - PASS");
     
     /* 3. Process via kind handler (NIP-01 replaceable/addressable, etc.) */
+    log_message(relay, connection, "handle_event: step 3 - nip_composition_process_kind");
     nip_kind_composition_result_t kind_result = nip_composition_process_kind(
-        relay->nip_registry, conn_id, &event_copy, relay->storage, relay->config.service_url);
+        relay->nip_registry, conn_id, event_copy, relay->storage, relay->config.service_url);
     
     nip01_process_result_t result;
     if (kind_result.any_handler_matched) {
         result = kind_result.result;
+        log_message(relay, connection, "handle_event: kind handler matched, accepted=%d broadcast=%d msg=%s",
+                    result.accepted, result.should_broadcast, result.response_msg);
     } else {
+        log_message(relay, connection, "handle_event: no kind handler, using default NIP-01");
         /* Default NIP-01 behavior for kinds without handlers */
-        if (event_copy.kind >= 20000 && event_copy.kind < 30000) {
+        if (event_copy->kind >= 20000 && event_copy->kind < 30000) {
             result.accepted = true;
             result.should_broadcast = true;
             result.response_msg[0] = '\0';
         } else {
-            storage_insert_result_t insert_result = relay->storage->insert_record(&event_copy, NULL, 0);
+            storage_insert_result_t insert_result = relay->storage->insert_record(event_copy, NULL, 0);
+            log_message(relay, connection, "handle_event: storage insert result=%d", insert_result.result);
             if (insert_result.result == STORAGE_OK) {
                 result.accepted = true;
                 result.should_broadcast = true;
@@ -614,19 +684,24 @@ static void handle_event(relay_t *relay, struct mg_connection *connection, const
                 snprintf(result.response_msg, sizeof(result.response_msg), "error: %s", insert_result.error_message);
             }
         }
+        log_message(relay, connection, "handle_event: default result accepted=%d broadcast=%d msg=%s",
+                    result.accepted, result.should_broadcast, result.response_msg);
     }
     
-    char *ok = protocol_serialize_ok(event_copy.id, result.accepted, result.response_msg);
+    log_message(relay, connection, "handle_event: sending OK response accepted=%d msg=%s", result.accepted, result.response_msg);
+    char *ok = protocol_serialize_ok(event_copy->id, result.accepted, result.response_msg);
     if (ok) {
         transport_send_json(connection, ok);
         protocol_free_string(ok);
     }
     
     if (result.accepted && result.should_broadcast) {
-        broadcast_event(relay, &event_copy);
+        log_message(relay, connection, "handle_event: broadcasting event");
+        broadcast_event(relay, event_copy);
     }
     
-    event_release(&event_copy);
+    log_message(relay, connection, "handle_event: END");
+    /* DO NOT call event_release - proto_msg owns the event and will free it via protocol_message_free */
 }
 
 static void handle_message(relay_t *relay, struct mg_connection *connection, struct mg_ws_message *message) {
@@ -635,15 +710,20 @@ static void handle_message(relay_t *relay, struct mg_connection *connection, str
     bool proto_valid;
     bool consumed = false;
 
+    log_message(relay, connection, "handle_message: START len=%zu data=%.100s", message->data.len, message->data.buf);
+
     /* Parse using the protocol parser with config limits */
     proto_valid = protocol_parse_client_message(message->data.buf, message->data.len,
                                                  &relay->config, &proto_msg, reject_reason, sizeof(reject_reason));
+
+    log_message(relay, connection, "handle_message: parse result=%d command=%d", proto_valid, proto_msg.command);
 
     /* Find connection ID */
     connection_session_t *session = connection_session_get_by_mg_connection(connection);
     connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
 
     if (!proto_valid) {
+        log_message(relay, connection, "handle_message: INVALID proto - %s", reject_reason);
         if (reject_reason[0]) {
             char *notice = protocol_serialize_notice(reject_reason);
             if (notice) {
@@ -657,29 +737,34 @@ static void handle_message(relay_t *relay, struct mg_connection *connection, str
     /* Offer to message intercept capabilities (e.g. NIP-42 AUTH) */
     for (nip_capability_t *cap = relay->nip_registry->capabilities; cap; cap = cap->next) {
         if (cap->type == NIP_CAP_MESSAGE_INTERCEPT && cap->caps.message_intercept.on_message) {
+            log_message(relay, connection, "handle_message: trying message interceptor");
             if (cap->caps.message_intercept.on_message(conn_id, &proto_msg, cap->ctx)) {
                 consumed = true;
+                log_message(relay, connection, "handle_message: message consumed by interceptor");
                 break;
             }
         }
     }
 
     if (!consumed) {
+        log_message(relay, connection, "handle_message: dispatching command=%d", proto_msg.command);
         switch (proto_msg.command) {
             case PROTOCOL_CMD_REQ:
-                handle_req(relay, connection, proto_msg.payload.req.subscription_id,
-                           proto_msg.payload.req.filters, proto_msg.payload.req.filters_count, false);
+                log_message(relay, connection, "handle_message: dispatching REQ sub=%s", proto_msg.payload.req.subscription_id);
+                handle_req(relay, connection, &proto_msg, false);
                 break;
             case PROTOCOL_CMD_COUNT:
-                handle_req(relay, connection, proto_msg.payload.count.subscription_id,
-                           proto_msg.payload.count.filters, proto_msg.payload.count.filters_count, true);
+                log_message(relay, connection, "handle_message: dispatching COUNT sub=%s", proto_msg.payload.count.subscription_id);
+                handle_req(relay, connection, &proto_msg, true);
                 break;
             case PROTOCOL_CMD_CLOSE:
+                log_message(relay, connection, "handle_message: dispatching CLOSE sub=%s", proto_msg.payload.close.subscription_id);
                 if (proto_msg.payload.close.subscription_id) {
                     remove_subscriptions(relay, connection, proto_msg.payload.close.subscription_id);
                 }
                 break;
             case PROTOCOL_CMD_EVENT:
+                log_message(relay, connection, "handle_message: dispatching EVENT");
                 handle_event(relay, connection, &proto_msg.payload.event.event);
                 break;
             case PROTOCOL_CMD_AUTH:
@@ -687,6 +772,7 @@ static void handle_message(relay_t *relay, struct mg_connection *connection, str
                  * the challenge flow and answers OK itself). Reaching here
                  * means no capability consumed it: malformed AUTH or no AUTH
                  * provider in this module generation. */
+                log_message(relay, connection, "handle_message: AUTH not consumed by interceptor, sending error");
                 {
                     char *notice = protocol_serialize_notice("error: invalid auth");
                     if (notice) {
@@ -696,6 +782,7 @@ static void handle_message(relay_t *relay, struct mg_connection *connection, str
                 }
                 break;
             default:
+                log_message(relay, connection, "handle_message: UNKNOWN command=%d", proto_msg.command);
                 {
                     char *notice = protocol_serialize_notice("error: invalid request");
                     if (notice) {
@@ -707,6 +794,7 @@ static void handle_message(relay_t *relay, struct mg_connection *connection, str
         }
     }
 
+    log_message(relay, connection, "handle_message: END");
     protocol_message_free(&proto_msg);
 }
 

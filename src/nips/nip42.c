@@ -163,11 +163,21 @@ bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *even
 #else
     valid_event = check_event(event);
 #endif
+    printf("[DEBUG] nip42_authenticate_by_id: connection_id=%lu event_kind=%d valid_event=%d\n", connection_id, event->kind, valid_event);
+    fflush(stdout);
     challenge = NIP42_SESS_CHALLENGE(connection_id);
+    printf("[DEBUG] nip42_authenticate_by_id: challenge=%s\n", challenge ? challenge : "NULL");
+    fflush(stdout);
     if (!challenge || !challenge[0] || event->kind != 22242 || !valid_event ||
         llabs((long long) now - (long long) event->created_at) > 600 ||
         !event_tag_has_value(event, "challenge", challenge) ||
-        !event_tag_has_value(event, "relay", service_url)) return false;
+        !event_tag_has_value(event, "relay", service_url)) {
+        printf("[DEBUG] nip42_authenticate_by_id: validation failed\n");
+        fflush(stdout);
+        return false;
+    }
+    printf("[DEBUG] nip42_authenticate_by_id: setting pubkey=%s\n", event->pubkey);
+    fflush(stdout);
     return NIP42_SESS_SET_PUBKEY(connection_id, event->pubkey);
 }
 
@@ -406,8 +416,12 @@ static bool nip42_message_intercept_fn(connection_id_t connection_id, const prot
     event = &msg->payload.auth.event;
     service_url = (cap_ctx && cap_ctx->service_url[0]) ? cap_ctx->service_url : "";
 
+    printf("[DEBUG] nip42_message_intercept_fn: connection_id=%lu event_id=%.16s kind=%d\n", connection_id, event->id, event->kind);
+    fflush(stdout);
     authenticated = nip42_authenticate_by_id(connection_id, event,
                                              service_url, time(NULL));
+    printf("[DEBUG] nip42_message_intercept_fn: authenticated=%d\n", authenticated);
+    fflush(stdout);
     /* NIP answers with OK; the relay owns framing, transport owns sending —
      * this helper only carries an opaque connection ID. */
     ok = protocol_serialize_ok(event->id, authenticated,

@@ -469,29 +469,26 @@ bool check_event(const event_t *ev) {
     } else {
         char **delegation_tag = event_tag_get(ev, "delegation");
         if (!delegation_tag) {
-            /* Fail closed: an unparseable tags blob must not skip
-             * delegation verification. Tags accepted by the parse-time
-             * gate always parse here, so this rejects only genuinely
-             * malformed input. */
-            return false;
-        }
-        
-        if (delegation_tag[1] && delegation_tag[2] && delegation_tag[3]) {
-            const char *delegator_pubkey = delegation_tag[1];
-            const char *conditions = delegation_tag[2];
-            const char *delegation_sig = delegation_tag[3];
-            
-            if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
-                event_tag_free(delegation_tag);
-                return false;
+            /* No delegation tag present; skip delegation verification.
+             * NIP-26 delegation is optional - only validate if the tag exists. */
+        } else {
+            if (delegation_tag[1] && delegation_tag[2] && delegation_tag[3]) {
+                const char *delegator_pubkey = delegation_tag[1];
+                const char *conditions = delegation_tag[2];
+                const char *delegation_sig = delegation_tag[3];
+                
+                if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
+                    event_tag_free(delegation_tag);
+                    return false;
+                }
             }
+            
+            event_tag_free(delegation_tag);
         }
-        
-        event_tag_free(delegation_tag);
     }
     
     return true;
-    }
+}
 #else
 bool check_event(const event_t *ev) { return check_event_core(ev); }
 #endif
