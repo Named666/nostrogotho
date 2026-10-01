@@ -129,6 +129,7 @@ nip_kind_composition_result_t nip_composition_process_kind(nip_registry_t *regis
                                                             storage_context_t *storage,
                                                             const char *relay_url) {
     nip_kind_composition_result_t result = {0};
+    bool saw_reject = false;
     result.result.accepted = false;
     result.result.should_broadcast = false;
     result.result.should_store = false;
@@ -140,12 +141,16 @@ nip_kind_composition_result_t nip_composition_process_kind(nip_registry_t *regis
                 result.any_handler_matched = true;
                 nip01_process_result_t r = cap->caps.kind_handler.process_event(connection_id, event, storage, relay_url, cap->ctx);
                 
-                /* Composition: if any handler rejects, reject. If any accepts, accept.
-                 * Broadcast if any handler says broadcast. */
+                /* Composition: accepted is the AND of all matched handlers --
+                 * any rejection wins regardless of registration order (a later
+                 * accept must not flip a prior reject back to true). The
+                 * rejecting handler's message wins; broadcast/store stay OR
+                 * (the relay only acts on them when accepted is true). */
                 if (!r.accepted) {
                     result.result.accepted = false;
+                    saw_reject = true;
                     strncpy(result.result.response_msg, r.response_msg, sizeof(result.result.response_msg) - 1);
-                } else if (!result.result.accepted) {
+                } else if (!saw_reject && !result.result.accepted) {
                     result.result.accepted = true;
                 }
                 if (r.should_broadcast) result.result.should_broadcast = true;

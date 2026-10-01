@@ -472,10 +472,11 @@ bool check_event(const event_t *ev) {
             /* No delegation tag present; skip delegation verification.
              * NIP-26 delegation is optional - only validate if the tag exists. */
         } else {
-            if (delegation_tag[1] && delegation_tag[2] && delegation_tag[3]) {
-                const char *delegator_pubkey = delegation_tag[1];
-                const char *conditions = delegation_tag[2];
-                const char *delegation_sig = delegation_tag[3];
+            /* event_tag_get returns tag[1..]: [delegator, conditions, sig]. */
+            if (delegation_tag[0] && delegation_tag[1] && delegation_tag[2]) {
+                const char *delegator_pubkey = delegation_tag[0];
+                const char *conditions = delegation_tag[1];
+                const char *delegation_sig = delegation_tag[2];
                 
                 if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
                     event_tag_free(delegation_tag);
@@ -554,10 +555,14 @@ bool check_signature(const event_t *ev) {
 
 size_t json_escape(const char *src, char *dst, size_t dst_size) {
     if (!src || !dst || dst_size == 0) return 0;
-    
+
     size_t out_pos = 0;
-    
-    for (const char *p = src; *p && out_pos < dst_size - 1; p++) {
+    const char *p = src;
+
+    /* Fail closed on truncation: every path below returns 0 instead of
+     * emitting a prefix. (The old loop bound silently stopped consuming
+     * input and returned success on a truncated string.) */
+    for (; *p; p++) {
         unsigned char c = (unsigned char)*p;
         const char *escape = NULL;
         size_t escape_len = 0;
@@ -589,6 +594,7 @@ size_t json_escape(const char *src, char *dst, size_t dst_size) {
             memcpy(dst + out_pos, escape, escape_len);
             out_pos += escape_len;
         } else {
+            if (out_pos + 1 >= dst_size) return 0;
             dst[out_pos++] = (char)c;
         }
     }
