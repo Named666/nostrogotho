@@ -6,12 +6,13 @@
   "type": "module",
   "scripts": {
     "test": "node test_integration.js",
-    "test:all": "node test_auth.js && node test_nip13.js && node test_integration.js",
+    "test:all": "node test_auth.js && node test_nip13.js && node test_integration.js && node test_hotreload_integration.js && node test_ws.js && node test_ws2.js && node test_hotreload_ws.js",
     "test:auth": "node test_auth.js",
     "test:nip13": "node test_nip13.js",
     "test:ws": "node test_ws.js",
     "test:ws2": "node test_ws2.js",
     "test:hotreload": "node test_hotreload_integration.js",
+    "test:hotreload-ws": "node test_hotreload_ws.js",
     "test:smoke": "node hotreload_live_smoke.js"
   },
   "dependencies": {

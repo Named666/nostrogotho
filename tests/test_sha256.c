@@ -31,17 +31,23 @@ int main(void) {
     printf("56-byte msg:   %s\n", hex);
     assert(strcmp(hex, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1") == 0);
 
-    /* Vector 4: multi-block update path (million 'a', 1,000,000 bytes).
-     * Checks the streaming loop in sha256_update. */
-    sha256_ctx ctx;
-    sha256_init(&ctx);
-    char chunk[1000];
-    memset(chunk, 'a', sizeof(chunk));
-    for (int i = 0; i < 1000; i++) sha256_update(&ctx, (const uint8_t *)chunk, sizeof(chunk));
-    sha256_final(&ctx, digest);
-    hexdump32(digest, hex);
-    printf("1M x 'a':      %s\n", hex);
-    assert(strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0") == 0);
+    /* Vector 4: multi-block large input (million 'a', 1,000,000 bytes).
+     * Exercises multi-block padding through the public one-shot API
+     * (the old version used the non-Windows-internal streaming API). */
+    {
+        static char chunk[1000];
+        uint8_t *mega;
+        size_t i;
+        memset(chunk, 'a', sizeof(chunk));
+        mega = (uint8_t *)malloc(1000000);
+        assert(mega != NULL);
+        for (i = 0; i < 1000; i++) memcpy(mega + i * 1000, chunk, sizeof(chunk));
+        sha256(mega, 1000000, digest);
+        free(mega);
+        hexdump32(digest, hex);
+        printf("1M x 'a':      %s\n", hex);
+        assert(strcmp(hex, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0") == 0);
+    }
 
     printf("ALL SHA-256 VECTORS PASSED\n");
     return 0;

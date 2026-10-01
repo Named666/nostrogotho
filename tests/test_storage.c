@@ -3,48 +3,49 @@
 #include <string.h>
 #include "storage.h"
 
+static int g_pass = 0;
+static int g_fail = 0;
+
+#define CHECK(cond, pass_label, fail_label)                                    \
+    do {                                                                       \
+        if (cond) {                                                            \
+            g_pass++;                                                          \
+            printf("PASS: %s\n", pass_label);                                  \
+        } else {                                                               \
+            g_fail++;                                                          \
+            printf("FAIL: %s\n", fail_label);                                  \
+        }                                                                      \
+    } while (0)
+
 /* Test escape_like with normal input */
 void test_escape_like_normal() {
     char *result = escape_like("hello world", 11);
-    if (result && strcmp(result, "hello world") == 0) {
-        printf("PASS: escape_like normal input\n");
-    } else {
-        printf("FAIL: escape_like normal input\n");
-    }
+    CHECK(result && strcmp(result, "hello world") == 0,
+          "escape_like normal input", "escape_like normal input");
     free(result);
 }
 
 /* Test escape_like with special characters */
 void test_escape_like_special() {
     char *result = escape_like("100%+50%", 8);
-    if (result && strcmp(result, "100\\%+50\\%") == 0) {
-        printf("PASS: escape_like special chars\n");
-    } else {
-        printf("FAIL: escape_like special chars (got: %s)\n", result ? result : "(null)");
-    }
+    CHECK(result && strcmp(result, "100\\%+50\\%") == 0,
+          "escape_like special chars", "escape_like special chars");
     free(result);
 }
 
 /* Test escape_like with NULL */
 void test_escape_like_null() {
     char *result = escape_like(NULL, 0);
-    if (result == NULL) {
-        printf("PASS: escape_like NULL input\n");
-    } else {
-        printf("FAIL: escape_like NULL input\n");
-        free(result);
-    }
+    CHECK(result == NULL, "escape_like NULL input", "escape_like NULL input");
+    free(result);
 }
 
 /* Test escape_like with large input (should be capped) */
 void test_escape_like_large() {
     char *result = escape_like("test", 2000000);  /* > 1MB */
-    if (result == NULL) {
-        printf("PASS: escape_like large input capped\n");
-    } else {
-        printf("FAIL: escape_like large input should be NULL\n");
-        free(result);
-    }
+    CHECK(result == NULL, "escape_like large input capped",
+          "escape_like large input should be NULL");
+    free(result);
 }
 
 /* Test get_event_by_id memory management */
@@ -61,9 +62,9 @@ void test_filter_free_no_double_free() {
         f->ids = (char **)malloc(sizeof(char *));
         f->ids[0] = strdup("test");
         filter_free(f);
-        printf("PASS: filter_free succeeds\n");
+        CHECK(1, "filter_free succeeds", "filter_free succeeds");
     } else {
-        printf("FAIL: filter_alloc returned NULL\n");
+        CHECK(0, "filter_free succeeds", "filter_alloc returned NULL");
     }
 }
 
@@ -75,6 +76,6 @@ int main(void) {
     test_escape_like_large();
     test_get_event_by_id_memory();
     test_filter_free_no_double_free();
-    printf("Storage tests complete.\n");
-    return 0;
+    printf("storage: %d passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
 }

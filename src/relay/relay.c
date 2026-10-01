@@ -1,6 +1,7 @@
 #include "relay/relay.h"
 #include "transport/server.h"
 #include "nips/nip_capability.h"
+#include "nips/nip_composition_policy.h"
 #include "crypto.h"
 #include "json_util.h"
 #include "nostrogotho.h"
@@ -27,6 +28,10 @@
 
 /* struct relay is defined in relay.h (single owner; transport/server.c needs
  * relay->manager). Do not duplicate it here. */
+
+/* Static pointer to current relay config — set in relay_create, cleared in
+ * relay_destroy. Safe for hot-reload: host owns relay, module is swapped. */
+static const relay_composition_config_t *g_relay_composition = NULL;
 
 /* Forward declarations. Publication policy has a single path:
  * nip_composition_check_publication (the plugins_accept_publish wrapper was
@@ -103,6 +108,7 @@ relay_t *relay_create(const relay_config_t *config, storage_context_t *storage) 
     
     relay->config = *config;
     relay->storage = storage;
+    g_relay_composition = &config->composition;
     /* Clamp: main() validates, but relay_create is also called by tests and
      * embedders — never index the log level table out of range. */
     relay->verbosity = config->verbosity;
@@ -210,6 +216,7 @@ void relay_destroy(relay_t *relay) {
     subscription_manager_destroy(relay->subscriptions);
     nip_registry_destroy(relay->nip_registry);
     connection_session_cleanup_all();
+    g_relay_composition = NULL;
     free(relay);
 }
 
@@ -349,7 +356,7 @@ bool relay_handle_http(relay_t *relay, struct mg_connection *connection,
     if (accept && mg_str_contains(*accept, "application/nostr+json")) {
         /* Deterministic metadata composition: first non-NULL wins. HTTP
          * handling owns the response; the NIP only provides the payload. */
-        const char *doc = nip_composition_get_info_document(relay->nip_registry);
+        const char *doc = nip_composition_get_info_document_policy((const nip_composition_policy_t *)&relay->config.composition, relay->nip_registry);
         if (doc) {
             mg_http_reply(connection, 200,
                 "Content-Type: application/nostr+json\r\nAccess-Control-Allow-Origin: *\r\n",
@@ -406,7 +413,9 @@ static void remove_subscriptions(relay_t *relay, struct mg_connection *connectio
 /* Wrapper for delivery check that captures the registry */
 static bool relay_can_deliver(const event_t *event, connection_id_t connection_id, void *ctx) {
     nip_registry_t *registry = (nip_registry_t *)ctx;
-    return nip_composition_check_delivery(registry, event, connection_id);
+    /* Use policy-aware composition for delivery check */
+    if (!g_relay_composition) return true;
+    return nip_composition_check_delivery_policy((const nip_composition_policy_t *)g_relay_composition, registry, event, connection_id);
 }
 
 static void broadcast_event(relay_t *relay, const event_t *event) {
@@ -429,27 +438,32 @@ static void send_event_json(connection_id_t connection_id, const char *sub, cons
 /* Wrapper functions for protocol response builders that capture the registry
  * via the context parameter (passed by subscription_manager_query). */
 static char *relay_build_eose(const char *sub, bool has_more, bool auth_hint, void *ctx) {
-    return nip_composition_build_eose((nip_registry_t *)ctx, sub, has_more, auth_hint);
+    if (!g_relay_composition) return NULL;
+    return nip_composition_build_eose_policy((const nip_composition_policy_t *)g_relay_composition, (nip_registry_t *)ctx, sub, has_more, auth_hint);
 }
 
 static char *relay_build_count(const char *sub, unsigned long count, void *ctx) {
-    return nip_composition_build_count((nip_registry_t *)ctx, sub, count);
+    if (!g_relay_composition) return NULL;
+    return nip_composition_build_count_policy((const nip_composition_policy_t *)g_relay_composition, (nip_registry_t *)ctx, sub, count);
 }
 
 static bool relay_needs_auth_hint(const filter_t *filters, size_t count,
                                   connection_id_t conn_id, void *ctx) {
-    return nip_composition_needs_auth_hint((nip_registry_t *)ctx, filters, count, conn_id);
+    if (!g_relay_composition) return false;
+    return nip_composition_needs_auth_hint_policy((const nip_composition_policy_t *)g_relay_composition, (nip_registry_t *)ctx, filters, count, conn_id);
 }
 
 static void relay_send_auth_challenge(connection_id_t conn_id, void *ctx) {
-    nip_composition_send_auth_challenge((nip_registry_t *)ctx, conn_id);
+    if (!g_relay_composition) return;
+    nip_composition_send_auth_challenge_policy((const nip_composition_policy_t *)g_relay_composition, (nip_registry_t *)ctx, conn_id);
 }
 
 static bool relay_authorize_query(connection_id_t connection_id, filter_t *filters,
                                    size_t filters_count, char *reason, size_t reason_size,
                                    void *ctx) {
     nip_registry_t *registry = (nip_registry_t *)ctx;
-    return nip_composition_authorize_query(registry, connection_id, filters, filters_count, reason, reason_size);
+    if (!g_relay_composition) return true;
+    return nip_composition_authorize_query_policy((const nip_composition_policy_t *)g_relay_composition, registry, connection_id, filters, filters_count, reason, reason_size);
 }
 
 static void send_query_json(connection_id_t connection_id, const char *json) {
@@ -530,7 +544,7 @@ static void handle_req(relay_t *relay, struct mg_connection *connection,
             /* NIP-42 flow: client must have a stored challenge to act on
              * auth-required CLOSED. Refresh it before CLOSED. */
             if (strncmp(pre_reason, "auth-required:", 14) == 0) {
-                nip_composition_send_auth_challenge(relay->nip_registry, conn_id);
+                nip_composition_send_auth_challenge_policy((const nip_composition_policy_t *)&relay->config.composition, relay->nip_registry, conn_id);
             }
             char *closed = protocol_serialize_closed(
                 sub, false,
@@ -577,7 +591,7 @@ static void handle_req(relay_t *relay, struct mg_connection *connection,
              * subscription so live broadcasts cannot leak to it. */
             subscription_manager_close_subscription(relay->subscriptions, conn_id, sub);
             if (strncmp(reject_reason, "auth-required:", 14) == 0) {
-                nip_composition_send_auth_challenge(relay->nip_registry, conn_id);
+                nip_composition_send_auth_challenge_policy((const nip_composition_policy_t *)&relay->config.composition, relay->nip_registry, conn_id);
             }
             char *closed = protocol_serialize_closed(sub, false, reject_reason[0] ? reject_reason : "auth-required: authentication required");
             if (closed) {
@@ -592,7 +606,7 @@ static void handle_req(relay_t *relay, struct mg_connection *connection,
         char reject_reason[256] = {0};
         if (!query_events(relay, conn_id, sub, filters, filter_count, true, reject_reason, sizeof(reject_reason))) {
             if (strncmp(reject_reason, "auth-required:", 14) == 0) {
-                nip_composition_send_auth_challenge(relay->nip_registry, conn_id);
+                nip_composition_send_auth_challenge_policy((const nip_composition_policy_t *)&relay->config.composition, relay->nip_registry, conn_id);
             }
             char *closed = protocol_serialize_closed(sub, false, reject_reason[0] ? reject_reason : "auth-required: authentication required");
             if (closed) {
@@ -772,7 +786,7 @@ static void handle_event(relay_t *relay, struct mg_connection *connection, const
     log_event_debug(conn_id, event_borrowed->id, event_borrowed->kind, "CHECK_PUBLICATION",
                     "conn_id=%u event_kind=%d event_id=%.16s",
                     (unsigned)conn_id, event_borrowed->kind, event_borrowed->id);
-    if (!nip_composition_check_publication(relay->nip_registry, conn_id, event_borrowed, reject_reason, sizeof(reject_reason))) {
+    if (!nip_composition_check_publication_policy((const nip_composition_policy_t *)&relay->config.composition, relay->nip_registry, conn_id, event_borrowed, reject_reason, sizeof(reject_reason))) {
         log_conn_warn(conn_id, "HANDLE_EVENT", "policy FAILED - %s", reject_reason);
         char *ok = protocol_serialize_ok(event_borrowed->id, false, reject_reason);
         if (ok) {
@@ -787,7 +801,8 @@ static void handle_event(relay_t *relay, struct mg_connection *connection, const
     
     /* 3. Process via kind handler (NIP-01 replaceable/addressable, etc.) */
     log_conn_debug(conn_id, "HANDLE_EVENT", "step 3 - nip_composition_process_kind");
-    nip_kind_composition_result_t kind_result = nip_composition_process_kind(
+    nip_kind_composition_result_t kind_result = nip_composition_process_kind_policy(
+        (const nip_composition_policy_t *)&relay->config.composition,
         relay->nip_registry, conn_id, event_borrowed, relay->storage, relay->config.service_url);
     
     nip01_process_result_t result;
@@ -1026,7 +1041,7 @@ static void plugin_timer_fn(void *arg) {
     /* Shared delivery path: ALL maintenance handlers run (see composition
      * rules). Interval is fixed at startup; per-generation intervals are
      * honored on next reload via fresh timer registration. */
-    nip_composition_run_maintenance(relay->nip_registry, relay->storage);
+    nip_composition_run_maintenance_policy((const nip_composition_policy_t *)&relay->config.composition, relay->nip_registry, relay->storage);
 }
 
 /* NOTE: transport_send_json() is owned by transport/server.c (sole frame

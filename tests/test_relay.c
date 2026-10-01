@@ -6,6 +6,9 @@
 static storage_context_t storage_ctx = {0};
 
 static void fn(struct mg_connection *c, int ev, void *ev_data) {
+    (void)c;
+    (void)ev;
+    (void)ev_data;
     printf("Event: %d\n", ev);
 }
 
@@ -51,5 +54,10 @@ int main() {
     printf("mg_http_listen OK\n");
 
     mg_mgr_free(&relay->manager);
+    /* Don't leave the probe database behind. */
+    remove("./test_debug.sqlite");
+    remove("./test_debug.sqlite-shm");
+    remove("./test_debug.sqlite-wal");
+    remove("./test_debug.sqlite-journal");
     return 0;
 }

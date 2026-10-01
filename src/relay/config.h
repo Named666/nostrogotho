@@ -19,6 +19,29 @@
  * from file. NIPs read config read-only in lifecycle init.
  * ============================================================================ */
 
+/* Composition policy — mirrors nip_composition_policy_t layout so we can
+ * cast relay_config_t.composition to nip_composition_policy_t* safely. */
+typedef struct {
+    char publication_mode[16];      /* "and" | "or" */
+    bool publication_enabled;
+    char delivery_mode[16];         /* "and" | "or" */
+    bool delivery_enabled;
+    char kind_mode[16];             /* "all" */
+    bool kind_enabled;
+    char query_mode[16];            /* "and" | "or" */
+    bool query_enabled;
+    char protocol_response_mode[16]; /* "first" */
+    bool protocol_response_enabled;
+    char metadata_mode[16];          /* "first" */
+    bool metadata_enabled;
+    char auth_hint_mode[16];         /* "or" */
+    bool auth_hint_enabled;
+    char auth_challenge_mode[16];    /* "all" */
+    bool auth_challenge_enabled;
+    char maintenance_mode[16];       /* "all" */
+    bool maintenance_enabled;
+} relay_composition_config_t;
+
 /* Single authoritative configuration. Field names are canonical; NIP-11
  * renders them under its own wire-key names (see nip11_lifecycle_init).
  * No legacy aliases: every limit is set in relay_config_init and enforced
@@ -43,6 +66,8 @@ typedef struct {
     bool nip42_auth_required_for_write;
     bool hot_reload_enabled;
     char hot_reload_module_path[1024];
+    /* Composition policy (optional — config.json "composition.*") */
+    relay_composition_config_t composition;
     storage_context_t *storage;
 } relay_config_t;
 

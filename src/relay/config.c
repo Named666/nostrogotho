@@ -49,6 +49,25 @@ void relay_config_init(relay_config_t *config) {
     snprintf(config->hot_reload_module_path,
              sizeof(config->hot_reload_module_path), "%s",
              DEFAULT_MODULE_PATH);
+    /* Composition defaults (match nip_composition_policy defaults) */
+    snprintf(config->composition.publication_mode, sizeof(config->composition.publication_mode), "and");
+    config->composition.publication_enabled = true;
+    snprintf(config->composition.delivery_mode, sizeof(config->composition.delivery_mode), "or");
+    config->composition.delivery_enabled = true;
+    snprintf(config->composition.kind_mode, sizeof(config->composition.kind_mode), "all");
+    config->composition.kind_enabled = true;
+    snprintf(config->composition.query_mode, sizeof(config->composition.query_mode), "and");
+    config->composition.query_enabled = true;
+    snprintf(config->composition.protocol_response_mode, sizeof(config->composition.protocol_response_mode), "first");
+    config->composition.protocol_response_enabled = true;
+    snprintf(config->composition.metadata_mode, sizeof(config->composition.metadata_mode), "first");
+    config->composition.metadata_enabled = true;
+    snprintf(config->composition.auth_hint_mode, sizeof(config->composition.auth_hint_mode), "or");
+    config->composition.auth_hint_enabled = true;
+    snprintf(config->composition.auth_challenge_mode, sizeof(config->composition.auth_challenge_mode), "all");
+    config->composition.auth_challenge_enabled = true;
+    snprintf(config->composition.maintenance_mode, sizeof(config->composition.maintenance_mode), "all");
+    config->composition.maintenance_enabled = true;
     config->storage = NULL;
 }
 

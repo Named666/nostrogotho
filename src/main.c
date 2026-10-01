@@ -9,6 +9,7 @@
 #include "transport/server.h"
 #include "storage.h"
 #include "nhr.h"
+#include "crash.h"
 #include "log.h"
 
 static storage_context_t storage_ctx = {0};
@@ -81,6 +82,10 @@ static void cleanup(void) {
 }
 
 int main(int argc, const char **argv) {
+    /* Install crash handlers first so even config/startup faults print a
+     * stack trace to the terminal where debug logs are observed. */
+    crash_install_handlers();
+
     /* Layer 1: compiled defaults. */
     relay_config_t config;
     relay_config_init(&config);

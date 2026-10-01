@@ -8,7 +8,7 @@
  * allowed 256 entries -> heap buffer overflow from a single REQ filter with
  * >= 33 ids. Run under a heap debugger/ASAN for full effect; the count and
  * content checks below catch the accounting part deterministically. */
-static void test_filter_many_ids(void) {
+static int test_filter_many_ids(void) {
     size_t n = 40;
     size_t cap = n * 70 + 32;
     char *buf = (char *) malloc(cap);
@@ -24,11 +24,14 @@ static void test_filter_many_ids(void) {
 
     filter_t filter;
     bool ok = json_parse_filter(buf, &filter);
+    int pass;
     if (!ok) {
         printf("FAIL: filter with 40 ids should parse\n");
+        pass = 0;
     } else if (filter.ids_count != n) {
         printf("FAIL: ids_count=%zu expected %zu\n", filter.ids_count, n);
         filter_release(&filter);
+        pass = 0;
     } else {
         int intact = 1;
         for (size_t i = 0; i < filter.ids_count && intact; i++) {
@@ -42,8 +45,10 @@ static void test_filter_many_ids(void) {
         }
         printf("%s: filter with 40 ids parses intact\n", intact ? "PASS" : "FAIL");
         filter_release(&filter);
+        pass = intact;
     }
     free(buf);
+    return pass;
 }
 
 /* Regression: json_builder_object_key_string() used to pass a fixed 128-byte
@@ -53,7 +58,7 @@ static void test_filter_many_ids(void) {
  * key write by the remaining capacity; this test asserts the builder never
  * reports a position outside the buffer and that the result stays NUL-
  * terminated. */
-static void test_serialize_huge_tags_terminated(void) {
+static int test_serialize_huge_tags_terminated(void) {
     event_t event;
     memset(&event, 0, sizeof(event));
     strcpy(event.id,     "0000000000000000000000000000000000000000000000000000000000000000");
@@ -115,6 +120,7 @@ static void test_serialize_huge_tags_terminated(void) {
     printf("%s: serialization of ~65 KB tags stays bounded and terminated\n",
            pass ? "PASS" : "FAIL");
     free(event.content);
+    return pass;
 }
 
 /* Regression: validate_event_tags() used to allow tags with unlimited
@@ -122,7 +128,7 @@ static void test_serialize_huge_tags_terminated(void) {
  * crypto.c) bails out past MAX_TAG_ELEMENTS elements -- silently skipping
  * delegation signature verification for such events. Both parsers must
  * agree; events carrying oversized tags must be rejected at parse time. */
-static void test_event_with_oversized_tag_rejected(void) {
+static int test_event_with_oversized_tag_rejected(void) {
     char *tags = (char *) malloc(65536);
     size_t off = (size_t) snprintf(tags, 65536, "[[");
     for (int i = 0; i < 300; i++)
@@ -139,53 +145,63 @@ static void test_event_with_oversized_tag_rejected(void) {
              0, 1, tags, 0);
 
     event_t parsed;
+    int pass;
     if (json_parse_event(wire, &parsed)) {
         printf("FAIL: event with a >%d-element tag must be rejected\n", MAX_TAG_ELEMENTS);
         event_release(&parsed);
+        pass = 0;
     } else {
         printf("PASS: event with a >%d-element tag rejected at parse time\n",
                MAX_TAG_ELEMENTS);
+        pass = 1;
     }
     free(tags);
     free(wire);
+    return pass;
 }
 
-static void test_parse_string_array_hex64(void) {
+static int test_parse_string_array_hex64(void) {
     filter_t filter;
     if (json_parse_filter("{\"ids\": [\"short\"]}", &filter)) {
         printf("FAIL: short hex id must be rejected\n");
         filter_release(&filter);
-        return;
+        return 0;
     }
     printf("PASS: short hex id rejected\n");
+    return 1;
 }
 
-static void test_filter_empty_is_match_all(void) {
+static int test_filter_empty_is_match_all(void) {
     /* NIP-01: a filter object with no keys matches everything. It must parse
      * successfully and carry the default limit. */
     filter_t filter;
+    int pass;
     if (!json_parse_filter("{}", &filter)) {
         printf("FAIL: empty filter should parse as match-all\n");
-        return;
+        return 0;
     }
+    pass = (filter.limit == 500);
     printf("%s: empty filter parses as match-all (limit=%d)\n",
-           filter.limit == 500 ? "PASS" : "FAIL", filter.limit);
+           pass ? "PASS" : "FAIL", filter.limit);
     filter_release(&filter);
+    return pass;
 }
 
-static void test_builder_key_number_format(void) {
+static int test_builder_key_number_format(void) {
     json_builder_t builder;
+    int pass;
     json_builder_start(&builder);
     json_builder_object_key_number(&builder, "count", 42);
     const char *result = json_builder_finish(&builder);
-    printf("%s: builder key-number format\n",
-           result && strstr(result, "\"count\":42") ? "PASS" : "FAIL");
+    pass = (result && strstr(result, "\"count\":42") != NULL);
+    printf("%s: builder key-number format\n", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 /* Invariant: json_serialized_event_size() must exactly predict the number
  * of bytes json_serialize_event() writes, so the publish-time rejection in
  * nip01 guarantees every stored event fits the fixed response buffer. */
-static void test_serialized_size_matches(void) {
+static int test_serialized_size_matches(void) {
     const char *contents[] = {"plain", "with/slash", "quote\" and\\back",
                               "control\n\t\x01\x1f", "unicode: \xc3\xa9"};
     int pass = 1;
@@ -219,17 +235,21 @@ static void test_serialized_size_matches(void) {
         free(event.tags_json);
     }
     printf("%s: json_serialized_event_size matches serialization\n", pass ? "PASS" : "FAIL");
+    return pass;
 }
 
 int main(void) {
+    int passed = 0, failed = 0;
+#define RUN(fn) do { if (fn()) passed++; else failed++; } while (0)
     printf("Running json_util security regression tests...\n");
-    test_filter_many_ids();
-    test_serialize_huge_tags_terminated();
-    test_event_with_oversized_tag_rejected();
-    test_serialized_size_matches();
-    test_parse_string_array_hex64();
-    test_filter_empty_is_match_all();
-    test_builder_key_number_format();
-    printf("json_util security regression tests complete.\n");
-    return 0;
+    RUN(test_filter_many_ids);
+    RUN(test_serialize_huge_tags_terminated);
+    RUN(test_event_with_oversized_tag_rejected);
+    RUN(test_serialized_size_matches);
+    RUN(test_parse_string_array_hex64);
+    RUN(test_filter_empty_is_match_all);
+    RUN(test_builder_key_number_format);
+#undef RUN
+    printf("json_util: %d passed, %d failed\n", passed, failed);
+    return failed ? 1 : 0;
 }
