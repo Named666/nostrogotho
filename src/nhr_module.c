@@ -1,7 +1,9 @@
 #include "nhr_module.h"
-#include "nip_capability.h" /* registry + nip26/nip42 shared decls (each NIP is one nipXX.c) */
+#include "nip_capability.h" /* registry types + composition functions */
+#include "nips/nip26.h"      /* nip26_check_delegation, nip26_extract_index_tags */
+#include "nips/nip42.h"      /* nip42_save_state, nip42_restore_state, nip42_* types */
 #include "crypto.h"
-#include "model/tag_iter.h"
+#include "protocol/tag_iter.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -38,6 +40,58 @@ bool nhr_module_session_set_auth(uintptr_t connection_id, const char *pubkey) {
 void nhr_module_session_clear_auth(uintptr_t connection_id) {
     if (!g_host || !g_host->connection_clear_auth) return;
     g_host->connection_clear_auth(g_host->userdata, connection_id);
+}
+
+bool nhr_module_session_add_auth(uintptr_t connection_id, const char *pubkey) {
+    if (!g_host || !pubkey) return false;
+    if (g_host->connection_add_auth) {
+        return g_host->connection_add_auth(g_host->userdata, connection_id, pubkey);
+    }
+    /* Older host (ABI v2): fall back to set_auth (single pubkey). */
+    if (!g_host->connection_set_auth) return false;
+    return g_host->connection_set_auth(g_host->userdata, connection_id, pubkey);
+}
+
+bool nhr_module_session_has_auth(uintptr_t connection_id, const char *pubkey) {
+    const char *first;
+    size_t i;
+    if (!g_host || !pubkey) return false;
+    if (g_host->connection_has_auth) {
+        return g_host->connection_has_auth(g_host->userdata, connection_id, pubkey);
+    }
+    /* Older host (ABI v2): only the first pubkey is visible. */
+    if (!g_host->connection_get_auth_pubkey) return false;
+    if (g_host->connection_get_auth_at) {
+        size_t n = g_host->connection_get_auth_count
+            ? g_host->connection_get_auth_count(g_host->userdata, connection_id) : 0;
+        for (i = 0; i < n; i++) {
+            const char *pk = g_host->connection_get_auth_at(g_host->userdata, connection_id, i);
+            if (pk && strcmp(pk, pubkey) == 0) return true;
+        }
+        return false;
+    }
+    first = g_host->connection_get_auth_pubkey(g_host->userdata, connection_id);
+    return first && strcmp(first, pubkey) == 0;
+}
+
+size_t nhr_module_session_auth_count(uintptr_t connection_id) {
+    const char *first;
+    if (!g_host) return 0;
+    if (g_host->connection_get_auth_count) {
+        return g_host->connection_get_auth_count(g_host->userdata, connection_id);
+    }
+    if (!g_host->connection_get_auth_pubkey) return 0;
+    first = g_host->connection_get_auth_pubkey(g_host->userdata, connection_id);
+    return (first && first[0]) ? 1 : 0;
+}
+
+const char *nhr_module_session_auth_at(uintptr_t connection_id, size_t index) {
+    if (!g_host) return NULL;
+    if (g_host->connection_get_auth_at) {
+        return g_host->connection_get_auth_at(g_host->userdata, connection_id, index);
+    }
+    if (index != 0 || !g_host->connection_get_auth_pubkey) return NULL;
+    return g_host->connection_get_auth_pubkey(g_host->userdata, connection_id);
 }
 
 size_t nhr_module_session_snapshot(connection_snapshot_t *out, size_t capacity) {
@@ -214,14 +268,12 @@ uint32_t NHR_CALL nhr_module_abi_version(void) {
     return NHR_ABI_VERSION;
 }
 
-/* Bridge used by in-module NIP policy code (nip01/nip42) for event-ID and
- * signature verification. Crypto state stays host-owned; this is a plain
- * internal function, not an ABI export. */
+/* Bridge used by in-module NIP policy code for event-ID and signature
+ * verification (plus NIP-26 delegation, mirroring host check_event()).
+ * Crypto state stays host-owned; this is a plain internal function, not an
+ * ABI export. */
 bool nhr_module_accepts_event(const event_t *event) {
-    if (g_host && g_host->crypto_check_event) {
-        return g_host->crypto_check_event(g_host->userdata, event);
-    }
-    return false;
+    return module_check_event(event);
 }
 
 bool NHR_CALL nhr_module_init(const Nhr_Host *host, const relay_config_t *config, void *storage_handle) {

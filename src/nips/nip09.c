@@ -7,8 +7,8 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_tags.h"
-#include "model/tag_iter.h"
+#include "protocol/event_tags.h"
+#include "protocol/tag_iter.h"
 #include "storage.h"
 #include <stdlib.h>
 #include <string.h>

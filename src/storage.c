@@ -1,5 +1,6 @@
 #include "storage.h"
 #include "json_util.h"
+#include "log.h"
 #include <sqlite3.h>
 #include <string.h>
 #include <stdio.h>
@@ -444,7 +445,7 @@ static event_t *get_event_by_id(const char *id) {
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("GET_EVENT", "SQL error: %s", sqlite3_errmsg(db_conn));
         return NULL;
     }
     
@@ -526,7 +527,7 @@ static storage_insert_result_t insert_record(const event_t *ev,
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("INSERT", "SQL error: %s", sqlite3_errmsg(db_conn));
         snprintf(result.error_message, sizeof(result.error_message), "SQL error: %s", sqlite3_errmsg(db_conn));
         return result;
     }
@@ -558,7 +559,7 @@ static storage_insert_result_t insert_record(const event_t *ev,
         for (size_t i = 0; i < indexed_tags_count; i++) {
             if (!index_event_tag(ev->id, indexed_tags[i].tag_name,
                                  indexed_tags[i].tag_value)) {
-                fprintf(stderr, "Warning: could not index tag for event %s\n", ev->id);
+                log_storage_warn("INDEX_TAG", "could not index tag for event %s", ev->id);
             }
         }
     }
@@ -790,7 +791,7 @@ static bool delete_matching_sqlite3(const storage_event_scope_t *scope,
         int bind = 1, rc;
 
         if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-            fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+            log_storage_error("DELETE_MATCHING", "SQL error: %s", sqlite3_errmsg(db_conn));
             return false;
         }
         if (scope && scope->id) sqlite3_bind_text(stmt, bind++, scope->id, -1, SQLITE_TRANSIENT);
@@ -989,7 +990,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
     
     /* Validate input sizes to prevent buffer overflows */
     if (filters_count > 256) {
-        fprintf(stderr, "Error: too many filters (%zu > 256)\n", filters_count);
+        log_storage_warn("SEND_RECORDS", "too many filters (%zu > 256)", filters_count);
         return false;
     }
     
@@ -1003,7 +1004,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         total_authors += filters[f].authors_count;
     }
     if (total_authors > 1024) {
-        fprintf(stderr, "Error: REQ too complex (%zu total authors across %zu filters)\n",
+        log_storage_warn("SEND_RECORDS", "REQ too complex (%zu total authors across %zu filters)",
                 total_authors, filters_count);
         return false;
     }
@@ -1016,7 +1017,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         /* Validate filter array sizes to prevent buffer overflows */
         if (filter->ids_count > 256 || filter->authors_count > 256 || 
             filter->kinds_count > 256 || filter->tags_count > 256) {
-            fprintf(stderr, "Error: filter arrays too large\n");
+            log_storage_warn("SEND_RECORDS", "filter arrays too large");
             return false;
         }
         
@@ -1073,7 +1074,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                     !conditions_append(conditions, sizeof(conditions), ")")) ids_ok = false;
             }
             if (!ids_ok) {
-                fprintf(stderr, "Error: ids filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "ids filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
@@ -1128,7 +1129,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 !conditions_append(conditions, sizeof(conditions), ")")) authors_ok = false;
             if (authors_ok && !conditions_append(conditions, sizeof(conditions), ")")) authors_ok = false;
             if (!authors_ok) {
-                fprintf(stderr, "Error: authors filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "authors filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
@@ -1164,7 +1165,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                     !conditions_append(conditions, sizeof(conditions), ")")) kinds_ok = false;
             }
             if (!kinds_ok) {
-                fprintf(stderr, "Error: kinds filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "kinds filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
@@ -1176,7 +1177,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                      (long long) filter->since);
             if ((!first && !conditions_append(conditions, sizeof(conditions), " AND ")) ||
                 !conditions_append(conditions, sizeof(conditions), since_str)) {
-                fprintf(stderr, "Error: since filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "since filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
@@ -1189,7 +1190,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                      (long long) filter->until);
             if ((!first && !conditions_append(conditions, sizeof(conditions), " AND ")) ||
                 !conditions_append(conditions, sizeof(conditions), until_str)) {
-                fprintf(stderr, "Error: until filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "until filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
@@ -1221,7 +1222,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 if (!conditions_append(conditions, sizeof(conditions), ")")) tags_ok = false;
             }
             if (!tags_ok) {
-                fprintf(stderr, "Error: tag filter conditions too large\n");
+                log_storage_warn("SEND_RECORDS", "tag filter conditions too large");
                 params_release(params, param_count);
                 return false;
             }
@@ -1229,18 +1230,18 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         
         if (filter->search && strlen(filter->search) > 0) {
             if (param_count >= 256) {
-                fprintf(stderr, "Error: too many query parameters for search filter\n");
+                log_storage_warn("SEND_RECORDS", "too many query parameters for search filter");
                 params_release(params, param_count);
                 return false;
             }
             if (!first && !conditions_append(conditions, sizeof(conditions), " AND ")) {
-                fprintf(stderr, "Error: search filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "search filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
             if (!conditions_append(conditions, sizeof(conditions),
                                    "content LIKE ? ESCAPE '\\'")) {
-                fprintf(stderr, "Error: search filter too large for query buffers\n");
+                log_storage_warn("SEND_RECORDS", "search filter too large for query buffers");
                 params_release(params, param_count);
                 return false;
             }
@@ -1264,7 +1265,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         if (strlen(conditions) > 0) {
             if (snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql),
                          " WHERE %s", conditions) >= (int) sizeof(sql)) {
-                fprintf(stderr, "Error: query too large for SQL buffer\n");
+                log_storage_warn("SEND_RECORDS", "query too large for SQL buffer");
                 params_release(params, param_count);
                 return false;
             }
@@ -1272,13 +1273,13 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         
         if (!do_count) {
             if (param_count >= 256) {
-                fprintf(stderr, "Error: too many query parameters\n");
+                log_storage_warn("SEND_RECORDS", "too many query parameters");
                 params_release(params, param_count);
                 return false;
             }
             if (snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql),
                          " ORDER BY created_at DESC LIMIT ?") >= (int) sizeof(sql)) {
-                fprintf(stderr, "Error: query too large for SQL buffer\n");
+                log_storage_warn("SEND_RECORDS", "query too large for SQL buffer");
                 params_release(params, param_count);
                 return false;
             }
@@ -1290,7 +1291,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         /* Execute query */
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-            fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+            log_storage_error("SEND_RECORDS", "SQL error: %s", sqlite3_errmsg(db_conn));
             params_release(params, param_count);
             return false;
         }
@@ -1490,7 +1491,7 @@ bool storage_find_events(const storage_event_scope_t *scope,
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1534,7 +1535,7 @@ bool storage_count_events(const storage_event_scope_t *scope,
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1578,7 +1579,7 @@ bool storage_delete_events(const storage_event_scope_t *scope,
                  "DELETE FROM event WHERE %s", conditions);
     } else {
         /* Safety: require explicit scope for DELETE to prevent accidental full table delete */
-        fprintf(stderr, "Error: DELETE without scope not allowed\n");
+        log_storage_error("DELETE_EVENTS", "DELETE without scope not allowed");
         return false;
     }
     
@@ -1602,7 +1603,7 @@ bool storage_delete_events(const storage_event_scope_t *scope,
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1621,7 +1622,7 @@ bool storage_delete_events(const storage_event_scope_t *scope,
         ok = true;
         deleted = sqlite3_changes(db_conn);
     } else {
-        fprintf(stderr, "SQL error during DELETE: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("DELETE_EVENTS", "SQL error during DELETE: %s", sqlite3_errmsg(db_conn));
     }
     
     sqlite3_finalize(stmt);
@@ -1681,7 +1682,7 @@ static bool execute_sql_tx(storage_transaction_t *tx, const char *sql,
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1699,7 +1700,7 @@ static bool execute_sql_tx(storage_transaction_t *tx, const char *sql,
         ok = true;
         changes = sqlite3_changes(db_conn);
     } else {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
     }
     
     sqlite3_finalize(stmt);
@@ -1749,7 +1750,7 @@ bool storage_find_events_tx(const storage_event_scope_t *scope,
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1786,7 +1787,7 @@ bool storage_delete_events_tx(const storage_event_scope_t *scope,
         snprintf(sql, sizeof(sql),
                  "DELETE FROM event WHERE %s", conditions);
     } else {
-        fprintf(stderr, "Error: DELETE without scope not allowed\n");
+        log_storage_error("DELETE_MATCHING", "DELETE without scope not allowed");
         return false;
     }
     
@@ -1824,7 +1825,7 @@ static bool delete_older_replaceable(const char *pubkey, int kind, time_t create
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1836,7 +1837,7 @@ static bool delete_older_replaceable(const char *pubkey, int kind, time_t create
     if (sqlite3_step(stmt) == SQLITE_DONE) {
         ok = true;
     } else {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
     }
     
     sqlite3_finalize(stmt);
@@ -1853,7 +1854,7 @@ static bool delete_older_addressable(const char *pubkey, int kind, const char *d
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -1866,7 +1867,7 @@ static bool delete_older_addressable(const char *pubkey, int kind, const char *d
     if (sqlite3_step(stmt) == SQLITE_DONE) {
         ok = true;
     } else {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
     }
     
     sqlite3_finalize(stmt);
@@ -1956,7 +1957,7 @@ storage_insert_result_t storage_upsert_replaceable(const event_t *ev,
     /* Index tags */
     for (size_t i = 0; i < indexed_tags_count; i++) {
         if (!index_event_tag(ev->id, indexed_tags[i].tag_name, indexed_tags[i].tag_value)) {
-            fprintf(stderr, "Warning: could not index tag for event %s\n", ev->id);
+            log_storage_warn("INDEX_TAG", "could not index tag for event %s", ev->id);
         }
     }
     
@@ -2042,7 +2043,7 @@ storage_insert_result_t storage_upsert_addressable(const event_t *ev,
     /* Index tags */
     for (size_t i = 0; i < indexed_tags_count; i++) {
         if (!index_event_tag(ev->id, indexed_tags[i].tag_name, indexed_tags[i].tag_value)) {
-            fprintf(stderr, "Warning: could not index tag for event %s\n", ev->id);
+            log_storage_warn("INDEX_TAG", "could not index tag for event %s", ev->id);
         }
     }
     
@@ -2084,7 +2085,7 @@ bool storage_find_ids_by_tags(const char *const *tag_names,
     
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -2195,7 +2196,7 @@ static bool storage_init_sqlite3(const char *dsn) {
                          NULL);
     
     if (ret != SQLITE_OK) {
-        fprintf(stderr, "Unable to connect to database: %s\n", sqlite3_errmsg(db_conn));
+        log_storage_error("INIT", "Unable to connect to database: %s", sqlite3_errmsg(db_conn));
         return false;
     }
     
@@ -2213,7 +2214,7 @@ static bool storage_init_sqlite3(const char *dsn) {
 
     char *errmsg = NULL;
     if (sqlite3_exec(db_conn, pragmas_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", errmsg);
+        log_storage_error("INIT", "SQL error: %s", errmsg);
         sqlite3_free(errmsg);
         sqlite3_close_v2(db_conn);
         db_conn = NULL;
@@ -2247,7 +2248,7 @@ static bool storage_init_sqlite3(const char *dsn) {
     
     errmsg = NULL;
     if (sqlite3_exec(db_conn, schema_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", errmsg);
+        log_storage_error("INIT", "SQL error: %s", errmsg);
         sqlite3_free(errmsg);
         sqlite3_close_v2(db_conn);
         db_conn = NULL;

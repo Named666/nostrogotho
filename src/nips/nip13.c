@@ -8,7 +8,7 @@
 
 #include "nip_capability.h"
 #include "crypto.h"
-#include "model/tag_iter.h"
+#include "protocol/tag_iter.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

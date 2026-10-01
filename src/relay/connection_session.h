@@ -46,11 +46,23 @@ connection_session_t *connection_session_get(uintptr_t connection_id);
 /* Get session by Mongoose connection pointer */
 connection_session_t *connection_session_get_by_mg_connection(struct mg_connection *connection);
 
-/* Get authenticated pubkey */
+/* Get first authenticated pubkey (for backward compatibility) */
 const char *connection_session_get_auth_pubkey(connection_session_t *session);
 
-/* Set authenticated pubkey */
+/* Set/replace first authenticated pubkey (for backward compatibility) */
 void connection_session_set_auth(connection_session_t *session, const char *pubkey);
+
+/* Add an authenticated pubkey (supports multiple per NIP-42) */
+void connection_session_add_auth_pubkey(connection_session_t *session, const char *pubkey);
+
+/* Check if a pubkey is authenticated for this session */
+bool connection_session_has_auth_pubkey(connection_session_t *session, const char *pubkey);
+
+/* Get number of authenticated pubkeys */
+size_t connection_session_get_auth_pubkey_count(connection_session_t *session);
+
+/* Get authenticated pubkey by index */
+const char *connection_session_get_auth_pubkey_at(connection_session_t *session, size_t index);
 
 /* Set/get challenge for NIP-42 */
 void connection_session_set_challenge(connection_session_t *session, const char *challenge);

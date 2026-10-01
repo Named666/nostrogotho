@@ -21,7 +21,14 @@ bool nhr_module_session_set_challenge(uintptr_t connection_id,
 const char *nhr_module_session_auth_pubkey(uintptr_t connection_id);
 bool nhr_module_session_set_auth(uintptr_t connection_id, const char *pubkey);
 void nhr_module_session_clear_auth(uintptr_t connection_id);
+bool nhr_module_session_add_auth(uintptr_t connection_id, const char *pubkey);
+bool nhr_module_session_has_auth(uintptr_t connection_id, const char *pubkey);
+size_t nhr_module_session_auth_count(uintptr_t connection_id);
+const char *nhr_module_session_auth_at(uintptr_t connection_id, size_t index);
 size_t nhr_module_session_snapshot(connection_snapshot_t *out, size_t capacity);
 bool nhr_module_send_json(uintptr_t connection_id, const char *json, size_t length);
+/* Full event validation bridge (ID + signature + NIP-26 delegation,
+ * mirroring host check_event()). Plain internal function, not an ABI export. */
+bool nhr_module_accepts_event(const event_t *event);
 
 #endif /* NHR_MODULE_H_ */

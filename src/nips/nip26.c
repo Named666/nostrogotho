@@ -7,16 +7,17 @@
  *
  * The delegation/tag-index API below is shared with the relay core
  * (crypto.c signature path, module storage adapter); its declarations live
- * in nip_capability.h. Everything else here is file-static.
+ * in nip26.h. Everything else here is file-static.
  * ============================================================================ */
 
 #include "nip_capability.h"
+#include "nips/nip26.h"      /* own public API declarations */
 #include "../storage.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include "model/tag_iter.h"
+#include "protocol/tag_iter.h"
 #ifndef NHR_DYNAMIC_MODULE
 #include "../crypto.h"
 #endif
@@ -46,6 +47,8 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
     if (conditions && strlen(conditions) > 0) {
         bool has_kind_condition = false;
         bool kind_matched = false;
+        int allowed_kinds[32];
+        size_t allowed_kinds_count = 0;
         
         char cond_copy[512];
         strncpy(cond_copy, conditions, sizeof(cond_copy) - 1);
@@ -80,11 +83,9 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
                 
                 if (key_len == 4 && strncmp(condition, "kind", 4) == 0 && op_char == '=') {
                     has_kind_condition = true;
-                    char kind_str[16];
-                    snprintf(kind_str, sizeof(kind_str), "%d", ev->kind);
-                    
-                    if (strcmp(kind_str, op_str) == 0) {
-                        kind_matched = true;
+                    int kind_val = (int)strtol(op_str, NULL, 10);
+                    if (kind_val >= 0 && allowed_kinds_count < 32) {
+                        allowed_kinds[allowed_kinds_count++] = kind_val;
                     }
                 } else if (key_len == 10 && strncmp(condition, "created_at", 10) == 0) {
                     time_t timestamp = (time_t)strtol(op_str, NULL, 10);
@@ -100,8 +101,16 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
             condition = strtok_r(NULL, "&", &saveptr);
         }
         
-        if (has_kind_condition && !kind_matched) {
-            return false;
+        if (has_kind_condition) {
+            for (size_t i = 0; i < allowed_kinds_count; i++) {
+                if (ev->kind == allowed_kinds[i]) {
+                    kind_matched = true;
+                    break;
+                }
+            }
+            if (!kind_matched) {
+                return false;
+            }
         }
     }
     
@@ -257,7 +266,13 @@ static bool nip26_accept_publish(uintptr_t connection_id, const event_t *event,
 }
 
 /* Single capability table. The hook ignores ctx, so .ctx is NULL (no
- * allocation, nothing to leak across reloads). */
+ * allocation, nothing to leak across reloads).
+ *
+ * NOTE: NIP-26 delegator-deletion (delegator may delete delegatee's events)
+ * is NOT enforced here. Per-event ownership checks belong in the kind
+ * handler for deletion (NIP-09, kind 5), which has the target events.
+ * A query-policy stub that always returns true would imply enforcement
+ * while doing none, so it is intentionally omitted. */
 static nip_capability_t nip26_caps[] = {
     {
         .name = "nip26-pub-policy",

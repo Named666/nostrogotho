@@ -10,7 +10,7 @@
  *
  * Owns the event loop, listener socket, and raw frame sending. All protocol
  * decisions (parse/dispatch/policy/query) live in relay_t; module reload
- * watching lives in relay.c. This file references no NIP implementation.
+ * watching lives in relay.c. 
  * ============================================================================ */
 
 void transport_send_json(struct mg_connection *connection, const char *json) {

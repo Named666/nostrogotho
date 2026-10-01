@@ -10,7 +10,11 @@
  * connection_session, NOT in module statics. Sessions outlive module reload,
  * so authentication survives a NIP change/add/remove with no migration step.
  * The versioned state blob below is belt-and-braces + rolling-update compat.
- * Its declarations (shared with nhr_module.c) live in nip_capability.h.
+ * Its declarations (shared with nhr_module.c) live in nip42.h.
+ *
+ * Transport/session/crypto access goes ONLY through nips/nip_env.h, which
+ * resolves to direct relay calls in host builds and to Nhr_Host shims in
+ * module builds. This file contains no NHR_BUILD_MODULE branches.
  * ============================================================================ */
 
 #ifdef _WIN32
@@ -27,14 +31,12 @@
 #include <errno.h>
 #endif
 #include "nip_capability.h"
-#include "crypto.h"
-#include "model/event_tags.h"
-#include "relay/connection_session.h"
+#include "nips/nip42.h"      /* own public API declarations */
+#include "nips/nip_env.h"    /* unified host env: send/session/validate */
+#include "log.h"
+#include "protocol/event_tags.h"
+#include "protocol/tag_iter.h"
 #include "protocol/protocol.h"
-#include "relay/relay.h"            /* host builds: relay_send_json() */
-#ifdef NHR_BUILD_MODULE
-#include "nhr_module.h"             /* module builds: session/send shims */
-#endif
 
 /* Fill a buffer with cryptographically-strong random bytes. Uses
  * BCryptGenRandom on Windows, getrandom(2) on Linux, /dev/urandom fallback.
@@ -94,45 +96,13 @@ static bool nip42_make_challenge(char challenge[17]) {
 }
 
 /* ============================================================================
- * Connection-ID auth API (session-backed)
- *
- * In module builds the session is reached through the nhr_module_session_*
- * shims (host services); in host builds directly.
+ * Connection-ID auth API (session-backed, via nip_env)
  * ============================================================================ */
-
-#ifdef NHR_BUILD_MODULE
-#define NIP42_SESS_CHALLENGE(id) nhr_module_session_challenge(id)
-#define NIP42_SESS_SET_CHALLENGE(id, ch) nhr_module_session_set_challenge((id), (ch))
-#define NIP42_SESS_PUBKEY(id) nhr_module_session_auth_pubkey(id)
-#define NIP42_SESS_SET_PUBKEY(id, pk) nhr_module_session_set_auth((id), (pk))
-#define NIP42_SESS_CLEAR(id) nhr_module_session_clear_auth(id)
-#else
-#define NIP42_SESS_CHALLENGE(id) \
-    (connection_session_get(id) ? \
-     connection_session_get_challenge(connection_session_get(id)) : NULL)
-#define NIP42_SESS_SET_CHALLENGE(id, ch) \
-    (connection_session_get(id) ? \
-     (connection_session_set_challenge(connection_session_get(id), (ch)), true) : false)
-#define NIP42_SESS_PUBKEY(id) \
-    (connection_session_get(id) ? \
-     connection_session_get_auth_pubkey(connection_session_get(id)) : NULL)
-#define NIP42_SESS_SET_PUBKEY(id, pk) \
-    (connection_session_get(id) ? \
-     (connection_session_set_auth(connection_session_get(id), (pk)), true) : false)
-#define NIP42_SESS_CLEAR(id) \
-    do { \
-        connection_session_t *s_ = connection_session_get(id); \
-        if (s_) { \
-            connection_session_set_auth(s_, NULL); \
-            connection_session_set_challenge(s_, NULL); \
-        } \
-    } while (0)
-#endif
 
 bool nip42_open_by_id(connection_id_t connection_id, char challenge[17]) {
     char fresh[17];
     if (!challenge || !nip42_make_challenge(fresh)) return false;
-    if (!NIP42_SESS_SET_CHALLENGE(connection_id, fresh)) return false;
+    if (!nip_env_session_set_challenge(connection_id, fresh)) return false;
     memcpy(challenge, fresh, sizeof(fresh));
     return true;
 }
@@ -144,12 +114,60 @@ bool nip42_open_challenge_by_id(connection_id_t connection_id, char challenge[17
 }
 
 void nip42_close_by_id(connection_id_t connection_id) {
-    NIP42_SESS_CLEAR(connection_id);
+    nip_env_session_clear_auth(connection_id);
 }
 
 const char *nip42_authenticated_pubkey_by_id(connection_id_t connection_id) {
-    const char *pubkey = NIP42_SESS_PUBKEY(connection_id);
+    const char *pubkey = nip_env_session_auth_pubkey(connection_id);
     return pubkey && pubkey[0] ? pubkey : NULL;
+}
+
+/* Check if a specific pubkey is authenticated for this connection (supports multiple per NIP-42) */
+bool nip42_is_pubkey_authenticated(connection_id_t connection_id, const char *pubkey) {
+    if (!pubkey) return false;
+    return nip_env_session_has_auth(connection_id, pubkey);
+}
+
+/* Send an auth challenge on demand (per NIP-42: "At any moment the relay may send an AUTH message") */
+bool nip42_send_auth_challenge(connection_id_t connection_id) {
+    char challenge[17];
+    if (!nip42_open_challenge_by_id(connection_id, challenge)) return false;
+
+    char *auth_msg = protocol_serialize_auth(challenge);
+    if (!auth_msg) return false;
+
+    nip_env_send_json(connection_id, auth_msg);
+
+    protocol_free_string(auth_msg);
+    return true;
+}
+
+static const char *nip42_extract_domain(const char *url) {
+    if (!url) return NULL;
+    
+    const char *domain_start = url;
+    if (strncmp(url, "wss://", 6) == 0) {
+        domain_start = url + 6;
+    } else if (strncmp(url, "ws://", 5) == 0) {
+        domain_start = url + 5;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        domain_start = url + 8;
+    } else if (strncmp(url, "http://", 7) == 0) {
+        domain_start = url + 7;
+    }
+    
+    const char *domain_end = domain_start;
+    while (*domain_end && *domain_end != '/' && *domain_end != ':' && *domain_end != '?') {
+        domain_end++;
+    }
+    
+    static char domain[256];
+    size_t len = domain_end - domain_start;
+    if (len >= sizeof(domain)) len = sizeof(domain) - 1;
+    memcpy(domain, domain_start, len);
+    domain[len] = '\0';
+    
+    return domain;
 }
 
 bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *event,
@@ -157,28 +175,43 @@ bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *even
     const char *challenge;
     bool valid_event;
     if (!event) return false;
-#ifdef NHR_BUILD_MODULE
-    extern bool nhr_module_accepts_event(const event_t *event);
-    valid_event = nhr_module_accepts_event(event);
-#else
-    valid_event = check_event(event);
-#endif
-    printf("[DEBUG] nip42_authenticate_by_id: connection_id=%lu event_kind=%d valid_event=%d\n", connection_id, event->kind, valid_event);
-    fflush(stdout);
-    challenge = NIP42_SESS_CHALLENGE(connection_id);
-    printf("[DEBUG] nip42_authenticate_by_id: challenge=%s\n", challenge ? challenge : "NULL");
-    fflush(stdout);
+    valid_event = nip_env_accepts_event(event);
+    log_debug("NIP", "AUTH", "connection_id=%llu event_kind=%d valid_event=%d", (unsigned long long)connection_id, event->kind, valid_event);
+    challenge = nip_env_session_challenge(connection_id);
+    log_debug("NIP", "AUTH", "challenge=%s", challenge ? challenge : "NULL");
     if (!challenge || !challenge[0] || event->kind != 22242 || !valid_event ||
         llabs((long long) now - (long long) event->created_at) > 600 ||
-        !event_tag_has_value(event, "challenge", challenge) ||
-        !event_tag_has_value(event, "relay", service_url)) {
-        printf("[DEBUG] nip42_authenticate_by_id: validation failed\n");
-        fflush(stdout);
+        !event_tag_has_value(event, "challenge", challenge)) {
+        log_debug("NIP", "AUTH", "validation failed");
         return false;
     }
-    printf("[DEBUG] nip42_authenticate_by_id: setting pubkey=%s\n", event->pubkey);
-    fflush(stdout);
-    return NIP42_SESS_SET_PUBKEY(connection_id, event->pubkey);
+    /* Check relay URL - domain matching per spec (URL normalization) */
+    if (service_url && service_url[0]) {
+        const char *event_relay = NULL;
+        /* Extract relay tag from event */
+        tag_iter_t it;
+        tag_iter_init(&it, event);
+        struct mg_str key, tag;
+        while (tag_iter_next(&it, &key, &tag)) {
+            char *name = tag_iter_element(&it, 0);
+            if (name && strcmp(name, "relay") == 0) {
+                event_relay = tag_iter_element(&it, 1);
+                free(name);
+                break;
+            }
+            free(name);
+        }
+        if (event_relay) {
+            const char *service_domain = nip42_extract_domain(service_url);
+            const char *event_domain = nip42_extract_domain(event_relay);
+            if (strcmp(service_domain, event_domain) != 0) {
+                log_debug("NIP", "AUTH", "relay domain mismatch: service=%s event=%s", service_domain, event_domain);
+                return false;
+            }
+        }
+    }
+    log_debug("NIP", "AUTH", "adding pubkey=%s", event->pubkey);
+    return nip_env_session_add_auth(connection_id, event->pubkey);
 }
 
 /* ============================================================================
@@ -188,79 +221,38 @@ bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *even
 #define NIP42_STATE_MAX (sizeof(((nip42_state_t *)0)->clients) / \
                          sizeof(((nip42_state_t *)0)->clients[0]))
 
-#ifndef NHR_BUILD_MODULE
-typedef struct {
-    nip42_state_t *state;
-    size_t count;
-    bool overflow;
-} nip42_save_ctx_t;
-
-static void nip42_save_one_session(connection_session_t *session, void *userdata) {
-    nip42_save_ctx_t *ctx = (nip42_save_ctx_t *)userdata;
-    const char *challenge;
-    const char *pubkey;
-    if (!session || !ctx || ctx->overflow) return;
-    if (ctx->count >= NIP42_STATE_MAX) {
-        ctx->overflow = true;
-        return;
-    }
-    challenge = connection_session_get_challenge(session);
-    pubkey = connection_session_get_auth_pubkey(session);
-    if ((!challenge || !challenge[0]) && (!pubkey || !pubkey[0])) return;
-    ctx->state->clients[ctx->count].connection_id =
-        connection_session_get_id(session);
-    snprintf(ctx->state->clients[ctx->count].challenge,
-             sizeof(ctx->state->clients[ctx->count].challenge),
-             "%s", challenge ? challenge : "");
-    snprintf(ctx->state->clients[ctx->count].pubkey,
-             sizeof(ctx->state->clients[ctx->count].pubkey),
-             "%s", pubkey ? pubkey : "");
-    ctx->count++;
-}
-#endif
-
 bool nip42_save_state(nip42_state_t *state,
                       const nip42_connection_t *connections,
                       size_t connection_count) {
+    /* Single path in every build: enumerate host sessions through nip_env.
+     * Sessions themselves survive reload, so this snapshot is belt-and-
+     * braces + rolling-update compat only. */
+    connection_snapshot_t snapshot[NIP42_STATE_MAX];
+    size_t count;
+    size_t kept = 0;
+    size_t i;
     (void)connections;
     (void)connection_count;
     if (!state) return false;
     memset(state, 0, sizeof(*state));
     state->version = 1;
-#ifdef NHR_BUILD_MODULE
-    {
-        /* Module build: enumerate host sessions through shims. */
-        connection_snapshot_t snapshot[256];
-        size_t count = nhr_module_session_snapshot(snapshot, 256);
-        size_t kept = 0;
-        if (count > 256) return false;
-        for (size_t i = 0; i < count; i++) {
-            const char *challenge = nhr_module_session_challenge(snapshot[i].id);
-            const char *pubkey = nhr_module_session_auth_pubkey(snapshot[i].id);
-            if ((!challenge || !challenge[0]) && (!pubkey || !pubkey[0])) continue;
-            if (kept >= NIP42_STATE_MAX) return false;
-            state->clients[kept].connection_id = snapshot[i].id;
-            snprintf(state->clients[kept].challenge,
-                     sizeof(state->clients[kept].challenge),
-                     "%s", challenge ? challenge : "");
-            snprintf(state->clients[kept].pubkey,
-                     sizeof(state->clients[kept].pubkey),
-                     "%s", pubkey ? pubkey : "");
-            kept++;
-        }
-        state->count = (uint32_t)kept;
+    count = nip_env_session_snapshot(snapshot, NIP42_STATE_MAX);
+    if (count > NIP42_STATE_MAX) return false;
+    for (i = 0; i < count; i++) {
+        const char *challenge = nip_env_session_challenge(snapshot[i].id);
+        const char *pubkey = nip_env_session_auth_pubkey(snapshot[i].id);
+        if ((!challenge || !challenge[0]) && (!pubkey || !pubkey[0])) continue;
+        if (kept >= NIP42_STATE_MAX) return false;
+        state->clients[kept].connection_id = snapshot[i].id;
+        snprintf(state->clients[kept].challenge,
+                 sizeof(state->clients[kept].challenge),
+                 "%s", challenge ? challenge : "");
+        snprintf(state->clients[kept].pubkey,
+                 sizeof(state->clients[kept].pubkey),
+                 "%s", pubkey ? pubkey : "");
+        kept++;
     }
-#else
-    {
-        nip42_save_ctx_t ctx;
-        ctx.state = state;
-        ctx.count = 0;
-        ctx.overflow = false;
-        connection_session_iterate(nip42_save_one_session, &ctx);
-        if (ctx.overflow) return false;
-        state->count = (uint32_t)ctx.count;
-    }
-#endif
+    state->count = (uint32_t)kept;
     return true;
 }
 
@@ -275,19 +267,11 @@ bool nip42_restore_state(const nip42_state_t *state,
      * live sessions converge to the snapshot. */
     for (uint32_t i = 0; i < state->count; i++) {
         connection_id_t id = state->clients[i].connection_id;
-#ifdef NHR_BUILD_MODULE
-        nhr_module_session_set_challenge(id, state->clients[i].challenge);
+        /* set_* fails for disconnected clients: skip them. */
+        if (!nip_env_session_set_challenge(id, state->clients[i].challenge)) continue;
         if (state->clients[i].pubkey[0]) {
-            nhr_module_session_set_auth(id, state->clients[i].pubkey);
+            nip_env_session_set_auth(id, state->clients[i].pubkey);
         }
-#else
-        connection_session_t *session = connection_session_get(id);
-        if (!session) continue; /* Client disconnected since the snapshot. */
-        connection_session_set_challenge(session, state->clients[i].challenge);
-        if (state->clients[i].pubkey[0]) {
-            connection_session_set_auth(session, state->clients[i].pubkey);
-        }
-#endif
     }
     return true;
 }
@@ -296,19 +280,10 @@ bool nip42_restore_state(const nip42_state_t *state,
  * Capabilities
  * ============================================================================ */
 
-/* Send a JSON message by opaque ID without touching transport types. Host
- * builds use the relay-owned helper; module builds go through host services. */
-static void nip42_send_json(connection_id_t connection_id, const char *json) {
-    if (!json) return;
-#ifdef NHR_BUILD_MODULE
-    nhr_module_send_json(connection_id, json, strlen(json));
-#else
-    relay_send_json(connection_id, json);
-#endif
-}
-
 typedef struct {
     char service_url[256];
+    bool enabled;                 /* nip42.enabled: false disables all hooks */
+    bool auth_required_for_write; /* nip42.auth_required_for_write */
 } nip42_ctx_t;
 
 /* Shared static ctx: re-derived in lifecycle init on every startup/reload,
@@ -323,6 +298,10 @@ static void nip42_connection_on_disconnect(connection_id_t connection_id, void *
 static bool nip42_message_intercept_fn(connection_id_t connection_id, const protocol_message_t *msg, void *ctx);
 static bool nip42_publication_policy_fn(connection_id_t connection_id, const event_t *event, char *reason, size_t reason_size, void *ctx);
 static void nip42_send_auth_challenge_fn(connection_id_t connection_id, void *ctx);
+static bool nip42_query_authorize_fn(connection_id_t connection_id, filter_t *filters, size_t count,
+                                     char *reason, size_t reason_size, void *ctx);
+static bool nip42_query_modify_fn(connection_id_t connection_id, const filter_t *filters, size_t count,
+                                   bool has_more, int total_count, void *ctx);
 
 /* Single capability table. (Protocol response carries the auth-challenge
  * hook only; EOSE/COUNT/hints are owned by NIP-67/NIP-45/NIP-17.) */
@@ -365,6 +344,14 @@ static nip_capability_t nip42_caps[] = {
                                     .send_auth_challenge = nip42_send_auth_challenge_fn },
         .next = NULL,
     },
+    {
+        .name = "nip42-query-policy",
+        .type = NIP_CAP_QUERY_POLICY,
+        .ctx = &nip42_ctx,
+        .caps.query_policy = { .authorize_query = nip42_query_authorize_fn,
+                               .modify_results = nip42_query_modify_fn },
+        .next = NULL,
+    },
 };
 
 static void nip42_lifecycle_init(const relay_config_t *config, void *ctx) {
@@ -372,7 +359,9 @@ static void nip42_lifecycle_init(const relay_config_t *config, void *ctx) {
     if (!cap_ctx || !config) return;
 
     snprintf(cap_ctx->service_url, sizeof(cap_ctx->service_url), "%s",
-             config->service_url ? config->service_url : "");
+             config->service_url);
+    cap_ctx->enabled = config->nip42_enabled;
+    cap_ctx->auth_required_for_write = config->nip42_auth_required_for_write;
 }
 
 static void nip42_lifecycle_shutdown(void *ctx) {
@@ -380,6 +369,8 @@ static void nip42_lifecycle_shutdown(void *ctx) {
 }
 
 static void nip42_connection_on_connect(connection_id_t connection_id, void *ctx) {
+    nip42_ctx_t *cap_ctx = (nip42_ctx_t *)ctx;
+    if (cap_ctx && !cap_ctx->enabled) return;
     nip42_send_auth_challenge_fn(connection_id, ctx);
 }
 
@@ -392,7 +383,7 @@ static void nip42_send_auth_challenge_fn(connection_id_t connection_id, void *ct
 
     char *auth_msg = protocol_serialize_auth(challenge);
     if (auth_msg) {
-        nip42_send_json(connection_id, auth_msg);
+        nip_env_send_json(connection_id, auth_msg);
         protocol_free_string(auth_msg);
     }
 }
@@ -409,6 +400,7 @@ static bool nip42_message_intercept_fn(connection_id_t connection_id, const prot
     char *ok;
     bool authenticated;
 
+    if (cap_ctx && !cap_ctx->enabled) return false;
     if (!msg || msg->command != PROTOCOL_CMD_AUTH) return false;
     /* Only client AUTH responses (signed kind:22242 event) are consumed.
      * Anything else falls through to the relay default (NOTICE). */
@@ -416,18 +408,16 @@ static bool nip42_message_intercept_fn(connection_id_t connection_id, const prot
     event = &msg->payload.auth.event;
     service_url = (cap_ctx && cap_ctx->service_url[0]) ? cap_ctx->service_url : "";
 
-    printf("[DEBUG] nip42_message_intercept_fn: connection_id=%lu event_id=%.16s kind=%d\n", connection_id, event->id, event->kind);
-    fflush(stdout);
+    log_debug("NIP", "AUTH_INTERCEPT", "connection_id=%llu event_id=%.16s kind=%d", (unsigned long long)connection_id, event->id, event->kind);
     authenticated = nip42_authenticate_by_id(connection_id, event,
                                              service_url, time(NULL));
-    printf("[DEBUG] nip42_message_intercept_fn: authenticated=%d\n", authenticated);
-    fflush(stdout);
+    log_debug("NIP", "AUTH_INTERCEPT", "authenticated=%d", authenticated);
     /* NIP answers with OK; the relay owns framing, transport owns sending —
      * this helper only carries an opaque connection ID. */
     ok = protocol_serialize_ok(event->id, authenticated,
                                authenticated ? "" : "error: failed to authenticate");
     if (ok) {
-        nip42_send_json(connection_id, ok);
+        nip_env_send_json(connection_id, ok);
         protocol_free_string(ok);
     }
     return true;
@@ -435,21 +425,174 @@ static bool nip42_message_intercept_fn(connection_id_t connection_id, const prot
 
 static bool nip42_publication_policy_fn(connection_id_t connection_id, const event_t *event,
                                         char *reason, size_t reason_size, void *ctx) {
-    (void)ctx;
-    (void)connection_id;
+    nip42_ctx_t *cap_ctx = (nip42_ctx_t *)ctx;
+    if (cap_ctx && !cap_ctx->enabled) return true;
+
+    /* Operator-configured write gate: unauthenticated connections cannot
+     * publish at all. Spec flow: OK with auth-required: prefix. */
+    if (cap_ctx && cap_ctx->auth_required_for_write &&
+        nip_env_session_auth_count(connection_id) == 0) {
+        snprintf(reason, reason_size,
+                 "auth-required: authentication required for event writes");
+        return false;
+    }
 
     if (!event_tag_has(event, "-")) return true;
 
+    /* Check if event author is among authenticated pubkeys for this connection */
+    if (!nip42_is_pubkey_authenticated(connection_id, event->pubkey)) {
+        const char *auth_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
+        if (!auth_pubkey) {
+            snprintf(reason, reason_size, "auth-required: authentication required");
+        } else {
+            snprintf(reason, reason_size,
+                     "restricted: authenticated pubkey does not match event author");
+        }
+        return false;
+    }
+    return true;
+}
+
+/* ============================================================================
+ * Query Policy: NIP-42 auth-required / restricted for REQ/COUNT
+ * ============================================================================ */
+
+/* Check if a filter targets kinds that require authentication (e.g., DMs kind 4).
+ * Returns true if the filter targets restricted kinds. */
+static bool nip42_filter_requires_auth(const filter_t *filter) {
+    if (!filter) return false;
+    
+    /* Kind 4 (encrypted direct messages) requires auth per NIP-42 */
+    for (size_t i = 0; i < filter->kinds_count; i++) {
+        if (filter->kinds[i] == 4) return true;
+        /* Add other restricted kinds here as needed */
+    }
+    return false;
+}
+
+/* Check if an authenticated pubkey is authorized for a filter.
+ * For DMs (kind 4), the pubkey must be a participant: either listed in
+ * the filter's authors or in its 'p' tags. A wildcard kind-4 query with
+ * neither is overly broad and must be rejected (no full-table DM leak). */
+static bool nip42_is_authorized_for_filter(connection_id_t connection_id,
+                                            const filter_t *filter,
+                                            const char *auth_pubkey) {
+    (void)connection_id;
+    if (!filter || !auth_pubkey) return false;
+    
+    /* For kind 4, check if the authenticated pubkey is a participant */
+    for (size_t i = 0; i < filter->kinds_count; i++) {
+        if (filter->kinds[i] == 4) {
+            /* Participant as author */
+            for (size_t a = 0; a < filter->authors_count; a++) {
+                if (filter->authors[a] && strcmp(filter->authors[a], auth_pubkey) == 0) {
+                    return true;
+                }
+            }
+            /* Participant as 'p' tag */
+            for (size_t t = 0; t < filter->tags_count; t++) {
+                const tag_t *tag = &filter->tags[t];
+                if (tag->count > 1 && tag->elements[0] && strcmp(tag->elements[0], "p") == 0) {
+                    for (size_t v = 1; v < tag->count; v++) {
+                        if (tag->elements[v] && strcmp(tag->elements[v], auth_pubkey) == 0) {
+                            return true; /* Participant in the DM conversation */
+                        }
+                    }
+                }
+            }
+            return false; /* Kind 4 but not a participant */
+        }
+    }
+    return true; /* Non-restricted kind or no kind filter */
+}
+
+/* True if ANY authenticated pubkey on this connection authorizes the filter.
+ * NIP-42: "Clients MAY provide signed events from multiple pubkeys...
+ * Relays MUST treat all pubkeys as authenticated accordingly." */
+static bool nip42_any_pubkey_authorizes(connection_id_t connection_id,
+                                        const filter_t *filter) {
+    size_t n = nip_env_session_auth_count(connection_id);
+    size_t i;
+    for (i = 0; i < n; i++) {
+        const char *pk = nip_env_session_auth_at(connection_id, i);
+        if (pk && nip42_is_authorized_for_filter(connection_id, filter, pk)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Query authorization hook: called before query execution.
+ * Returns true to allow, false to reject with CLOSED message.
+ * Fills reason buffer with appropriate prefix (auth-required: or restricted:) */
+static bool nip42_query_authorize_fn(connection_id_t connection_id, filter_t *filters, size_t count,
+                                     char *reason, size_t reason_size, void *ctx) {
+    (void)ctx;
+
+    if (!filters || count == 0) return true;
+
+    {
+        nip42_ctx_t *cap_ctx = (nip42_ctx_t *)ctx;
+        if (cap_ctx && !cap_ctx->enabled) return true;
+    }
+    /* Check if any filter requires authentication */
+    bool requires_auth = false;
+    for (size_t i = 0; i < count; i++) {
+        if (nip42_filter_requires_auth(&filters[i])) {
+            requires_auth = true;
+            break;
+        }
+    }
+    
+    if (!requires_auth) return true; /* No auth needed for this query */
+    
+    /* Check if connection is authenticated (ANY pubkey counts per NIP-42). */
     const char *auth_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
     if (!auth_pubkey) {
-        snprintf(reason, reason_size, "auth-required: authentication required");
-        return false;
+        log_debug("NIP", "QUERY_AUTH", "connection_id=%llu auth-required (no auth)", (unsigned long long)connection_id);
+        if (reason && reason_size > 0) {
+            snprintf(reason, reason_size, "auth-required: we can't serve DMs to unauthenticated users");
+        }
+        return false; /* Will trigger CLOSED with auth-required */
     }
-    if (strcmp(auth_pubkey, event->pubkey) != 0) {
-        snprintf(reason, reason_size,
-                 "restricted: authenticated pubkey does not match event author");
-        return false;
+    
+    /* Check if ANY authenticated pubkey is authorized for the restricted filters */
+    bool authorized = false;
+    for (size_t i = 0; i < count; i++) {
+        if (nip42_filter_requires_auth(&filters[i]) &&
+            nip42_any_pubkey_authorizes(connection_id, &filters[i])) {
+            authorized = true;
+            break;
+        }
+        if (!nip42_filter_requires_auth(&filters[i])) {
+            authorized = true;
+            break;
+        }
     }
+    
+    if (!authorized) {
+        log_debug("NIP", "QUERY_AUTH", "connection_id=%llu restricted (auth=%s)", (unsigned long long)connection_id, auth_pubkey);
+        if (reason && reason_size > 0) {
+            snprintf(reason, reason_size, "restricted: authenticated pubkey not authorized for this query");
+        }
+        return false; /* Will trigger CLOSED with restricted */
+    }
+    
+    log_debug("NIP", "QUERY_AUTH", "connection_id=%llu authorized (auth=%s)", (unsigned long long)connection_id, auth_pubkey);
+    return true;
+}
+
+/* Query modify hook: called after query execution.
+ * Can add auth hint to EOSE if needed. */
+static bool nip42_query_modify_fn(connection_id_t connection_id, const filter_t *filters, size_t count,
+                                  bool has_more, int total_count, void *ctx) {
+    (void)connection_id;
+    (void)filters;
+    (void)count;
+    (void)has_more;
+    (void)total_count;
+    (void)ctx;
+    /* No result modification needed; auth hint handled by protocol_response capability */
     return true;
 }
 

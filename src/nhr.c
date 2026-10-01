@@ -2,6 +2,7 @@
 #include "nhr_loader.h"
 #include "crypto.h"
 #include "relay/connection_session.h"
+#include "log.h"
 #include <mongoose.h>
 #include <stdlib.h>
 #include <time.h>
@@ -125,20 +126,10 @@ static unsigned NHR_CALL host_crypto_count_leading_zero_bits(void *userdata,
 }
 
 static uintptr_t NHR_CALL host_connection_id(void *userdata, void *connection) {
-    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    Nhr_Connection_Node *node;
-    if (!runtime || !connection) return 0;
-    for (node = runtime->connections; node; node = node->next) {
-        if (node->connection.connection == connection) return node->connection.id;
-    }
-    node = (Nhr_Connection_Node *)calloc(1, sizeof(*node));
-    if (!node) return 0;
-    node->connection.id = ++runtime->next_connection_id;
-    if (!node->connection.id) node->connection.id = ++runtime->next_connection_id;
-    node->connection.connection = connection;
-    node->next = runtime->connections;
-    runtime->connections = node;
-    return node->connection.id;
+    (void)userdata;
+    if (!connection) return 0;
+    connection_session_t *session = connection_session_get_by_mg_connection((struct mg_connection *)connection);
+    return session ? connection_session_get_id(session) : 0;
 }
 
 static size_t NHR_CALL host_connection_snapshot(void *userdata,
@@ -198,19 +189,46 @@ static void NHR_CALL host_connection_clear_auth(void *userdata,
     connection_session_set_challenge(session, NULL);
 }
 
+/* Multi-pubkey session-auth services (ABI v3). Same host-owned list as the
+ * v2 services above. */
+static bool NHR_CALL host_connection_add_auth(void *userdata,
+                                              uintptr_t connection_id,
+                                              const char *pubkey) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    if (!session || !pubkey) return false;
+    connection_session_add_auth_pubkey(session, pubkey);
+    return true;
+}
+
+static bool NHR_CALL host_connection_has_auth(void *userdata,
+                                              uintptr_t connection_id,
+                                              const char *pubkey) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    return session ? connection_session_has_auth_pubkey(session, pubkey) : false;
+}
+
+static size_t NHR_CALL host_connection_get_auth_count(void *userdata,
+                                                      uintptr_t connection_id) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    return session ? connection_session_get_auth_pubkey_count(session) : 0;
+}
+
+static const char *NHR_CALL host_connection_get_auth_at(void *userdata,
+                                                        uintptr_t connection_id,
+                                                        size_t index) {
+    (void)userdata;
+    connection_session_t *session = connection_session_get(connection_id);
+    return session ? connection_session_get_auth_pubkey_at(session, index) : NULL;
+}
+
 void nhr_runtime_connection_closed(Nhr_Runtime *runtime, void *connection) {
-    Nhr_Connection_Node **link;
-    if (!runtime || !connection) return;
-    link = &runtime->connections;
-    while (*link) {
-        if ((*link)->connection.connection == connection) {
-            Nhr_Connection_Node *removed = *link;
-            *link = removed->next;
-            free(removed);
-            return;
-        }
-        link = &(*link)->next;
-    }
+    (void)runtime;
+    (void)connection;
+    /* Session cleanup is handled by the relay via connection_session_destroy().
+     * The host-owned connection_session list is the single source of truth. */
 }
 
 static bool nhr_runtime_load_generation(Nhr_Runtime *runtime,
@@ -228,8 +246,7 @@ static bool nhr_runtime_load_generation(Nhr_Runtime *runtime,
              (unsigned long)getpid(), runtime->generation);
 #endif
     if (!nhr_platform_copy(source_path, unique_path)) {
-        fprintf(stderr, "NHR: could not copy candidate '%s' to '%s'\n",
-                source_path, unique_path);
+        log_nhr_error("COPY", "could not copy candidate '%s' to '%s'", source_path, unique_path);
         return false;
     }
     if (!nhr_library_open(library, unique_path)) {
@@ -248,7 +265,7 @@ bool nhr_library_open(Nhr_Library *out, const char *path) {
 
     candidate.handle = nhr_platform_open(path, error, sizeof(error));
     if (!candidate.handle) {
-        fprintf(stderr, "NHR: could not load '%s': %s\n", path,
+        log_nhr_error("LOAD", "could not load '%s': %s", path,
                 error[0] ? error : "unknown loader error");
         memset(out, 0, sizeof(*out));
         return false;
@@ -260,7 +277,7 @@ bool nhr_library_open(Nhr_Library *out, const char *path) {
         if (!nhr_platform_symbol(candidate.handle, "nhr_module_" #name, \
                                  &candidate.api.name, sizeof(candidate.api.name), \
                                  error, sizeof(error))) { \
-            fprintf(stderr, "NHR: missing symbol nhr_module_%s in '%s': %s\n", \
+            log_nhr_error("LOAD", "missing symbol nhr_module_%s in '%s': %s", \
                     #name, path, error[0] ? error : "not found"); \
             nhr_platform_close(candidate.handle); \
             memset(out, 0, sizeof(*out)); \
@@ -271,7 +288,7 @@ bool nhr_library_open(Nhr_Library *out, const char *path) {
 #undef NHR_RESOLVE
 
     if (candidate.api.abi_version() != NHR_ABI_VERSION) {
-        fprintf(stderr, "NHR: ABI mismatch in '%s' (module=%u host=%u)\n",
+        log_nhr_error("LOAD", "ABI mismatch in '%s' (module=%u host=%u)",
                 path, candidate.api.abi_version(), NHR_ABI_VERSION);
         nhr_platform_close(candidate.handle);
         memset(out, 0, sizeof(*out));
@@ -321,6 +338,10 @@ bool nhr_runtime_init(Nhr_Runtime *runtime, storage_context_t *storage,
     runtime->services.connection_get_auth_pubkey = host_connection_get_auth_pubkey;
     runtime->services.connection_set_auth = host_connection_set_auth;
     runtime->services.connection_clear_auth = host_connection_clear_auth;
+    runtime->services.connection_add_auth = host_connection_add_auth;
+    runtime->services.connection_has_auth = host_connection_has_auth;
+    runtime->services.connection_get_auth_count = host_connection_get_auth_count;
+    runtime->services.connection_get_auth_at = host_connection_get_auth_at;
     runtime->services.alloc = host_alloc;
     runtime->services.free = host_free;
     /* Loader startup is LOAD -> ABI VALIDATION -> INIT -> RUN. */
@@ -436,11 +457,6 @@ void nhr_runtime_shutdown(Nhr_Runtime *runtime) {
     if (runtime->library.handle) {
         runtime->library.api.shutdown();
         nhr_library_close(&runtime->library);
-    }
-    while (runtime->connections) {
-        Nhr_Connection_Node *node = runtime->connections;
-        runtime->connections = node->next;
-        free(node);
     }
     memset(runtime, 0, sizeof(*runtime));
 }

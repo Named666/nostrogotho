@@ -13,6 +13,17 @@
  * 
  * All storage operations are synchronous and NOT thread-safe. A mutex
  * should be used at the application level if concurrent access is needed.
+ * 
+ * OWNERSHIP MODEL:
+ * - storage_find_events() TRANSFERS ownership of returned events to CALLER
+ *   (caller MUST call event_free() on each event, then free() the array)
+ * - storage_insert_record() BORROWS event - does NOT take ownership
+ *   (storage copies data if needed)
+ * - storage_get_event_by_id() TRANSFERS ownership to CALLER
+ * - storage_delete_events() BORROWS scope - does NOT take ownership
+ * - storage_count_events() BORROWS scope - does NOT take ownership
+ * - storage_find_ids_by_tag() TRANSFERS ownership of ID list to CALLER
+ *   (caller MUST call storage_free_id_list())
  * ============================================================================ */
 
 /* ============================================================================
@@ -185,7 +196,8 @@ typedef struct {
     /* get_event_by_id - Retrieve a single event by ID
      * Args: id - event ID (hex string)
      * Returns: malloc'd event_t on success, NULL if not found
-     *          caller must call event_free() to release
+     *          CALLER OWNS returned event - must call event_free() to release
+     * OWNERSHIP: TRANSFERS ownership to caller
      */
     event_t *(*get_event_by_id)(const char *id);
     
@@ -195,8 +207,9 @@ typedef struct {
      *        indexed_tags_count - number of tag index entries
      * Returns: storage_insert_result_t with result and error details
      * Note: May enforce uniqueness on event ID
+     * OWNERSHIP: BORROWS event - does NOT take ownership
      */
-    storage_insert_result_t (*insert_record)(const event_t *ev,
+    storage_insert_result_t (*insert_record)(const event_t *ev,  /* BORROWED */
                                              const storage_tag_match_t *indexed_tags,
                                              size_t indexed_tags_count);
     
@@ -298,8 +311,8 @@ typedef struct storage_transaction_t storage_transaction_t;
 /* storage_find_events - Find events matching scope
  *
  * Args:
- *   scope - selection scope (NULL = no filter, subject to backend safety)
- *   out_events - receives caller-owned array of caller-owned event_t*
+ *   scope - selection scope (NULL = no filter, subject to backend safety) - BORROWED
+ *   out_events - receives CALLER-OWNED array of CALLER-OWNED event_t*
  *   out_count - receives number of returned events
  *
  * Returns: true on success (including zero matches), false on database error
@@ -309,15 +322,16 @@ typedef struct storage_transaction_t storage_transaction_t;
  *   - Ordering: ORDER BY created_at DESC, id DESC
  *   - limit == 0 means no limit
  *   - offset skips first N matching events
- *   - Caller releases: event_free() each event, free() the array
+ *   - OWNERSHIP: TRANSFERS ownership of returned events to CALLER
+ *   - Caller MUST: event_free() each event, then free() the array
  */
-bool storage_find_events(const storage_event_scope_t *scope,
+bool storage_find_events(const storage_event_scope_t *scope,  /* BORROWED */
                          event_t ***out_events, size_t *out_count);
 
 /* storage_count_events - Count events matching scope
  *
  * Args:
- *   scope - selection scope (same semantics as storage_find_events)
+ *   scope - selection scope (same semantics as storage_find_events) - BORROWED
  *   out_count - receives total matching count
  *
  * Returns: true on success (including zero matches), false on database error
@@ -327,14 +341,15 @@ bool storage_find_events(const storage_event_scope_t *scope,
  *   - Returns total matching count without materializing events
  *   - Zero matches = success with *out_count == 0
  *   - Ignores limit and offset
+ *   - OWNERSHIP: BORROWS scope - does NOT take ownership
  */
-bool storage_count_events(const storage_event_scope_t *scope,
+bool storage_count_events(const storage_event_scope_t *scope,  /* BORROWED */
                           size_t *out_count);
 
 /* storage_delete_events - Delete events matching scope
  *
  * Args:
- *   scope - selection scope (same semantics as storage_find_events)
+ *   scope - selection scope (same semantics as storage_find_events) - BORROWED
  *   out_deleted - receives number of deleted rows (may be NULL)
  *
  * Returns: true on success (including zero matches), false on database error
@@ -345,8 +360,9 @@ bool storage_count_events(const storage_event_scope_t *scope,
  *   - Atomic from storage call perspective
  *   - limit controls maximum deleted rows (symmetry with find)
  *   - offset skips first N matching events before deleting
+ *   - OWNERSHIP: BORROWS scope - does NOT take ownership
  */
-bool storage_delete_events(const storage_event_scope_t *scope,
+bool storage_delete_events(const storage_event_scope_t *scope,  /* BORROWED */
                            size_t *out_deleted);
 
 /* Transaction API */
@@ -354,30 +370,35 @@ storage_transaction_t *storage_transaction_begin(void);
 bool storage_transaction_commit(storage_transaction_t *tx);
 void storage_transaction_rollback(storage_transaction_t *tx);
 
-bool storage_delete_events_tx(const storage_event_scope_t *scope,
+bool storage_delete_events_tx(const storage_event_scope_t *scope,  /* BORROWED */
                               storage_transaction_t *tx, size_t *out_deleted);
-bool storage_find_events_tx(const storage_event_scope_t *scope,
+bool storage_find_events_tx(const storage_event_scope_t *scope,  /* BORROWED */
                             storage_transaction_t *tx,
-                            event_t ***out_events, size_t *out_count);
+                            event_t ***out_events, size_t *out_count);  /* TRANSFERS ownership to caller */
 
-/* Replaceable event upsert (atomic delete-older-then-insert) */
-storage_insert_result_t storage_upsert_replaceable(const event_t *ev,
+/* Replaceable event upsert (atomic delete-older-then-insert)
+ * OWNERSHIP: BORROWS event - does NOT take ownership */
+storage_insert_result_t storage_upsert_replaceable(const event_t *ev,  /* BORROWED */
                                                     const storage_tag_match_t *indexed_tags,
                                                     size_t indexed_tags_count);
 
-/* Addressable event upsert (atomic delete-older-then-insert) */
-storage_insert_result_t storage_upsert_addressable(const event_t *ev,
+/* Addressable event upsert (atomic delete-older-then-insert)
+ * OWNERSHIP: BORROWS event - does NOT take ownership */
+storage_insert_result_t storage_upsert_addressable(const event_t *ev,  /* BORROWED */
                                                      const char *d_tag_value,
                                                      const storage_tag_match_t *indexed_tags,
                                                      size_t indexed_tags_count);
 
-/* Compound tag index lookup (AND of multiple tag name/value pairs) */
+/* Compound tag index lookup (AND of multiple tag name/value pairs)
+ * OWNERSHIP: TRANSFERS ownership of ID list to CALLER
+ * Caller MUST call storage_free_id_list() */
 bool storage_find_ids_by_tags(const char *const *tag_names,
                               const char *const *tag_values,
                               size_t tag_count,
                               char ***ids_out, size_t *count_out);
 
-/* Free ID list from storage_find_ids_by_tag or storage_find_ids_by_tags */
+/* Free ID list from storage_find_ids_by_tag or storage_find_ids_by_tags
+ * OWNERSHIP: Caller owns the ID list, this frees it */
 void storage_free_id_list(char **ids, size_t count);
 
 /* ============================================================================

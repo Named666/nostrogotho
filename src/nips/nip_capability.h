@@ -118,8 +118,10 @@ typedef struct {
 
 /* Query policy capability */
 typedef struct {
-    /* Called before query execution - can modify filters or reject */
-    bool (*authorize_query)(uintptr_t connection_id, filter_t *filters, size_t count, void *ctx);
+    /* Called before query execution - can modify filters or reject.
+     * Returns true to allow, false to reject. On reject, fills reason buffer. */
+    bool (*authorize_query)(uintptr_t connection_id, filter_t *filters, size_t count,
+                            char *reason, size_t reason_size, void *ctx);
     
     /* Called after query - can modify results or add hints */
     bool (*modify_results)(uintptr_t connection_id, const filter_t *filters, size_t count,
@@ -178,7 +180,7 @@ struct nip_capability {
  * Registry Operations
  * ============================================================================ */
 
-/* New NIPs declare ONE static table (see nip_template.c) — one entry per
+/* New NIPs declare ONE static table (see nip_template.c) -- one entry per
  * capability type implemented. No heap allocation: point .ctx at a static
  * struct (or NULL when the hooks need no state). nip_registry_register()
  * deep-copies each entry, so statics are safe and nothing leaks across
@@ -220,11 +222,11 @@ void nip_registry_iterate(nip_registry_t *registry, nip_capability_type_t type,
 
 /* Publication policies: ALL must permit (AND composition) */
 bool nip_composition_check_publication(nip_registry_t *registry, uintptr_t connection_id,
-                                       const event_t *event, char *reason, size_t reason_size);
+                                        const event_t *event, char *reason, size_t reason_size);
 
 /* Delivery policies: ANY may veto (OR composition for veto) */
 bool nip_composition_check_delivery(nip_registry_t *registry, const event_t *event,
-                                    uintptr_t connection_id);
+                                     uintptr_t connection_id);
 
 /* Kind handlers: ALL applicable handlers are consulted */
 typedef struct {
@@ -233,35 +235,36 @@ typedef struct {
 } nip_kind_composition_result_t;
 
 nip_kind_composition_result_t nip_composition_process_kind(nip_registry_t *registry,
-                                                           uintptr_t connection_id,
-                                                           const event_t *event,
-                                                           storage_context_t *storage,
-                                                           const char *relay_url);
+                                                            uintptr_t connection_id,
+                                                            const event_t *event,
+                                                            storage_context_t *storage,
+                                                            const char *relay_url);
 
 /* Maintenance: ALL registered timers run */
 void nip_composition_run_maintenance(nip_registry_t *registry, storage_context_t *storage);
 
 /* Query policy: ALL authorize_query must permit */
 bool nip_composition_authorize_query(nip_registry_t *registry, uintptr_t connection_id,
-                                     filter_t *filters, size_t count);
+                                      filter_t *filters, size_t count,
+                                      char *reason, size_t reason_size);
 
 /* Protocol response: FIRST non-NULL wins (explicit priority) */
 char *nip_composition_build_eose(nip_registry_t *registry, const char *sub,
-                                 bool has_more, bool auth_hint);
+                                  bool has_more, bool auth_hint);
 char *nip_composition_build_count(nip_registry_t *registry, const char *sub,
-                                  unsigned long count);
+                                   unsigned long count);
 
 /* Metadata: FIRST non-NULL wins */
 const char *nip_composition_get_info_document(nip_registry_t *registry);
 
 /* Auth hint: ANY provider may request it (OR composition) */
 bool nip_composition_needs_auth_hint(nip_registry_t *registry,
-                                     const filter_t *filters, size_t filters_count,
-                                     uintptr_t connection_id);
+                                      const filter_t *filters, size_t filters_count,
+                                      uintptr_t connection_id);
 
 /* Auth challenge: ALL providers with the hook send one */
 void nip_composition_send_auth_challenge(nip_registry_t *registry,
-                                         uintptr_t connection_id);
+                                          uintptr_t connection_id);
 
 /* ============================================================================
  * Capability Providers (self-registration)
@@ -303,67 +306,5 @@ void nip_registry_register_providers(nip_registry_t *registry);
     __attribute__((constructor)) static void nip_name##_register_provider(void) { \
         nip_capability_add_provider(nip_name##_register); \
     }
-
-/* ============================================================================
- * Shared NIP-provided helpers (cross-file callers)
- *
- * Each NIP is a single self-contained nipXX.c. The few helpers needed
- * outside their own file are declared here so no per-NIP header exists:
- *   - NIP-26 delegation/tag-index API: used by crypto.c (host signature
- *     path) and nhr_module.c (module storage adapter + delegation check).
- *   - NIP-42 session-auth API + migration types: used by nhr_module.c
- *     (reload state) and NIP-17 (delivery gating on authenticated pubkey).
- * Everything else in a NIP file is file-static.
- * ============================================================================ */
-
-/* NIP-26: verify a delegation tag (conditions + signature). */
-bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
-                            const char *conditions, const char *delegation_sig);
-
-/* NIP-26: generic tag-index pairs making delegated authors discoverable.
- * Caller owns the returned array and strings; free with free_index_tags. */
-bool nip26_extract_index_tags(const event_t *event,
-                              storage_tag_match_t **matches, size_t *count);
-void nip26_free_index_tags(storage_tag_match_t *matches, size_t count);
-bool nip26_query_index_tags(const filter_t *filters, size_t filters_count,
-                            storage_tag_match_t **matches, size_t *count);
-void nip26_set_crypto_services(
-    void (*hash_fn)(const uint8_t *, size_t, uint8_t[32]),
-    bool (*verify_fn)(const char *, const char *, const uint8_t[32]));
-
-/* NIP-42: opaque transport handle for migration (host-owned identity is the
- * connection_id_t; `connection` is the raw transport handle, never
- * dereferenced by NIP code). */
-struct mg_connection;
-typedef struct {
-    uintptr_t id;
-    struct mg_connection *connection;
-} nip42_connection_t;
-
-/* NIP-42: versioned auth-state snapshot for reload migration. Host-allocated,
- * host-freed; empty state (count 0) is a valid reload, not a failure. */
-typedef struct {
-    uint32_t version;
-    uint32_t count;
-    struct {
-        uintptr_t connection_id;
-        char challenge[17];
-        char pubkey[MAX_PUBKEY_SIZE + 1];
-    } clients[1024];
-} nip42_state_t;
-
-/* NIP-42: connection-ID auth API (state lives in host-owned sessions). */
-bool nip42_open_by_id(connection_id_t connection_id, char challenge[17]);
-bool nip42_open_challenge_by_id(connection_id_t connection_id, char challenge[17]);
-void nip42_close_by_id(connection_id_t connection_id);
-const char *nip42_authenticated_pubkey_by_id(connection_id_t connection_id);
-bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *event,
-                              const char *service_url, time_t now);
-bool nip42_save_state(nip42_state_t *state,
-                      const nip42_connection_t *connections,
-                      size_t connection_count);
-bool nip42_restore_state(const nip42_state_t *state,
-                         const nip42_connection_t *connections,
-                         size_t connection_count);
 
 #endif /* NIP_CAPABILITY_H_ */

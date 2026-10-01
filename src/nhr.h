@@ -30,10 +30,11 @@ typedef struct connection_snapshot connection_snapshot_t;
 #define NHR_EXPORT __attribute__((visibility("default")))
 #endif
 
-/* v2 adds the connection_* session-auth services so NIP-42 challenge/pubkey
- * state lives in host-owned sessions and survives module reload without a
- * migration blob. Rebuild host and module together on version change. */
-#define NHR_ABI_VERSION 2u
+/* v4 changes relay_config_t layout (owned string buffers, verbosity enum
+ * replacing bool debug_logging, nip42/hot_reload sections). v3 added the
+ * multi-pubkey session services. Rebuild host and module together on
+ * version change. */
+#define NHR_ABI_VERSION 4u
 #define NHR_STATE_VERSION 1u
 
 typedef struct {
@@ -41,16 +42,6 @@ typedef struct {
     void *data;
     size_t size;
 } Nhr_State;
-
-typedef struct {
-    uintptr_t id;
-    void *connection;
-} Nhr_Connection;
-
-typedef struct Nhr_Connection_Node {
-    Nhr_Connection connection;
-    struct Nhr_Connection_Node *next;
-} Nhr_Connection_Node;
 
 /* Resident process services. Storage callbacks are synchronous; buffers
  * returned by storage_get_event_copy are host-owned and must be freed through
@@ -114,6 +105,21 @@ typedef struct Nhr_Host {
                                          const char *pubkey);
     void (NHR_CALL *connection_clear_auth)(void *userdata,
                                            uintptr_t connection_id);
+    /* Multi-pubkey session-auth services (ABI v3). add_auth appends without
+     * clearing existing pubkeys; has_auth tests membership; count/at
+     * enumerate. Added in ABI v3; check for non-NULL before calling when
+     * talking to an older host. */
+    bool (NHR_CALL *connection_add_auth)(void *userdata,
+                                         uintptr_t connection_id,
+                                         const char *pubkey);
+    bool (NHR_CALL *connection_has_auth)(void *userdata,
+                                         uintptr_t connection_id,
+                                         const char *pubkey);
+    size_t (NHR_CALL *connection_get_auth_count)(void *userdata,
+                                                 uintptr_t connection_id);
+    const char *(NHR_CALL *connection_get_auth_at)(void *userdata,
+                                                   uintptr_t connection_id,
+                                                   size_t index);
     void *(NHR_CALL *alloc)(size_t size);
     void (NHR_CALL *free)(void *ptr);
 } Nhr_Host;
@@ -158,8 +164,6 @@ typedef struct {
     Nhr_Module active;
     relay_config_t config;
     unsigned generation;
-    uintptr_t next_connection_id;
-    Nhr_Connection_Node *connections;
     char published_path[1024];
     char loaded_path[1024];
 } Nhr_Runtime;

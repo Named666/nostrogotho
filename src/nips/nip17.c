@@ -7,7 +7,8 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_tags.h"
+#include "nips/nip42.h"      /* nip42_authenticated_pubkey_by_id */
+#include "protocol/event_tags.h"
 #include "protocol/protocol.h"
 #include <stdio.h>
 #include <stdlib.h>

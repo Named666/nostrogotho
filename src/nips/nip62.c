@@ -12,7 +12,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_tags.h"
+#include "protocol/event_tags.h"
 #include "../storage.h"
 #include <stdio.h>
 #include <stdlib.h>

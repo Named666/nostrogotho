@@ -12,6 +12,18 @@
  * Core data structures and memory management utilities for Nostr events,
  * filters, and tags. All structures using malloc'd memory require explicit
  * cleanup via their corresponding free functions.
+ * 
+ * OWNERSHIP MODEL:
+ * - event_alloc() -> caller owns, must call event_free()
+ * - event_release() -> releases fields only, does NOT free struct (for stack events)
+ * - event_free() -> releases fields AND frees struct (for heap events from event_alloc())
+ * - filter_alloc() -> caller owns, must call filter_free()
+ * - filter_release() -> releases fields only, does NOT free struct (for stack filters)
+ * - filter_free() -> releases fields AND frees struct (for heap filters from filter_alloc())
+ * - tag_alloc() -> caller owns, must call tag_free()
+ * - tag_free() -> releases elements AND frees struct
+ * - tags_array_alloc() -> caller owns, must call tags_array_free()
+ * - tags_array_free() -> releases tags AND frees struct
  * ============================================================================ */
 
 /* Maximum sizes for string fields - must fit in stack-allocated arrays */
@@ -144,59 +156,69 @@ typedef struct {
 
 /* event_alloc - Allocate and zero-initialize an event structure
  * Returns: pointer to new event, or NULL on allocation failure
+ * OWNERSHIP: TRANSFERS ownership to caller
  * Caller: must call event_free() to release */
 event_t *event_alloc(void);
 
 /* event_release - Release an event's dynamically allocated fields
- * Args: ev - pointer to event (NULL-safe)
+ * Args: ev - pointer to event (NULL-safe) - BORROWED
  * Note: Frees tags_json and content if allocated, but does NOT free the
  *       event_t struct itself. Use this for stack-allocated events.
- *       For heap-allocated events (from event_alloc()), use event_free(). */
+ *       For heap-allocated events (from event_alloc()), use event_free().
+ * OWNERSHIP: BORROWS event - does NOT take ownership */
 void event_release(event_t *ev);
 
 /* event_free - Free an event and its dynamically allocated fields
- * Args: ev - pointer to event (NULL-safe)
+ * Args: ev - pointer to event (NULL-safe) - OWNED
  * Note: Frees tags_json and content if allocated, then frees the struct.
- *       Only use for heap-allocated events (from event_alloc()). */
+ *       Only use for heap-allocated events (from event_alloc()).
+ * OWNERSHIP: TAKES ownership - caller must not use after call */
 void event_free(event_t *ev);
 
 /* filter_alloc - Allocate and zero-initialize a filter structure
  * Returns: pointer to new filter, or NULL on allocation failure
+ * OWNERSHIP: TRANSFERS ownership to caller
  * Caller: must call filter_free() to release */
 filter_t *filter_alloc(void);
 
 /* filter_release - Release a filter's dynamically allocated fields
- * Args: f - pointer to filter (NULL-safe)
+ * Args: f - pointer to filter (NULL-safe) - BORROWED
  * Note: Frees ids/authors/kinds/tags/search but does NOT free the filter_t
  *       struct itself. Use this for stack-allocated filters (e.g. those
  *       filled by json_parse_filter()). For heap-allocated filters from
- *       filter_alloc(), use filter_free(). */
+ *       filter_alloc(), use filter_free().
+ * OWNERSHIP: BORROWS filter - does NOT take ownership */
 void filter_release(filter_t *f);
 
 /* filter_free - Free a filter and all its dynamically allocated fields
- * Args: f - pointer to filter (NULL-safe)
- * Note: Recursively frees all string arrays and tag arrays */
+ * Args: f - pointer to filter (NULL-safe) - OWNED
+ * Note: Recursively frees all string arrays and tag arrays
+ * OWNERSHIP: TAKES ownership - caller must not use after call */
 void filter_free(filter_t *f);
 
 /* tag_alloc - Allocate a tag structure with capacity for element_count strings
  * Args: element_count - maximum elements this tag can hold
  * Returns: pointer to new tag with count=0, or NULL on failure
+ * OWNERSHIP: TRANSFERS ownership to caller
  * Note: Allocates the elements array but leaves count at 0 */
 tag_t *tag_alloc(size_t element_count);
 
 /* tag_free - Free a tag and all its element strings
- * Args: tag - pointer to tag (NULL-safe)
- * Note: Frees both the elements array and each element string */
+ * Args: tag - pointer to tag (NULL-safe) - OWNED
+ * Note: Frees both the elements array and each element string
+ * OWNERSHIP: TAKES ownership - caller must not use after call */
 void tag_free(tag_t *tag);
 
 /* tags_array_alloc - Allocate a tags array structure with capacity for tag_count tags
  * Args: tag_count - maximum tags this array can hold
- * Returns: pointer to new tags array with count=0, or NULL on failure */
+ * Returns: pointer to new tags array with count=0, or NULL on failure
+ * OWNERSHIP: TRANSFERS ownership to caller */
 tags_array_t *tags_array_alloc(size_t tag_count);
 
 /* tags_array_free - Free a tags array and all its contained tags
- * Args: tags - pointer to tags array (NULL-safe)
- * Note: Recursively frees all tag structures in the array */
+ * Args: tags - pointer to tags array (NULL-safe) - OWNED
+ * Note: Recursively frees all tag structures in the array
+ * OWNERSHIP: TAKES ownership - caller must not use after call */
 void tags_array_free(tags_array_t *tags);
 
 #endif /* NOSTROGOTHO_H_ */

@@ -25,7 +25,7 @@ struct relay {
     volatile sig_atomic_t stop_requested;
     subscription_manager_t *subscriptions;
     nip_registry_t *nip_registry;
-    bool debug_logging;
+    int verbosity; /* log_verbosity_t snapshot from config at create */
     Nhr_Runtime *host_runtime;
     uintptr_t next_connection_id;
     char watched_module_path[1024];
@@ -39,9 +39,6 @@ struct relay {
 };
 
 typedef struct relay relay_t;
-
-/* Initialize relay configuration with defaults */
-void relay_config_init(relay_config_t *config);
 
 /* Create and initialize a new relay instance */
 relay_t *relay_create(const relay_config_t *config, storage_context_t *storage);

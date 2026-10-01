@@ -1,9 +1,9 @@
 #include "crypto.h"
 #ifndef NHR_DYNAMIC_MODULE
-#include "nips/nip_capability.h" /* nip26_check_delegation (NIP-26 lives in src/nips/nip26.c) */
+#include "nips/nip26.h" /* nip26_check_delegation (NIP-26 lives in src/nips/nip26.c) */
 #endif
-#include "model/tag_iter.h"
-#include "model/event_tags.h"
+#include "protocol/tag_iter.h"
+#include "protocol/event_tags.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>

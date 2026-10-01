@@ -1,22 +1,67 @@
 #include "nip_capability.h"
-#include "../protocol/protocol.h"
+#include "nostrogotho.h"
+#include "storage.h"
+#include "relay/connection_session.h"
+#include "protocol/protocol.h"
 #include <stdlib.h>
 #include <string.h>
 
-/* ============================================================================
- * NIP_CAPABILITY.C - NIP Capability Registry Implementation
- * ============================================================================ */
+/* Provider list for self-registration */
+typedef struct nip_provider_node {
+    nip_capability_provider_fn provider;
+    struct nip_provider_node *next;
+} nip_provider_node_t;
 
-nip_registry_t *nip_registry_create(void) {
-    nip_registry_t *registry = calloc(1, sizeof(*registry));
-    return registry;
+static nip_provider_node_t *providers = NULL;
+
+void nip_capability_add_provider(nip_capability_provider_fn provider) {
+    nip_provider_node_t *node = malloc(sizeof(*node));
+    if (!node) return;
+    node->provider = provider;
+    node->next = providers;
+    providers = node;
 }
 
-static void nip_registry_free_nodes(nip_registry_t *registry) {
+void nip_registry_register_providers(nip_registry_t *registry) {
+    if (!registry) return;
+    for (nip_provider_node_t *n = providers; n; n = n->next) {
+        if (n->provider) n->provider(registry);
+    }
+}
+
+nip_registry_t *nip_registry_create(void) {
+    return calloc(1, sizeof(nip_registry_t));
+}
+
+void nip_registry_destroy(nip_registry_t *registry) {
+    if (!registry) return;
     nip_capability_t *cap = registry->capabilities;
     while (cap) {
         nip_capability_t *next = cap->next;
-        /* name was duplicated at register time; ctx is registrant-owned. */
+        free(cap);
+        cap = next;
+    }
+    free(registry);
+}
+
+void nip_registry_register(nip_registry_t *registry, const nip_capability_t *capability) {
+    if (!registry || !capability) return;
+    
+    nip_capability_t *node = malloc(sizeof(*node));
+    if (!node) return;
+    
+    *node = *capability;
+    node->name = strdup(capability->name);
+    node->next = registry->capabilities;
+    registry->capabilities = node;
+    registry->count++;
+}
+
+void nip_registry_clear(nip_registry_t *registry) {
+    if (!registry) return;
+    nip_capability_t *cap = registry->capabilities;
+    while (cap) {
+        nip_capability_t *next = cap->next;
         free((void *)cap->name);
         free(cap);
         cap = next;
@@ -25,68 +70,8 @@ static void nip_registry_free_nodes(nip_registry_t *registry) {
     registry->count = 0;
 }
 
-void nip_registry_destroy(nip_registry_t *registry) {
-    if (!registry) return;
-    nip_registry_free_nodes(registry);
-    free(registry);
-}
-
-void nip_registry_clear(nip_registry_t *registry) {
-    if (!registry) return;
-    nip_registry_free_nodes(registry);
-}
-
-/* ============================================================================
- * Capability Providers (self-registration)
- * ============================================================================ */
-
-#define NIP_CAPABILITY_MAX_PROVIDERS 32
-
-static nip_capability_provider_fn capability_providers[NIP_CAPABILITY_MAX_PROVIDERS];
-static size_t capability_provider_count;
-
-void nip_capability_add_provider(nip_capability_provider_fn provider) {
-    if (!provider || capability_provider_count >= NIP_CAPABILITY_MAX_PROVIDERS) return;
-    /* Guard against double registration of the same provider. */
-    for (size_t i = 0; i < capability_provider_count; i++) {
-        if (capability_providers[i] == provider) return;
-    }
-    capability_providers[capability_provider_count++] = provider;
-}
-
-void nip_registry_register_providers(nip_registry_t *registry) {
-    if (!registry) return;
-    for (size_t i = 0; i < capability_provider_count; i++) {
-        capability_providers[i](registry);
-    }
-}
-
-void nip_registry_register(nip_registry_t *registry, const nip_capability_t *capability) {
-    nip_capability_t *copy;
-    if (!registry || !capability) return;
-
-    copy = (nip_capability_t *)calloc(1, sizeof(*copy));
-    if (!copy) return;
-    /* Copy descriptor by value (function pointers + ctx pointer). */
-    *copy = *capability;
-    copy->next = NULL;
-    /* Duplicate the debug name so statics can be re-registered safely. */
-    if (capability->name) {
-        size_t len = strlen(capability->name) + 1;
-        char *dup = (char *)malloc(len);
-        if (!dup) { free(copy); return; }
-        memcpy(dup, capability->name, len);
-        copy->name = dup;
-    }
-
-    copy->next = registry->capabilities;
-    registry->capabilities = copy;
-    registry->count++;
-}
-
 nip_capability_t *nip_registry_get_by_type(nip_registry_t *registry, nip_capability_type_t type) {
     if (!registry) return NULL;
-    
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
         if (cap->type == type) return cap;
     }
@@ -96,7 +81,6 @@ nip_capability_t *nip_registry_get_by_type(nip_registry_t *registry, nip_capabil
 void nip_registry_iterate(nip_registry_t *registry, nip_capability_type_t type,
                           nip_capability_iter_fn fn, void *userdata) {
     if (!registry || !fn) return;
-    
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
         if (cap->type == type) {
             fn(cap, userdata);
@@ -105,11 +89,12 @@ void nip_registry_iterate(nip_registry_t *registry, nip_capability_type_t type,
 }
 
 /* ============================================================================
- * Composition Rules Implementation
+ * Composition Rules (Deterministic)
  * ============================================================================ */
 
+/* Publication policies: ALL must permit (AND composition) */
 bool nip_composition_check_publication(nip_registry_t *registry, uintptr_t connection_id,
-                                       const event_t *event, char *reason, size_t reason_size) {
+                                        const event_t *event, char *reason, size_t reason_size) {
     if (!registry) return true;
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
@@ -122,8 +107,9 @@ bool nip_composition_check_publication(nip_registry_t *registry, uintptr_t conne
     return true;
 }
 
+/* Delivery policies: ANY may veto (OR composition for veto) */
 bool nip_composition_check_delivery(nip_registry_t *registry, const event_t *event,
-                                    uintptr_t connection_id) {
+                                     uintptr_t connection_id) {
     if (!registry) return true;
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
@@ -136,46 +122,46 @@ bool nip_composition_check_delivery(nip_registry_t *registry, const event_t *eve
     return true;
 }
 
+/* Kind handlers: ALL applicable handlers are consulted */
 nip_kind_composition_result_t nip_composition_process_kind(nip_registry_t *registry,
-                                                           uintptr_t connection_id,
-                                                           const event_t *event,
-                                                           storage_context_t *storage,
-                                                           const char *relay_url) {
+                                                            uintptr_t connection_id,
+                                                            const event_t *event,
+                                                            storage_context_t *storage,
+                                                            const char *relay_url) {
     nip_kind_composition_result_t result = {0};
     result.result.accepted = false;
-    result.any_handler_matched = false;
-    
-    if (!registry) return result;
+    result.result.should_broadcast = false;
+    result.result.should_store = false;
+    result.result.response_msg[0] = '\0';
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
         if (cap->type == NIP_CAP_KIND_HANDLER && cap->caps.kind_handler.handles_kind) {
             if (cap->caps.kind_handler.handles_kind(event->kind, cap->ctx)) {
                 result.any_handler_matched = true;
-                if (cap->caps.kind_handler.process_event) {
-                    nip01_process_result_t handler_result = cap->caps.kind_handler.process_event(
-                        connection_id, event, storage, relay_url, cap->ctx);
-                    
-                    if (handler_result.accepted) {
-                        result.result = handler_result;
-                        return result;
-                    }
-                    
-                    /* If handler rejected, keep its reason if we don't have one yet */
-                    if (!result.result.accepted && handler_result.response_msg[0] != '\0' && 
-                        result.result.response_msg[0] == '\0') {
-                        snprintf(result.result.response_msg, sizeof(result.result.response_msg), 
-                                "%s", handler_result.response_msg);
-                    }
+                nip01_process_result_t r = cap->caps.kind_handler.process_event(connection_id, event, storage, relay_url, cap->ctx);
+                
+                /* Composition: if any handler rejects, reject. If any accepts, accept.
+                 * Broadcast if any handler says broadcast. */
+                if (!r.accepted) {
+                    result.result.accepted = false;
+                    strncpy(result.result.response_msg, r.response_msg, sizeof(result.result.response_msg) - 1);
+                } else if (!result.result.accepted) {
+                    result.result.accepted = true;
+                }
+                if (r.should_broadcast) result.result.should_broadcast = true;
+                if (r.should_store) result.result.should_store = true;
+                if (r.response_msg[0] && result.result.response_msg[0] == '\0') {
+                    strncpy(result.result.response_msg, r.response_msg, sizeof(result.result.response_msg) - 1);
                 }
             }
         }
     }
-    
     return result;
 }
 
+/* Maintenance: ALL registered timers run */
 void nip_composition_run_maintenance(nip_registry_t *registry, storage_context_t *storage) {
-    if (!registry || !storage) return;
+    if (!registry) return;
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
         if (cap->type == NIP_CAP_MAINTENANCE && cap->caps.maintenance.timer) {
@@ -184,13 +170,15 @@ void nip_composition_run_maintenance(nip_registry_t *registry, storage_context_t
     }
 }
 
+/* Query policy: ALL authorize_query must permit */
 bool nip_composition_authorize_query(nip_registry_t *registry, uintptr_t connection_id,
-                                     filter_t *filters, size_t count) {
+                                      filter_t *filters, size_t count,
+                                      char *reason, size_t reason_size) {
     if (!registry) return true;
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
         if (cap->type == NIP_CAP_QUERY_POLICY && cap->caps.query_policy.authorize_query) {
-            if (!cap->caps.query_policy.authorize_query(connection_id, filters, count, cap->ctx)) {
+            if (!cap->caps.query_policy.authorize_query(connection_id, filters, count, reason, reason_size, cap->ctx)) {
                 return false;
             }
         }
@@ -199,7 +187,7 @@ bool nip_composition_authorize_query(nip_registry_t *registry, uintptr_t connect
 }
 
 char *nip_composition_build_eose(nip_registry_t *registry, const char *sub,
-                                 bool has_more, bool auth_hint) {
+                                  bool has_more, bool auth_hint) {
     if (!registry) return NULL;
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
@@ -212,7 +200,7 @@ char *nip_composition_build_eose(nip_registry_t *registry, const char *sub,
 }
 
 char *nip_composition_build_count(nip_registry_t *registry, const char *sub,
-                                  unsigned long count) {
+                                   unsigned long count) {
     if (!registry) return NULL;
     
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
@@ -224,6 +212,7 @@ char *nip_composition_build_count(nip_registry_t *registry, const char *sub,
     return NULL;
 }
 
+/* Metadata: FIRST non-NULL wins */
 const char *nip_composition_get_info_document(nip_registry_t *registry) {
     if (!registry) return NULL;
     
@@ -236,16 +225,15 @@ const char *nip_composition_get_info_document(nip_registry_t *registry) {
     return NULL;
 }
 
+/* Auth hint: ANY provider may request it (OR composition) */
 bool nip_composition_needs_auth_hint(nip_registry_t *registry,
-                                     const filter_t *filters, size_t filters_count,
-                                     uintptr_t connection_id) {
+                                      const filter_t *filters, size_t filters_count,
+                                      uintptr_t connection_id) {
     if (!registry) return false;
-
+    
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
-        if (cap->type == NIP_CAP_PROTOCOL_RESPONSE &&
-            cap->caps.protocol_response.needs_auth_hint) {
-            if (cap->caps.protocol_response.needs_auth_hint(filters, filters_count,
-                                                            connection_id, cap->ctx)) {
+        if (cap->type == NIP_CAP_PROTOCOL_RESPONSE && cap->caps.protocol_response.needs_auth_hint) {
+            if (cap->caps.protocol_response.needs_auth_hint(filters, filters_count, connection_id, cap->ctx)) {
                 return true;
             }
         }
@@ -253,13 +241,13 @@ bool nip_composition_needs_auth_hint(nip_registry_t *registry,
     return false;
 }
 
+/* Auth challenge: ALL providers with the hook send one */
 void nip_composition_send_auth_challenge(nip_registry_t *registry,
-                                         uintptr_t connection_id) {
+                                          uintptr_t connection_id) {
     if (!registry) return;
-
+    
     for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
-        if (cap->type == NIP_CAP_PROTOCOL_RESPONSE &&
-            cap->caps.protocol_response.send_auth_challenge) {
+        if (cap->type == NIP_CAP_PROTOCOL_RESPONSE && cap->caps.protocol_response.send_auth_challenge) {
             cap->caps.protocol_response.send_auth_challenge(connection_id, cap->ctx);
         }
     }

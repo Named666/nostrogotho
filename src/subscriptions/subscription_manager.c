@@ -2,18 +2,22 @@
 #include "nostrogotho.h"
 #include "storage.h"
 #include "json_util.h"
-#include "model/tag_iter.h"
-#include "model/event_tags.h"
+#include "protocol/tag_iter.h"
+#include "protocol/event_tags.h"
 #include "nips/nip_capability.h"
 #include "protocol/protocol.h"
+#include "log.h"
 #include <mongoose.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 /* mg_str_contains() is shared from json_util.h. */
 
 /* Forward declaration */
 struct query_context;
+
+/* Use log.h for structured logging */
 
 /* ============================================================================
  * New Query Implementation using Unified Storage API (NOSTR_EVENT_STORAGE_SPEC.md)
@@ -92,12 +96,12 @@ static void free_scope_tags(storage_event_scope_t *scope) {
 
 /* Query context structure - forward declared above */
 struct query_context {
-    struct mg_connection *connection;
+    connection_id_t connection_id;
     const char *sub;
     const filter_t *query_filters;
     size_t query_filters_count;
     bool do_count;
-    void (*send_json)(struct mg_connection *, const char *);
+    void (*send_json)(connection_id_t connection_id, const char *);
     bool (*can_deliver)(const event_t *, connection_id_t, void *);
     void *can_deliver_ctx;
     char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx);
@@ -107,18 +111,18 @@ struct query_context {
     void *protocol_response_ctx;
     bool has_more;
     int total_count;
-    connection_id_t connection_id;
 };
 
 /* Query using new unified storage API */
+/* BORROWS filters - does NOT take ownership. Filters owned by caller (subscription_manager or protocol_message). */
 static bool query_with_new_api(subscription_manager_t *manager,
                                storage_context_t *storage,
-                               struct mg_connection *connection,
+                               connection_id_t connection_id,
                                const char *sub,
-                               filter_t *filters,
+                               filter_t *filters,  /* BORROWED */
                                size_t filters_count,
                                bool do_count,
-                               void (*send_json)(struct mg_connection *, const char *),
+                               void (*send_json)(connection_id_t connection_id, const char *),
                                bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                void *can_deliver_ctx,
                                char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx),
@@ -130,13 +134,13 @@ static bool query_with_new_api(subscription_manager_t *manager,
                                void (*send_auth_challenge)(connection_id_t connection_id,
                                                            void *ctx),
                                void *protocol_response_ctx) {
-    if (!manager || !storage || !connection || !sub || !filters || filters_count == 0 || !send_json) return false;
+    if (!manager || !storage || !connection_id || !sub || !filters || filters_count == 0 || !send_json) return false;
 
-    fprintf(stderr, "[DEBUG] query_with_new_api: START sub=%s filters=%zu do_count=%d\n", sub, filters_count, do_count);
+    log_debug("SUBSCRIPTION", "QUERY", "ENTRY sub=%s filters=%zu do_count=%d filters_ptr=%p (BORROWED)", 
+              sub, filters_count, do_count, (void*)filters);
 
-    /* Resolve the connection ID from the live session */
-    connection_session_t *session = connection_session_get_by_mg_connection(connection);
-    connection_id_t conn_id = session ? connection_session_get_id(session) : 0;
+    /* connection_id is already resolved by caller */
+    connection_id_t conn_id = connection_id;
 
     bool success = true;
     size_t total_count = 0;
@@ -171,7 +175,7 @@ static bool query_with_new_api(subscription_manager_t *manager,
             event_t **events = NULL;
             size_t count = 0;
             if (storage_find_events(&scope, &events, &count)) {
-                fprintf(stderr, "[DEBUG] query_with_new_api: filter[%zu] found %zu events\n", f, count);
+                log_debug("SUBSCRIPTION", "QUERY", "filter[%zu] found %zu events", f, count);
                 for (size_t i = 0; i < count && !has_more; i++) {
                     if (sent_count >= limit) {
                         has_more = true;
@@ -191,9 +195,10 @@ static bool query_with_new_api(subscription_manager_t *manager,
                         json_builder_append_string(&builder, "EVENT");
                         json_builder_append_string(&builder, sub);
                         json_serialize_event(events[i], &builder);
-                        send_json(connection, json_builder_finish(&builder));
+                        send_json(conn_id, json_builder_finish(&builder));
                         sent_count++;
                     }
+                    /* event_free() - storage_find_events TRANSFERS ownership of returned events to caller */
                     event_free(events[i]);
                 }
                 free(events);
@@ -205,7 +210,7 @@ static bool query_with_new_api(subscription_manager_t *manager,
     }
 
     if (!success) {
-        fprintf(stderr, "[DEBUG] query_with_new_api: FAILED\n");
+        log_debug("SUBSCRIPTION", "QUERY", "FAILED");
         return false;
     }
 
@@ -224,13 +229,13 @@ static bool query_with_new_api(subscription_manager_t *manager,
         if (build_eose) {
             char *eose = build_eose(sub, has_more, auth_hint, protocol_response_ctx);
             if (eose) {
-                send_json(connection, eose);
+                send_json(conn_id, eose);
                 free(eose);
             }
         } else {
             char *eose = protocol_serialize_eose(sub, has_more, auth_hint);
             if (eose) {
-                send_json(connection, eose);
+                send_json(conn_id, eose);
                 free(eose);
             }
         }
@@ -238,19 +243,19 @@ static bool query_with_new_api(subscription_manager_t *manager,
         if (build_count) {
             char *count_resp = build_count(sub, (unsigned long)total_count, protocol_response_ctx);
             if (count_resp) {
-                send_json(connection, count_resp);
+                send_json(conn_id, count_resp);
                 free(count_resp);
             }
         } else {
             char *count_resp = protocol_serialize_count(sub, (unsigned long)total_count);
             if (count_resp) {
-                send_json(connection, count_resp);
+                send_json(conn_id, count_resp);
                 free(count_resp);
             }
         }
     }
 
-    fprintf(stderr, "[DEBUG] query_with_new_api: END sub=%s sent=%zu has_more=%d\n", sub, total_count, has_more);
+    log_debug("SUBSCRIPTION", "QUERY", "END sub=%s sent=%zu has_more=%d", sub, total_count, has_more);
 
     return true;
 }
@@ -310,30 +315,33 @@ void subscription_manager_destroy(subscription_manager_t *manager) {
 bool subscription_manager_create_subscription(subscription_manager_t *manager,
                                               connection_id_t connection_id,
                                               const char *id,
-                                              filter_t *filters,
+                                              filter_t *filters,  /* TAKES OWNERSHIP on success */
                                               size_t filters_count) {
     if (!manager || !connection_id || !id || !filters || filters_count == 0) return false;
     if (strlen(id) > manager->max_subscription_id_length) return false;
     if (filters_count > manager->max_filters_per_subscription) return false;
     
-    fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: conn_id=%u sub=%s filters=%zu\n", 
-            (unsigned)connection_id, id, filters_count);
+    log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "ENTRY conn_id=%u sub=%s filters=%zu filters_ptr=%p (caller owns)", 
+            (unsigned)connection_id, id, filters_count, (void*)filters);
     
     /* Count existing subscriptions for this connection */
     size_t count = 0;
     for (subscription_t *s = manager->subscriptions; s; s = s->next) {
         if (s->connection_id == connection_id) count++;
     }
-    fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: existing subscriptions for conn_id=%u: %zu\n", 
+    log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "existing subscriptions for conn_id=%u: %zu", 
             (unsigned)connection_id, count);
-    if (count >= manager->max_subscriptions_per_connection) return false;
+    if (count >= manager->max_subscriptions_per_connection) {
+        log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "EXIT early (too many), caller retains ownership of filters");
+        return false;
+    }
     
     /* Remove any existing subscription with same ID for this connection */
     subscription_t **link = &manager->subscriptions;
     while (*link) {
         subscription_t *sub = *link;
         if (sub->connection_id == connection_id && strcmp(sub->id, id) == 0) {
-            fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: removing existing sub=%s for conn_id=%u\n", 
+            log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "removing existing sub=%s for conn_id=%u", 
                     id, (unsigned)connection_id);
             *link = sub->next;
             for (size_t i = 0; i < sub->filters_count; i++) filter_release(&sub->filters[i]);
@@ -347,21 +355,27 @@ bool subscription_manager_create_subscription(subscription_manager_t *manager,
     }
     
     subscription_t *subscription = calloc(1, sizeof(*subscription));
-    if (!subscription) return false;
+    if (!subscription) {
+        log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "EXIT (OOM), caller retains ownership of filters");
+        return false;
+    }
     
     subscription->id = strdup(id);
     if (!subscription->id) {
         free(subscription);
+        log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "EXIT (strdup failed), caller retains ownership of filters");
         return false;
     }
     
+    /* TRANSFER OWNERSHIP: subscription now owns filters */
     subscription->connection_id = connection_id;
     subscription->filters = filters;
     subscription->filters_count = filters_count;
     subscription->next = manager->subscriptions;
     manager->subscriptions = subscription;
     
-    fprintf(stderr, "[DEBUG] subscription_manager_create_subscription: created sub=%s for conn_id=%u (total now %zu)\n", 
+    log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "SUCCESS - ownership TRANSFERRED to subscription_manager, filters_ptr=%p", (void*)filters);
+    log_debug("SUBSCRIPTION", "CREATE_SUBSCRIPTION", "created sub=%s for conn_id=%u (total now %zu)", 
             id, (unsigned)connection_id, count + 1);
     
     return true;
@@ -372,20 +386,19 @@ void subscription_manager_close_subscription(subscription_manager_t *manager,
                                              const char *id) {
     if (!manager || !connection_id || !id) return;
     
-    fprintf(stderr, "[DEBUG] subscription_manager_close_subscription: conn_id=%u sub=%s\n", 
-            (unsigned)connection_id, id);
+    log_sub_debug(connection_id, id, "CLOSE_SUBSCRIPTION", "ENTRY");
     
     subscription_t **link = &manager->subscriptions;
     while (*link) {
         subscription_t *sub = *link;
         if (sub->connection_id == connection_id && strcmp(sub->id, id) == 0) {
             *link = sub->next;
+            log_sub_debug(connection_id, id, "CLOSE_SUBSCRIPTION", "FREEING filters (subscription_manager owned them)");
             for (size_t i = 0; i < sub->filters_count; i++) filter_release(&sub->filters[i]);
             free(sub->filters);
             free(sub->id);
             free(sub);
-            fprintf(stderr, "[DEBUG] subscription_manager_close_subscription: removed sub=%s for conn_id=%u\n", 
-                    id, (unsigned)connection_id);
+            log_sub_debug(connection_id, id, "CLOSE_SUBSCRIPTION", "removed sub=%s", id);
             break;
         } else {
             link = &sub->next;
@@ -397,7 +410,7 @@ void subscription_manager_remove_connection(subscription_manager_t *manager,
                                             connection_id_t connection_id) {
     if (!manager || !connection_id) return;
     
-    fprintf(stderr, "[DEBUG] subscription_manager_remove_connection: conn_id=%u\n", (unsigned)connection_id);
+    log_debug("SUBSCRIPTION", "REMOVE_CONNECTION", "ENTRY conn_id=%u", (unsigned)connection_id);
     
     subscription_t **link = &manager->subscriptions;
     size_t removed = 0;
@@ -405,6 +418,7 @@ void subscription_manager_remove_connection(subscription_manager_t *manager,
         subscription_t *sub = *link;
         if (sub->connection_id == connection_id) {
             *link = sub->next;
+            log_sub_debug(connection_id, sub->id, "REMOVE_CONNECTION", "FREEING filters (subscription_manager owned them)");
             for (size_t i = 0; i < sub->filters_count; i++) filter_release(&sub->filters[i]);
             free(sub->filters);
             free(sub->id);
@@ -415,8 +429,7 @@ void subscription_manager_remove_connection(subscription_manager_t *manager,
         }
     }
     
-    fprintf(stderr, "[DEBUG] subscription_manager_remove_connection: removed %zu subscriptions for conn_id=%u\n", 
-            removed, (unsigned)connection_id);
+    log_debug("SUBSCRIPTION", "REMOVE_CONNECTION", "removed %zu subscriptions for conn_id=%u", removed, (unsigned)connection_id);
 }
 
 static bool matches_filter(const filter_t *filter, const event_t *event) {
@@ -472,10 +485,10 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
                                             const event_t *event,
                                             bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                             void *can_deliver_ctx,
-                                            void (*send_event)(struct mg_connection *, const char *, const event_t *)) {
+                                            void (*send_event)(connection_id_t connection_id, const char *, const event_t *)) {
     if (!manager || !event || !send_event) return;
     
-    fprintf(stderr, "[DEBUG] subscription_manager_match_and_deliver: event kind=%d id=%.16s...\n", 
+    log_event_debug(0, event->id, event->kind, "MATCH_AND_DELIVER", "event kind=%d id=%.16s...", 
             event->kind, event->id);
     
     size_t delivered = 0;
@@ -493,20 +506,19 @@ void subscription_manager_match_and_deliver(subscription_manager_t *manager,
                 can_deliver_result = can_deliver(event, sub->connection_id, can_deliver_ctx);
             }
             if (can_deliver_result) {
-                /* Get the Mongoose connection from the connection session */
+                /* Verify the connection still exists */
                 connection_session_t *session = connection_session_get(sub->connection_id);
-                struct mg_connection *conn = session ? connection_session_get_mg_connection(session) : NULL;
-                if (conn) {
-                    fprintf(stderr, "[DEBUG] subscription_manager_match_and_deliver: delivering to conn_id=%u sub=%s\n", 
+                if (session) {
+                    log_sub_debug(sub->connection_id, sub->id, "MATCH_AND_DELIVER", "delivering to conn_id=%u sub=%s", 
                             (unsigned)sub->connection_id, sub->id);
-                    send_event(conn, sub->id, event);
+                    send_event(sub->connection_id, sub->id, event);
                     delivered++;
                 }
             }
         }
     }
     
-    fprintf(stderr, "[DEBUG] subscription_manager_match_and_deliver: delivered to %zu connections\n", delivered);
+    log_debug("SUBSCRIPTION", "MATCH_AND_DELIVER", "delivered to %zu connections", delivered);
 }
 
 /* Shared delivery pipeline for stored results: parse the stored
@@ -543,20 +555,20 @@ static bool query_frame_passes_delivery(struct query_context *ctx,
 
 static void query_sender(const char *json_event, void *userdata) {
     struct query_context *ctx = (struct query_context *)userdata;
-    if (!ctx || !ctx->send_json || !ctx->connection) return;
+    if (!ctx || !ctx->send_json || !ctx->connection_id) return;
 
     if (!query_frame_passes_delivery(ctx, json_event)) return;
-    ctx->send_json(ctx->connection, json_event);
+    ctx->send_json(ctx->connection_id, json_event);
 }
 
 bool subscription_manager_query(subscription_manager_t *manager,
                                 storage_context_t *storage,
-                                struct mg_connection *connection,
+                                connection_id_t connection_id,
                                 const char *sub,
-                                filter_t *filters,
+                                filter_t *filters,  /* BORROWED - caller retains ownership */
                                 size_t filters_count,
                                 bool do_count,
-                                void (*send_json)(struct mg_connection *, const char *),
+                                void (*send_json)(connection_id_t connection_id, const char *),
                                 bool (*can_deliver)(const event_t *, connection_id_t, void *),
                                 void *can_deliver_ctx,
                                 char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx),
@@ -567,10 +579,30 @@ bool subscription_manager_query(subscription_manager_t *manager,
                                                         void *ctx),
                                 void (*send_auth_challenge)(connection_id_t connection_id,
                                                             void *ctx),
-                                void *protocol_response_ctx) {
-    fprintf(stderr, "[DEBUG] subscription_manager_query: sub=%s filters=%zu do_count=%d\n", 
-            sub, filters_count, do_count);
-    return query_with_new_api(manager, storage, connection, sub, filters, filters_count,
+                                bool (*authorize_query)(connection_id_t connection_id, filter_t *filters,
+                                                        size_t filters_count, char *reason, size_t reason_size,
+                                                        void *ctx),
+                                void *authorize_query_ctx,
+                                void *protocol_response_ctx,
+                                char *out_reason, size_t out_reason_size) {
+    log_debug("SUBSCRIPTION", "QUERY", "ENTRY sub=%s filters=%zu do_count=%d filters_ptr=%p (BORROWED)", 
+              sub, filters_count, do_count, (void*)filters);
+    
+    /* Check query authorization before execution. Reason is propagated to
+     * the caller so it can send CLOSED with the specific NIP-42 prefix
+     * (auth-required: vs restricted:) instead of a generic message. */
+    char reject_reason[256] = {0};
+    if (authorize_query && !authorize_query(connection_id, filters, filters_count,
+                                            reject_reason, sizeof(reject_reason),
+                                            authorize_query_ctx)) {
+        log_debug("SUBSCRIPTION", "QUERY", "REJECTED: %s", reject_reason);
+        if (out_reason && out_reason_size > 0) {
+            snprintf(out_reason, out_reason_size, "%s", reject_reason);
+        }
+        return false; /* Caller should send CLOSED with reject_reason */
+    }
+    
+    return query_with_new_api(manager, storage, connection_id, sub, filters, filters_count,
                               do_count, send_json, can_deliver, can_deliver_ctx,
                               build_eose, build_count, needs_auth_hint,
                               send_auth_challenge, protocol_response_ctx);

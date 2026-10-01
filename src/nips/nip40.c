@@ -14,8 +14,9 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "model/event_tags.h"
+#include "protocol/event_tags.h"
 #include "../storage.h"
+#include "log.h"
 #include <stdio.h>
 #include <time.h>
 #include <string.h>
@@ -71,14 +72,13 @@ static void nip40_garbage_collect(void *arg) {
                                       nip40_expiry_predicate,
                                       NULL, &deleted, next_id, sizeof(next_id),
                                       &more)) {
-            fprintf(stderr, "NIP-40 GC: storage selection failed\n");
+            log_nip_error("NIP-40", "GC", "storage selection failed");
             return;
         }
         total += deleted;
         snprintf(cursor, sizeof(cursor), "%s", next_id);
     } while (more);
-    if (total > 0) fprintf(stdout, "[NIP-40 GC] deleted %lu expired event(s)\n",
-                           (unsigned long)total);
+    if (total > 0) log_nip_info("NIP-40", "GC", "deleted %lu expired event(s)", (unsigned long)total);
 }
 
 /* ============================================================================

@@ -14,7 +14,7 @@
 #include "nip_template.h"
 #include "nip_capability.h"
 #include "nip_macros.h"
-#include "model/event_tags.h"
+#include "protocol/event_tags.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>

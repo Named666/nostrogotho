@@ -19,11 +19,14 @@
  *   - NIP code NEVER sees Mongoose (`struct mg_connection`) or SQLite.
  *     Connections are opaque `connection_id_t`; storage goes through
  *     `storage_context_t`; replies are built with protocol_serialize_* and
- *     sent with relay_send_json() (host) / nhr_module_send_json() (module).
+ *     sent with nip_env_send_json() from nips/nip_env.h (same call in
+ *     monolithic and hot-reload module builds — never include
+ *     relay/relay.h or nhr_module.h here, and never test
+ *     NHR_BUILD_MODULE: nip_env.c owns that branch).
  *   - No NIP sends OK/EOSE/CLOSED itself for the normal EVENT/REQ flow.
  *     Return a policy decision; the relay core owns framing + transport.
  *   - State that must survive `nob -hr` reloads lives in host-owned
- *     connection_session_t (challenge/pubkey) or is re-derivable in
+ *     sessions (via nip_env_session_* in nips/nip_env.h) or is re-derivable in
  *     lifecycle init. Module statics die with the old .so/.dll — never
  *     rely on them across a reload. Empty migration state is valid.
  *   - Composition is deterministic, never registration-order dependent:
@@ -39,13 +42,9 @@
  */
 
 #include "nip_capability.h"
-#include "model/tag_iter.h"
+#include "nips/nip_env.h"    /* send/session/validate: same call in all builds */
+#include "protocol/tag_iter.h"
 #include "protocol/protocol.h"
-#include "relay/connection_session.h"
-#include "relay/relay.h"            /* host builds: relay_send_json() */
-#ifdef NHR_BUILD_MODULE
-#include "nhr_module.h"             /* module builds: nhr_module_send_json() */
-#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -71,12 +70,7 @@ static nipxx_ctx_t nipxx_ctx;
 
 /* Send a JSON frame without touching transport types. */
 static void nipxx_send_json(connection_id_t id, const char *json) {
-    if (!json) return;
-#ifdef NHR_BUILD_MODULE
-    nhr_module_send_json(id, json, strlen(json));
-#else
-    relay_send_json(id, json);
-#endif
+    nip_env_send_json(id, json);
 }
 
 /* ============================================================================
@@ -88,7 +82,7 @@ static void nipxx_send_json(connection_id_t id, const char *json) {
  * post_reload) before any traffic. */
 static void nipxx_lifecycle_init(const relay_config_t *config, void *ctx) {
     nipxx_ctx_t *c = (nipxx_ctx_t *)ctx;
-    if (c && config && config->service_url)
+    if (c && config)
         snprintf(c->service_url, sizeof(c->service_url), "%s", config->service_url);
 }
 

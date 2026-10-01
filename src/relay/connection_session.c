@@ -11,7 +11,8 @@ struct connection_session {
     uintptr_t connection_id;
     struct mg_connection *mg_connection;
     auth_state_t auth_state;
-    char *auth_pubkey;
+    char **auth_pubkeys;
+    size_t auth_pubkeys_count;
     char *challenge;
     void *protocol_state;
     struct connection_session *next;
@@ -27,7 +28,8 @@ connection_id_t connection_session_create(uintptr_t connection_id,
     session->connection_id = connection_id;
     session->mg_connection = connection;
     session->auth_state = AUTH_STATE_NONE;
-    session->auth_pubkey = NULL;
+    session->auth_pubkeys = NULL;
+    session->auth_pubkeys_count = 0;
     session->challenge = NULL;
     session->protocol_state = NULL;
     session->next = sessions;
@@ -49,7 +51,10 @@ void connection_session_destroy(connection_session_t *session) {
         link = &(*link)->next;
     }
     
-    free(session->auth_pubkey);
+    for (size_t i = 0; i < session->auth_pubkeys_count; i++) {
+        free(session->auth_pubkeys[i]);
+    }
+    free(session->auth_pubkeys);
     free(session->challenge);
     free(session);
 }
@@ -70,13 +75,75 @@ connection_session_t *connection_session_get_by_mg_connection(struct mg_connecti
 
 void connection_session_set_auth(connection_session_t *session, const char *pubkey) {
     if (!session) return;
-    free(session->auth_pubkey);
-    session->auth_pubkey = pubkey ? strdup(pubkey) : NULL;
-    if (pubkey) session->auth_state = AUTH_STATE_AUTHENTICATED;
+    
+    /* Clear existing pubkeys */
+    for (size_t i = 0; i < session->auth_pubkeys_count; i++) {
+        free(session->auth_pubkeys[i]);
+    }
+    free(session->auth_pubkeys);
+    
+    if (pubkey) {
+        session->auth_pubkeys = malloc(sizeof(char *));
+        if (session->auth_pubkeys) {
+            session->auth_pubkeys[0] = strdup(pubkey);
+            session->auth_pubkeys_count = 1;
+        }
+        session->auth_state = AUTH_STATE_AUTHENTICATED;
+    } else {
+        session->auth_pubkeys = NULL;
+        session->auth_pubkeys_count = 0;
+        session->auth_state = AUTH_STATE_NONE;
+    }
 }
 
 const char *connection_session_get_auth_pubkey(connection_session_t *session) {
-    return session ? session->auth_pubkey : NULL;
+    return (session && session->auth_pubkeys_count > 0) ? session->auth_pubkeys[0] : NULL;
+}
+
+/* Add an authenticated pubkey (supports multiple per NIP-42) */
+void connection_session_add_auth_pubkey(connection_session_t *session, const char *pubkey) {
+    if (!session || !pubkey) return;
+    
+    /* Dedupe: repeated AUTH from the same pubkey must not grow the list
+     * unbounded (resource exhaustion via AUTH replay). */
+    for (size_t i = 0; i < session->auth_pubkeys_count; i++) {
+        if (session->auth_pubkeys[i] && strcmp(session->auth_pubkeys[i], pubkey) == 0) {
+            session->auth_state = AUTH_STATE_AUTHENTICATED;
+            return;
+        }
+    }
+
+    char **new_pubkeys = realloc(session->auth_pubkeys,
+                                  (session->auth_pubkeys_count + 1) * sizeof(char *));
+    if (!new_pubkeys) return;
+    
+    session->auth_pubkeys = new_pubkeys;
+    session->auth_pubkeys[session->auth_pubkeys_count] = strdup(pubkey);
+    session->auth_pubkeys_count++;
+    session->auth_state = AUTH_STATE_AUTHENTICATED;
+}
+
+/* Check if a pubkey is authenticated for this session */
+bool connection_session_has_auth_pubkey(connection_session_t *session, const char *pubkey) {
+    if (!session || !pubkey) return false;
+    
+    for (size_t i = 0; i < session->auth_pubkeys_count; i++) {
+        if (session->auth_pubkeys[i] && strcmp(session->auth_pubkeys[i], pubkey) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Get number of authenticated pubkeys */
+size_t connection_session_get_auth_pubkey_count(connection_session_t *session) {
+    return session ? session->auth_pubkeys_count : 0;
+}
+
+/* Get authenticated pubkey by index */
+const char *connection_session_get_auth_pubkey_at(connection_session_t *session, size_t index) {
+    if (!session || index >= session->auth_pubkeys_count) return NULL;
+    return session->auth_pubkeys[index];
 }
 
 void connection_session_set_challenge(connection_session_t *session, const char *challenge) {
@@ -124,7 +191,10 @@ void connection_session_iterate(connection_session_iter_fn fn, void *userdata) {
 void connection_session_cleanup_all(void) {
     while (sessions) {
         connection_session_t *next = sessions->next;
-        free(sessions->auth_pubkey);
+        for (size_t i = 0; i < sessions->auth_pubkeys_count; i++) {
+            free(sessions->auth_pubkeys[i]);
+        }
+        free(sessions->auth_pubkeys);
         free(sessions->challenge);
         free(sessions);
         sessions = next;
