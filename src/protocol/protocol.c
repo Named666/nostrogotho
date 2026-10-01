@@ -74,8 +74,18 @@ protocol_collect_filters(json_value_t *values, size_t count, filter_t **out,
             json_array_free(inner, inner_count);
             return 0;
         }
-        for (idx = 0; idx < inner_count && *out_count < max_filters; ++idx) {
+        for (idx = 0; idx < inner_count; ++idx) {
             if (inner[idx].type == JSON_TYPE_OBJECT && inner[idx].value.string_val != NULL) {
+                if (*out_count >= max_filters) {
+                    /* Strict limit: more valid filters than allowed. The old
+                     * code silently truncated, so an over-limit REQ was
+                     * accepted with filters missing (and the manager-side
+                     * limit check was dead code). Release and reject. */
+                    for (size_t r = 0; r < *out_count; r++) filter_release(&filters[r]);
+                    free(filters);
+                    json_array_free(inner, inner_count);
+                    return 0;
+                }
                 if (json_parse_filter(inner[idx].value.string_val, &filters[*out_count])) {
                     (*out_count)++;
                 } else {
@@ -94,8 +104,14 @@ protocol_collect_filters(json_value_t *values, size_t count, filter_t **out,
         if (filters == NULL) {
             return 0;
         }
-        for (idx = 2; idx < count && *out_count < max_filters; ++idx) {
+        for (idx = 2; idx < count; ++idx) {
             if (values[idx].type == JSON_TYPE_OBJECT && values[idx].value.string_val != NULL) {
+                if (*out_count >= max_filters) {
+                    /* Strict limit (see array form above). */
+                    for (size_t r = 0; r < *out_count; r++) filter_release(&filters[r]);
+                    free(filters);
+                    return 0;
+                }
                 if (json_parse_filter(values[idx].value.string_val, &filters[*out_count])) {
                     (*out_count)++;
                 } else {

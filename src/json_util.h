@@ -248,6 +248,14 @@ const char *json_builder_finish(json_builder_t *builder);
  */
 bool json_parse_filter(const char *json_str, filter_t *filter);
 
+/* Decode a raw JSON string token (including surrounding quotes) with full
+ * escape support (short forms, \/, \uXXXX incl. surrogate pairs as UTF-8).
+ * Fallback for inputs mongoose's decoder rejects; see json_util.c.
+ * Returns nonzero on success (out_pos+1, so empty strings succeed), 0 on
+ * malformed input / overflow. */
+size_t json_decode_string_token(const char *start, const char *end, char *dst,
+                                size_t dstsz);
+
 /* Parse event object from JSON
  * 
  * Args:

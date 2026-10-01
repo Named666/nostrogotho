@@ -142,32 +142,154 @@ bool nip42_send_auth_challenge(connection_id_t connection_id) {
     return true;
 }
 
-static const char *nip42_extract_domain(const char *url) {
-    if (!url) return NULL;
-    
-    const char *domain_start = url;
-    if (strncmp(url, "wss://", 6) == 0) {
-        domain_start = url + 6;
-    } else if (strncmp(url, "ws://", 5) == 0) {
-        domain_start = url + 5;
-    } else if (strncmp(url, "https://", 8) == 0) {
-        domain_start = url + 8;
-    } else if (strncmp(url, "http://", 7) == 0) {
-        domain_start = url + 7;
+/* Normalize a relay URL into out[] for identity comparison.
+ *
+ * Canonical form: `scheme://host[:port]` with scheme+host lowercased, no
+ * path/query/fragment, no trailing slash or dot. Default ports are dropped
+ * (443 for wss/https, 80 for ws/http/bare); any other explicit port is kept,
+ * so wss://relay.example.com:8443 stays distinct from wss://relay.example.com.
+ * IPv6 literals ([::1], [::1]:port, or bare multi-colon) are kept whole —
+ * the old scanner stopped at the first ':' and truncated them.
+ * No-scheme input ("relay.example.com/x") normalizes without a scheme prefix.
+ * Returns false (out untouched) when no usable host remains. Buffers are
+ * caller-provided: the old static-buffer helper aliased both results, making
+ * the comparison a no-op. */
+#define NIP42_NORMALIZED_URL_MAX 256
+
+static bool nip42_normalize_relay_url(const char *url, char *out,
+                                      size_t outsz) {
+    const char *authority, *authority_end, *host_end, *port_str = NULL;
+    char scheme[16] = "";
+    char host[NIP42_NORMALIZED_URL_MAX];
+    size_t host_len = 0;
+    size_t i;
+    int port = 0;
+
+    if (!url || !out || outsz == 0) return false;
+
+    /* Split scheme://authority. */
+    {
+        const char *sep = strstr(url, "://");
+        if (sep) {
+            size_t slen = (size_t)(sep - url);
+            if (slen == 0 || slen >= sizeof(scheme)) return false;
+            for (i = 0; i < slen; i++) {
+                char c = url[i];
+                scheme[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+            }
+            scheme[slen] = '\0';
+            authority = sep + 3;
+        } else {
+            authority = url;
+        }
     }
-    
-    const char *domain_end = domain_start;
-    while (*domain_end && *domain_end != '/' && *domain_end != ':' && *domain_end != '?') {
-        domain_end++;
+
+    /* Authority ends at the first / ? #. */
+    authority_end = authority;
+    while (*authority_end && *authority_end != '/' &&
+           *authority_end != '?' && *authority_end != '#') {
+        authority_end++;
     }
-    
-    static char domain[256];
-    size_t len = domain_end - domain_start;
-    if (len >= sizeof(domain)) len = sizeof(domain) - 1;
-    memcpy(domain, domain_start, len);
-    domain[len] = '\0';
-    
-    return domain;
+    if (authority_end == authority) return false; /* empty */
+
+    /* Split host/port. Bracketed IPv6 keeps everything through ']';
+     * unbracketed keeps a :port suffix only for a single colon with digits. */
+    if (*authority == '[') {
+        const char *close =
+            memchr(authority, ']', (size_t)(authority_end - authority));
+        const char *r;
+        if (!close) return false;
+        host_end = close + 1; /* brackets stay part of the host */
+        if (host_end < authority_end && *host_end == ':') {
+            port_str = host_end + 1;
+            for (r = port_str; r < authority_end; r++) {
+                if (*r < '0' || *r > '9') return false;
+            }
+            if (r == port_str) return false; /* bare colon, no port */
+        } else if (host_end != authority_end) {
+            return false; /* garbage after ']' */
+        }
+    } else {
+        int colons = 0;
+        const char *last_colon = NULL;
+        const char *q;
+        for (q = authority; q < authority_end; q++) {
+            if (*q == ':') {
+                colons++;
+                last_colon = q;
+            }
+        }
+        if (colons == 1) {
+            const char *r;
+            for (r = last_colon + 1; r < authority_end; r++) {
+                if (*r < '0' || *r > '9') break;
+            }
+            if (r == authority_end && r > last_colon + 1) {
+                port_str = last_colon + 1;
+                host_end = last_colon;
+            } else {
+                host_end = authority_end; /* colon but not a port: keep whole */
+            }
+        } else {
+            host_end = authority_end; /* bare IPv6 or similar: keep whole */
+        }
+    }
+
+    /* Lowercase host; strip a trailing dot (FQDN root). Overlong hosts
+     * fail closed — never compare truncated prefixes. */
+    {
+        const char *h = authority;
+        const char *h_end = host_end;
+        while (h_end > h && *(h_end - 1) == '.') h_end--;
+        if (h_end == h || (size_t)(h_end - h) >= sizeof(host)) return false;
+        for (; h < h_end; h++) {
+            char c = *h;
+            host[host_len++] =
+                (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+        }
+        host[host_len] = '\0';
+    }
+
+    /* Parse the port; drop defaults (443 wss/https, 80 ws/http/bare). */
+    if (port_str) {
+        const char *r;
+        long v = 0;
+        for (r = port_str; r < authority_end; r++) {
+            v = v * 10 + (*r - '0');
+            if (v > 65535) return false;
+        }
+        port = (int)v;
+        if ((port == 443 &&
+             (strcmp(scheme, "wss") == 0 || strcmp(scheme, "https") == 0 ||
+              scheme[0] == '\0')) ||
+            (port == 80 &&
+             (strcmp(scheme, "ws") == 0 || strcmp(scheme, "http") == 0 ||
+              scheme[0] == '\0'))) {
+            port = 0;
+        }
+    }
+
+    /* Render canonical form. */
+    {
+        int written;
+        if (scheme[0]) {
+            written =
+                snprintf(out, outsz, "%s://%s", scheme, host);
+        } else {
+            written = snprintf(out, outsz, "%s", host);
+        }
+        if (written <= 0 || (size_t)written >= outsz) return false;
+        if (port) {
+            char with_port[NIP42_NORMALIZED_URL_MAX];
+            written = snprintf(with_port, sizeof(with_port), "%s:%d", out,
+                               port);
+            if (written <= 0 || (size_t)written >= sizeof(with_port)) {
+                return false;
+            }
+            snprintf(out, outsz, "%s", with_port);
+        }
+    }
+    return true;
 }
 
 bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *event,
@@ -185,33 +307,69 @@ bool nip42_authenticate_by_id(connection_id_t connection_id, const event_t *even
         log_debug("NIP", "AUTH", "validation failed");
         return false;
     }
-    /* Check relay URL - domain matching per spec (URL normalization) */
-    if (service_url && service_url[0]) {
-        const char *event_relay = NULL;
-        /* Extract relay tag from event */
+    /* The relay tag is REQUIRED (NIP-42: the AUTH event "should have at
+     * least two tags, one for the relay URL and one for the challenge").
+     * Accepting a missing tag lets a malicious relay proxy our challenge to
+     * its own visitors and replay their signed responses here. The tag is
+     * required even when no service URL is configured (presence check);
+     * the value is compared when the service URL is known. */
+    {
+        char *event_relay = NULL;
+        /* Extract relay tag from event (malloc'd; freed below on all paths) */
         tag_iter_t it;
         tag_iter_init(&it, event);
         struct mg_str key, tag;
         while (tag_iter_next(&it, &key, &tag)) {
-            char *name = tag_iter_element(&it, 0);
+            tag_iter_t sub;
+            char *name;
+            tag_iter_init_tag(&sub, tag);
+            name = tag_iter_element(&sub, 0);
             if (name && strcmp(name, "relay") == 0) {
-                event_relay = tag_iter_element(&it, 1);
+                event_relay = tag_iter_element(&sub, 1);
                 free(name);
                 break;
             }
             free(name);
         }
-        if (event_relay) {
-            const char *service_domain = nip42_extract_domain(service_url);
-            const char *event_domain = nip42_extract_domain(event_relay);
-            if (strcmp(service_domain, event_domain) != 0) {
-                log_debug("NIP", "AUTH", "relay domain mismatch: service=%s event=%s", service_domain, event_domain);
-                return false;
+        if (!event_relay || !event_relay[0]) {
+            free(event_relay);
+            log_debug("NIP", "AUTH", "missing relay tag");
+            return false;
+        }
+        if (service_url && service_url[0]) {
+            /* Caller-provided buffers: the old static-buffer helper aliased
+             * both results, so strcmp was always 0 and the check was dead. */
+            char want[NIP42_NORMALIZED_URL_MAX];
+            char got[NIP42_NORMALIZED_URL_MAX];
+            bool match;
+            want[0] = '\0';
+            got[0] = '\0';
+            match =
+                nip42_normalize_relay_url(service_url, want, sizeof(want)) &&
+                nip42_normalize_relay_url(event_relay, got, sizeof(got)) &&
+                strcmp(want, got) == 0;
+            if (!match) {
+                log_debug("NIP", "AUTH",
+                          "relay URL mismatch: service=%s event=%s", want,
+                          got);
             }
+            free(event_relay);
+            if (!match) return false;
+        } else {
+            free(event_relay);
         }
     }
     log_debug("NIP", "AUTH", "adding pubkey=%s", event->pubkey);
-    return nip_env_session_add_auth(connection_id, event->pubkey);
+    {
+        /* Single-use challenge: consume after one success so the same signed
+         * AUTH event cannot be replayed (malicious-relay forward + replay).
+         * The client requests a fresh challenge for the next AUTH. */
+        bool added = nip_env_session_add_auth(connection_id, event->pubkey);
+        if (added) {
+            nip_env_session_set_challenge(connection_id, NULL);
+        }
+        return added;
+    }
 }
 
 /* ============================================================================
@@ -297,6 +455,7 @@ static void nip42_connection_on_connect(connection_id_t connection_id, void *ctx
 static void nip42_connection_on_disconnect(connection_id_t connection_id, void *ctx);
 static bool nip42_message_intercept_fn(connection_id_t connection_id, const protocol_message_t *msg, void *ctx);
 static bool nip42_publication_policy_fn(connection_id_t connection_id, const event_t *event, char *reason, size_t reason_size, void *ctx);
+static bool nip42_delivery_policy_can_deliver(const event_t *event, connection_id_t connection_id, void *ctx);
 static void nip42_send_auth_challenge_fn(connection_id_t connection_id, void *ctx);
 static bool nip42_query_authorize_fn(connection_id_t connection_id, filter_t *filters, size_t count,
                                      char *reason, size_t reason_size, void *ctx);
@@ -333,6 +492,13 @@ static nip_capability_t nip42_caps[] = {
         .type = NIP_CAP_PUBLICATION_POLICY,
         .ctx = &nip42_ctx,
         .caps.publication_policy = { .accept_publish = nip42_publication_policy_fn },
+        .next = NULL,
+    },
+    {
+        .name = "nip42-delivery-policy",
+        .type = NIP_CAP_DELIVERY_POLICY,
+        .ctx = &nip42_ctx,
+        .caps.delivery_policy = { .can_deliver = nip42_delivery_policy_can_deliver },
         .next = NULL,
     },
     {
@@ -457,53 +623,77 @@ static bool nip42_publication_policy_fn(connection_id_t connection_id, const eve
  * Query Policy: NIP-42 auth-required / restricted for REQ/COUNT
  * ============================================================================ */
 
-/* Check if a filter targets kinds that require authentication (e.g., DMs kind 4).
- * Returns true if the filter targets restricted kinds. */
-static bool nip42_filter_requires_auth(const filter_t *filter) {
+/* ============================================================================
+ * Kind-4 DM gating: per-event delivery policy + query-time early reject
+ *
+ * Enforcement lives in the delivery policy below: a kind-4 event is
+ * visible iff an authenticated pubkey equals event.pubkey or appears in
+ * one of the event's "p" tags. That closes filter-pairing bypasses at the
+ * point of delivery for live REQ, stored REQ, and COUNT (all three honor
+ * can_deliver):
+ *   (a) {kinds:[1]} paired with {kinds:[4],authors:[victim]} — the victim's
+ *       DMs fail per-event visibility even when the query passes;
+ *   (b) kind-less filters ({authors:[victim]}, {"#p":[victim]}) — still
+ *       match kind-4 rows, still filtered per event;
+ *   (c) authors:[me,victim] — my DMs deliver, the victim's do not;
+ *   (d) previously no delivery policy covered kind 4 (unlike 1059).
+ * Query-time authorization stays only as an early-reject optimization and
+ * must check EVERY filter (no break on the first unrestricted one).
+ * ============================================================================ */
+
+/* True when this filter could match a kind-4 DM: explicit kind 4, or no
+ * kind constraint at all (matches any kind, including 4). Narrow point
+ * lookups by id are exempt: they cannot fish for unknown DMs, and the
+ * per-event delivery policy below still enforces kind-4 visibility
+ * (e.g. fetch-by-id for NIP-09 verification keeps working). */
+static bool nip42_filter_targets_dm(const filter_t *filter) {
+    size_t i;
     if (!filter) return false;
-    
-    /* Kind 4 (encrypted direct messages) requires auth per NIP-42 */
-    for (size_t i = 0; i < filter->kinds_count; i++) {
+    if (filter->ids_count > 0) return false;
+    if (filter->kinds_count == 0) return true;
+    for (i = 0; i < filter->kinds_count; i++) {
         if (filter->kinds[i] == 4) return true;
-        /* Add other restricted kinds here as needed */
     }
     return false;
 }
 
+/* Check if a filter targets kinds that require authentication (e.g., DMs kind 4).
+ * Returns true if the filter targets restricted kinds. */
+static bool nip42_filter_requires_auth(const filter_t *filter) {
+    return nip42_filter_targets_dm(filter);
+}
+
 /* Check if an authenticated pubkey is authorized for a filter.
- * For DMs (kind 4), the pubkey must be a participant: either listed in
- * the filter's authors or in its 'p' tags. A wildcard kind-4 query with
+ * For DM-targeting filters, the pubkey must be a participant: either listed
+ * in the filter's authors or in its 'p' tags. A wildcard DM query with
  * neither is overly broad and must be rejected (no full-table DM leak). */
 static bool nip42_is_authorized_for_filter(connection_id_t connection_id,
                                             const filter_t *filter,
                                             const char *auth_pubkey) {
+    size_t a, t, v;
     (void)connection_id;
     if (!filter || !auth_pubkey) return false;
-    
-    /* For kind 4, check if the authenticated pubkey is a participant */
-    for (size_t i = 0; i < filter->kinds_count; i++) {
-        if (filter->kinds[i] == 4) {
-            /* Participant as author */
-            for (size_t a = 0; a < filter->authors_count; a++) {
-                if (filter->authors[a] && strcmp(filter->authors[a], auth_pubkey) == 0) {
-                    return true;
-                }
-            }
-            /* Participant as 'p' tag */
-            for (size_t t = 0; t < filter->tags_count; t++) {
-                const tag_t *tag = &filter->tags[t];
-                if (tag->count > 1 && tag->elements[0] && strcmp(tag->elements[0], "p") == 0) {
-                    for (size_t v = 1; v < tag->count; v++) {
-                        if (tag->elements[v] && strcmp(tag->elements[v], auth_pubkey) == 0) {
-                            return true; /* Participant in the DM conversation */
-                        }
-                    }
-                }
-            }
-            return false; /* Kind 4 but not a participant */
+
+    if (!nip42_filter_targets_dm(filter)) return true; /* never matches kind 4 */
+
+    /* Participant as author */
+    for (a = 0; a < filter->authors_count; a++) {
+        if (filter->authors[a] && strcmp(filter->authors[a], auth_pubkey) == 0) {
+            return true;
         }
     }
-    return true; /* Non-restricted kind or no kind filter */
+    /* Participant as 'p' tag */
+    for (t = 0; t < filter->tags_count; t++) {
+        const tag_t *tag = &filter->tags[t];
+        if (tag->count > 1 && tag->elements[0] && strcmp(tag->elements[0], "p") == 0) {
+            for (v = 1; v < tag->count; v++) {
+                if (tag->elements[v] && strcmp(tag->elements[v], auth_pubkey) == 0) {
+                    return true; /* Participant in the DM conversation */
+                }
+            }
+        }
+    }
+    return false; /* DM-targeting but not a participant */
 }
 
 /* True if ANY authenticated pubkey on this connection authorizes the filter.
@@ -522,11 +712,41 @@ static bool nip42_any_pubkey_authorizes(connection_id_t connection_id,
     return false;
 }
 
-/* Query authorization hook: called before query execution.
- * Returns true to allow, false to reject with CLOSED message.
- * Fills reason buffer with appropriate prefix (auth-required: or restricted:) */
+/* Per-event delivery policy for kind-4 DMs: visible iff an authenticated
+ * pubkey is the author or a "p" recipient. Non-kind-4 events pass through.
+ * Runs on live delivery, stored REQ, and COUNT (all honor can_deliver). */
+static bool nip42_dm_is_visible_to(const event_t *event, const char *auth_pubkey) {
+    if (!event || event->kind != 4) return true;
+    if (!auth_pubkey || !auth_pubkey[0]) return false;
+    if (strcmp(event->pubkey, auth_pubkey) == 0) return true;
+    return event_tag_has_value(event, "p", auth_pubkey);
+}
+
+static bool nip42_delivery_policy_can_deliver(const event_t *event,
+                                              connection_id_t connection_id,
+                                              void *ctx) {
+    nip42_ctx_t *cap_ctx = (nip42_ctx_t *)ctx;
+    size_t n, i;
+    if (cap_ctx && !cap_ctx->enabled) return true;
+    if (!event || event->kind != 4) return true;
+    n = nip_env_session_auth_count(connection_id);
+    for (i = 0; i < n; i++) {
+        const char *pk = nip_env_session_auth_at(connection_id, i);
+        if (nip42_dm_is_visible_to(event, pk)) return true;
+    }
+    return false;
+}
+
+/* Query authorization hook: early-reject optimization ONLY (delivery policy
+ * above is the enforcement point). Called before query execution for both
+ * REQ and COUNT. Returns true to allow, false to reject with CLOSED message.
+ * Fills reason buffer with appropriate prefix (auth-required: or restricted:).
+ * EVERY DM-targeting filter is checked: one unauthorized restricted filter
+ * rejects the whole query even beside unrestricted ones. */
 static bool nip42_query_authorize_fn(connection_id_t connection_id, filter_t *filters, size_t count,
                                      char *reason, size_t reason_size, void *ctx) {
+    size_t i;
+    const char *auth_pubkey;
     (void)ctx;
 
     if (!filters || count == 0) return true;
@@ -535,19 +755,20 @@ static bool nip42_query_authorize_fn(connection_id_t connection_id, filter_t *fi
         nip42_ctx_t *cap_ctx = (nip42_ctx_t *)ctx;
         if (cap_ctx && !cap_ctx->enabled) return true;
     }
-    /* Check if any filter requires authentication */
-    bool requires_auth = false;
-    for (size_t i = 0; i < count; i++) {
-        if (nip42_filter_requires_auth(&filters[i])) {
-            requires_auth = true;
-            break;
+    /* Fast path: no filter can match kind 4. */
+    {
+        bool any_dm = false;
+        for (i = 0; i < count; i++) {
+            if (nip42_filter_requires_auth(&filters[i])) {
+                any_dm = true;
+                break;
+            }
         }
+        if (!any_dm) return true;
     }
-    
-    if (!requires_auth) return true; /* No auth needed for this query */
-    
-    /* Check if connection is authenticated (ANY pubkey counts per NIP-42). */
-    const char *auth_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
+
+    /* A DM-targeting query needs authentication (ANY pubkey counts). */
+    auth_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
     if (!auth_pubkey) {
         log_debug("NIP", "QUERY_AUTH", "connection_id=%llu auth-required (no auth)", (unsigned long long)connection_id);
         if (reason && reason_size > 0) {
@@ -555,29 +776,19 @@ static bool nip42_query_authorize_fn(connection_id_t connection_id, filter_t *fi
         }
         return false; /* Will trigger CLOSED with auth-required */
     }
-    
-    /* Check if ANY authenticated pubkey is authorized for the restricted filters */
-    bool authorized = false;
-    for (size_t i = 0; i < count; i++) {
+
+    /* Every DM-targeting filter must authorize: no break on unrestricted. */
+    for (i = 0; i < count; i++) {
         if (nip42_filter_requires_auth(&filters[i]) &&
-            nip42_any_pubkey_authorizes(connection_id, &filters[i])) {
-            authorized = true;
-            break;
-        }
-        if (!nip42_filter_requires_auth(&filters[i])) {
-            authorized = true;
-            break;
+            !nip42_any_pubkey_authorizes(connection_id, &filters[i])) {
+            log_debug("NIP", "QUERY_AUTH", "connection_id=%llu restricted filter[%zu] (auth=%s)", (unsigned long long)connection_id, i, auth_pubkey);
+            if (reason && reason_size > 0) {
+                snprintf(reason, reason_size, "restricted: authenticated pubkey not authorized for this query");
+            }
+            return false; /* Will trigger CLOSED with restricted */
         }
     }
-    
-    if (!authorized) {
-        log_debug("NIP", "QUERY_AUTH", "connection_id=%llu restricted (auth=%s)", (unsigned long long)connection_id, auth_pubkey);
-        if (reason && reason_size > 0) {
-            snprintf(reason, reason_size, "restricted: authenticated pubkey not authorized for this query");
-        }
-        return false; /* Will trigger CLOSED with restricted */
-    }
-    
+
     log_debug("NIP", "QUERY_AUTH", "connection_id=%llu authorized (auth=%s)", (unsigned long long)connection_id, auth_pubkey);
     return true;
 }

@@ -258,6 +258,7 @@ int main(int argc, const char **argv) {
 
     log_init();
     log_set_verbosity((log_verbosity_t)config.verbosity);
+    if (file_loaded) relay_config_warn_unknown(config_path);
     log_info("MAIN", "CONFIG",
              "path=%s loaded=%s env_overrides=%d cli_overrides=%d port=%d verbosity=%d",
              config_path, file_loaded ? "file" : "defaults-created",

@@ -105,7 +105,7 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
             
             event_t **events = NULL;
             size_t count = 0;
-            if (!storage_find_events(&scope, &events, &count) || count == 0) {
+            if (!storage->find_events(&scope, &events, &count) || count == 0) {
                 ok = false;
             } else {
                 /* Verify p tag matches */
@@ -125,7 +125,7 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
             if (ok) {
                 storage_event_scope_t del_scope = { .id = id };
                 size_t deleted = 0;
-                if (!storage_delete_events(&del_scope, &deleted) || deleted == 0) ok = false;
+                if (!storage->delete_events(&del_scope, &deleted) || deleted == 0) ok = false;
             }
         } else {
             /* Direct deletion by ID + pubkey authorization */
@@ -134,14 +134,14 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
                 .pubkey = event->pubkey
             };
             size_t deleted = 0;
-            if (!storage_delete_events(&scope, &deleted) || deleted == 0) ok = false;
+            if (!storage->delete_events(&scope, &deleted) || deleted == 0) ok = false;
         }
     }
     event_free(target);
     return ok;
 }
 
-static bool delete_a_target(const event_t *event, storage_context_t *storage __attribute__((unused)),
+static bool delete_a_target(const event_t *event, storage_context_t *storage,
                             const char *a) {
     int kind;
     char pubkey[MAX_PUBKEY_SIZE + 1];
@@ -165,7 +165,7 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage __a
             .created_at_before = event->created_at
         };
         size_t deleted = 0;
-        return storage_delete_events(&scope, &deleted);
+        return storage->delete_events(&scope, &deleted);
     } else {
         /* Has 'd' tag: find addressable events matching pubkey+kind+created_at_before, 
          * then filter by 'd' tag value */
@@ -179,7 +179,7 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage __a
         
         event_t **events = NULL;
         size_t count = 0;
-        if (!storage_find_events(&scope, &events, &count)) {
+        if (!storage->find_events(&scope, &events, &count)) {
             return false;
         }
         
@@ -188,7 +188,7 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage __a
             if (event_tag_has_value(events[i], "d", d_identifier)) {
                 storage_event_scope_t del_scope = { .id = events[i]->id };
                 size_t deleted = 0;
-                if (!storage_delete_events(&del_scope, &deleted) || deleted == 0) {
+                if (!storage->delete_events(&del_scope, &deleted) || deleted == 0) {
                     ok = false;
                 }
             }

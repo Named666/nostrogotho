@@ -74,30 +74,124 @@ static int NHR_CALL host_storage_delete_kind(void *userdata, int kind,
     return result.result == STORAGE_OK ? result.deleted_count : -1;
 }
 
-static bool NHR_CALL host_storage_delete_matching(
-    void *userdata, const storage_event_scope_t *scope,
-    storage_event_predicate_t predicate, void *predicate_userdata,
-    size_t *deleted, char *next_id, size_t next_id_size, bool *more) {
+/* host_storage_delete_matching deleted with the legacy predicate API. */
+
+static bool NHR_CALL host_storage_find_events(void *userdata,
+                                              const storage_event_scope_t *scope,
+                                              event_t ***out_events,
+                                              size_t *out_count) {
     Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    /* Predicate is called synchronously within this host service only. */
-    return runtime && runtime->storage && runtime->storage->delete_matching
-        ? runtime->storage->delete_matching(scope, predicate, predicate_userdata,
-                                            deleted, next_id, next_id_size, more)
+    return runtime && runtime->storage
+        ? storage_find_events(scope, out_events, out_count)
         : false;
 }
 
-static bool NHR_CALL host_storage_send_records(
-    void *userdata, send_records_callback_t sender, const char *sub,
-    const filter_t *filters, size_t filters_count, bool do_count,
-    bool *has_more, int *out_count, const storage_tag_match_t *indexed_tags,
-    size_t indexed_tags_count, void *sender_userdata) {
+static bool NHR_CALL host_storage_count_events(void *userdata,
+                                               const storage_event_scope_t *scope,
+                                               size_t *out_count) {
     Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
-    return runtime && runtime->storage && runtime->storage->send_records
-        ? runtime->storage->send_records(sender, sub, filters, filters_count,
-                                         do_count, has_more, out_count,
-                                         indexed_tags, indexed_tags_count,
-                                         sender_userdata)
+    return runtime && runtime->storage
+        ? storage_count_events(scope, out_count)
         : false;
+}
+
+static bool NHR_CALL host_storage_delete_events(void *userdata,
+                                                const storage_event_scope_t *scope,
+                                                size_t *out_deleted) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    return runtime && runtime->storage
+        ? storage_delete_events(scope, out_deleted)
+        : false;
+}
+
+static storage_transaction_t *NHR_CALL host_storage_transaction_begin(void *userdata) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    return runtime && runtime->storage
+        ? storage_transaction_begin()
+        : NULL;
+}
+
+static bool NHR_CALL host_storage_transaction_commit(void *userdata, storage_transaction_t *tx) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    return runtime && runtime->storage
+        ? storage_transaction_commit(tx)
+        : false;
+}
+
+static void NHR_CALL host_storage_transaction_rollback(void *userdata, storage_transaction_t *tx) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    if (runtime && runtime->storage) {
+        storage_transaction_rollback(tx);
+    }
+}
+
+static bool NHR_CALL host_storage_delete_events_tx(void *userdata,
+                                                   const storage_event_scope_t *scope,
+                                                   storage_transaction_t *tx,
+                                                   size_t *out_deleted) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    return runtime && runtime->storage
+        ? storage_delete_events_tx(scope, tx, out_deleted)
+        : false;
+}
+
+static bool NHR_CALL host_storage_find_events_tx(void *userdata,
+                                                 const storage_event_scope_t *scope,
+                                                 storage_transaction_t *tx,
+                                                 event_t ***out_events,
+                                                 size_t *out_count) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    return runtime && runtime->storage
+        ? storage_find_events_tx(scope, tx, out_events, out_count)
+        : false;
+}
+
+static storage_insert_result_t NHR_CALL host_storage_upsert_replaceable(void *userdata,
+                                                                        const event_t *event,
+                                                                        const storage_tag_match_t *indexed_tags,
+                                                                        size_t indexed_tags_count) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    storage_insert_result_t result = {0};
+    result.result = STORAGE_ERROR;
+    snprintf(result.error_message, sizeof(result.error_message), "not implemented");
+    if (runtime && runtime->storage) {
+        return storage_upsert_replaceable(event, indexed_tags, indexed_tags_count);
+    }
+    return result;
+}
+
+static storage_insert_result_t NHR_CALL host_storage_upsert_addressable(void *userdata,
+                                                                        const event_t *event,
+                                                                        const char *d_tag_value,
+                                                                        const storage_tag_match_t *indexed_tags,
+                                                                        size_t indexed_tags_count) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    storage_insert_result_t result = {0};
+    result.result = STORAGE_ERROR;
+    snprintf(result.error_message, sizeof(result.error_message), "not implemented");
+    if (runtime && runtime->storage) {
+        return storage_upsert_addressable(event, d_tag_value, indexed_tags, indexed_tags_count);
+    }
+    return result;
+}
+
+static bool NHR_CALL host_storage_find_ids_by_tags(void *userdata,
+                                                   const char *const *tag_names,
+                                                   const char *const *tag_values,
+                                                   size_t tag_count,
+                                                   char ***ids_out,
+                                                   size_t *count_out) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    return runtime && runtime->storage
+        ? storage_find_ids_by_tags(tag_names, tag_values, tag_count, ids_out, count_out)
+        : false;
+}
+
+static void NHR_CALL host_storage_free_id_list(void *userdata, char **ids, size_t count) {
+    Nhr_Runtime *runtime = (Nhr_Runtime *)userdata;
+    if (runtime && runtime->storage) {
+        storage_free_id_list(ids, count);
+    }
 }
 
 static bool NHR_CALL host_crypto_check_event(void *userdata, const event_t *event) {
@@ -325,8 +419,19 @@ bool nhr_runtime_init(Nhr_Runtime *runtime, storage_context_t *storage,
     runtime->services.storage_get_event_copy = host_storage_get_event;
     runtime->services.storage_delete_by_id_and_pubkey = host_storage_delete_id;
     runtime->services.storage_delete_by_kind_and_pubkey = host_storage_delete_kind;
-    runtime->services.storage_delete_matching = host_storage_delete_matching;
-    runtime->services.storage_send_records = host_storage_send_records;
+    /* storage_delete_matching removed (legacy predicate API deleted). */
+    runtime->services.storage_find_events = host_storage_find_events;
+    runtime->services.storage_count_events = host_storage_count_events;
+    runtime->services.storage_delete_events = host_storage_delete_events;
+    runtime->services.storage_transaction_begin = host_storage_transaction_begin;
+    runtime->services.storage_transaction_commit = host_storage_transaction_commit;
+    runtime->services.storage_transaction_rollback = host_storage_transaction_rollback;
+    runtime->services.storage_delete_events_tx = host_storage_delete_events_tx;
+    runtime->services.storage_find_events_tx = host_storage_find_events_tx;
+    runtime->services.storage_upsert_replaceable = host_storage_upsert_replaceable;
+    runtime->services.storage_upsert_addressable = host_storage_upsert_addressable;
+    runtime->services.storage_find_ids_by_tags = host_storage_find_ids_by_tags;
+    runtime->services.storage_free_id_list = host_storage_free_id_list;
     runtime->services.crypto_check_event = host_crypto_check_event;
     runtime->services.crypto_sha256 = host_crypto_sha256;
     runtime->services.crypto_signature_verify = host_crypto_signature_verify;

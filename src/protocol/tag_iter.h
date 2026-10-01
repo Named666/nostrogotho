@@ -35,7 +35,7 @@ static inline void tag_iter_init_tag(tag_iter_t *it, struct mg_str tag) {
     it->offset = 0;
 }
 
-/* Storage predicate userdata structs (used by storage->delete_matching) */
+/* Tag predicate userdata structs (used by tag_predicate_* in tag_iter.c) */
 typedef struct { const char *name; } tag_match_name_t;
 typedef struct { const char *name; const char *value; } tag_match_name_value_t;
 typedef struct { const char *name; const char *value; bool empty_value_when_missing; } tag_match_name_value_opt_t;

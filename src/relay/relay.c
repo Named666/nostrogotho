@@ -7,6 +7,7 @@
 #include "subscriptions/subscription_manager.h"
 #include "relay/connection_session.h"
 #include "protocol/protocol.h"
+#include "protocol/event_tags.h"
 #include "nhr.h"
 #include "log.h"
 #include <mongoose.h>
@@ -27,16 +28,59 @@
 /* struct relay is defined in relay.h (single owner; transport/server.c needs
  * relay->manager). Do not duplicate it here. */
 
-/* Forward declarations */
+/* Forward declarations. Publication policy has a single path:
+ * nip_composition_check_publication (the plugins_accept_publish wrapper was
+ * deleted as legacy duplication). Stored queries have a single path:
+ * subscription_manager_query -> query_with_new_api. */
 static void remove_subscriptions(relay_t *relay, struct mg_connection *connection, const char *id);
-static bool plugins_accept_publish(relay_t *relay, connection_id_t connection_id,
-                                    const event_t *event, char *reason, size_t reason_size);
 static void broadcast_event(relay_t *relay, const event_t *event);
 static void send_event_json(connection_id_t connection_id, const char *sub, const event_t *event);
 static bool query_events(relay_t *relay, connection_id_t connection_id, const char *sub,
                           filter_t *filters, size_t count, bool do_count, char *reject_reason, size_t reason_size);
 static void handle_req(relay_t *relay, struct mg_connection *connection,
                        protocol_message_t *proto_msg, bool do_count);
+
+/* Index NIP-01 queryable tags (e/p/a) so stored tag-filter queries (#e/#p/#a)
+ * can match. The default insert path previously passed no indexed tags, so
+ * event_tag_index stayed empty and every stored tag query came back blank
+ * (live delivery was unaffected — it uses matches_filter, not the index).
+ * Mirrors nip01_extract_indexed_tags, but owns its copies: values are
+ * strdup'd here and released after insert, never borrowed-then-freed. */
+#define RELAY_INDEXED_TAG_CAP 64
+
+static size_t relay_collect_index_tags(const event_t *event,
+                                       storage_tag_match_t *out,
+                                       size_t cap) {
+    static const char *names[] = { "e", "p", "a" };
+    size_t count = 0;
+    size_t n;
+    if (!event || !out || cap == 0) return 0;
+    for (n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+        size_t tag_count = 0;
+        char ***all = event_tag_get_all(event, names[n], &tag_count);
+        size_t t, i;
+        if (!all) continue;
+        for (t = 0; t < tag_count && count < cap; t++) {
+            if (!all[t]) continue;
+            for (i = 0; all[t][i] && count < cap; i++) {
+                char *value = strdup(all[t][i]);
+                if (!value) break;
+                out[count].tag_name = (char *)names[n];
+                out[count].tag_value = value;
+                out[count].filter_index = 0;
+                count++;
+            }
+        }
+        event_tag_free_all(all, tag_count);
+    }
+    return count;
+}
+
+static void relay_free_index_tags(storage_tag_match_t *tags, size_t count) {
+    size_t i;
+    if (!tags) return;
+    for (i = 0; i < count; i++) free(tags[i].tag_value);
+}
 static void handle_event(relay_t *relay, struct mg_connection *connection, const event_t *event);
 static void handle_message(relay_t *relay, struct mg_connection *connection, struct mg_ws_message *message);
 
@@ -59,8 +103,14 @@ relay_t *relay_create(const relay_config_t *config, storage_context_t *storage) 
     
     relay->config = *config;
     relay->storage = storage;
+    /* Clamp: main() validates, but relay_create is also called by tests and
+     * embedders — never index the log level table out of range. */
     relay->verbosity = config->verbosity;
-    log_set_verbosity((log_verbosity_t)config->verbosity);
+    if (relay->verbosity < LOG_VERBOSITY_QUIET)
+        relay->verbosity = LOG_VERBOSITY_QUIET;
+    if (relay->verbosity > LOG_VERBOSITY_DEBUG)
+        relay->verbosity = LOG_VERBOSITY_DEBUG;
+    log_set_verbosity((log_verbosity_t)relay->verbosity);
     relay->stop_requested = 0;
     relay->subscriptions = subscription_manager_create(
         (size_t)config->max_subscriptions_per_connection,
@@ -348,15 +398,8 @@ static void remove_subscriptions(relay_t *relay, struct mg_connection *connectio
     }
 }
 
-static bool plugins_accept_publish(relay_t *relay, connection_id_t connection_id,
-                                   const event_t *event, char *reason, size_t reason_size) {
-    (void)relay;
-    log_event_debug(connection_id, event->id, event->kind, "PLUGINS_ACCEPT_PUBLISH", "conn_id=%u event_kind=%d event_id=%.16s", 
-                (unsigned)connection_id, event->kind, event->id);
-    bool result = nip_composition_check_publication(relay->nip_registry, connection_id, event, reason, reason_size);
-    log_event_debug(connection_id, event->id, event->kind, "PLUGINS_ACCEPT_PUBLISH", "result=%s reason=%s", result ? "accept" : "reject", reason);
-    return result;
-}
+/* Publication policy: single path via NIP composition (legacy
+ * plugins_accept_publish wrapper deleted). */
 
 
 
@@ -725,8 +768,11 @@ static void handle_event(relay_t *relay, struct mg_connection *connection, const
     log_conn_debug(conn_id, "HANDLE_EVENT", "step 1 - PASS");
     
     /* 2. Then check NIP publication policies (NIP-13 PoW, NIP-26 delegation, NIP-42 auth, etc.) */
-    log_conn_debug(conn_id, "HANDLE_EVENT", "step 2 - plugins_accept_publish");
-    if (!plugins_accept_publish(relay, conn_id, event_borrowed, reject_reason, sizeof(reject_reason))) {
+    log_conn_debug(conn_id, "HANDLE_EVENT", "step 2 - nip_composition_check_publication");
+    log_event_debug(conn_id, event_borrowed->id, event_borrowed->kind, "CHECK_PUBLICATION",
+                    "conn_id=%u event_kind=%d event_id=%.16s",
+                    (unsigned)conn_id, event_borrowed->kind, event_borrowed->id);
+    if (!nip_composition_check_publication(relay->nip_registry, conn_id, event_borrowed, reject_reason, sizeof(reject_reason))) {
         log_conn_warn(conn_id, "HANDLE_EVENT", "policy FAILED - %s", reject_reason);
         char *ok = protocol_serialize_ok(event_borrowed->id, false, reject_reason);
         if (ok) {
@@ -757,7 +803,12 @@ static void handle_event(relay_t *relay, struct mg_connection *connection, const
             result.should_broadcast = true;
             result.response_msg[0] = '\0';
         } else {
-            storage_insert_result_t insert_result = relay->storage->insert_record(event_borrowed, NULL, 0);
+            storage_tag_match_t indexed_tags[RELAY_INDEXED_TAG_CAP];
+            size_t indexed_tags_count = relay_collect_index_tags(
+                event_borrowed, indexed_tags, RELAY_INDEXED_TAG_CAP);
+            storage_insert_result_t insert_result = relay->storage->insert_record(
+                event_borrowed, indexed_tags, indexed_tags_count);
+            relay_free_index_tags(indexed_tags, indexed_tags_count);
             log_conn_debug(conn_id, "HANDLE_EVENT", "storage insert result=%d", insert_result.result);
             if (insert_result.result == STORAGE_OK) {
                 result.accepted = true;

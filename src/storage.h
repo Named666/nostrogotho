@@ -22,7 +22,7 @@
  * - storage_get_event_by_id() TRANSFERS ownership to CALLER
  * - storage_delete_events() BORROWS scope - does NOT take ownership
  * - storage_count_events() BORROWS scope - does NOT take ownership
- * - storage_find_ids_by_tag() TRANSFERS ownership of ID list to CALLER
+ * - storage_find_ids_by_tags() TRANSFERS ownership of ID list to CALLER
  *   (caller MUST call storage_free_id_list())
  * ============================================================================ */
 
@@ -58,24 +58,6 @@ typedef struct {
     int deleted_count;
     char error_message[256];
 } storage_delete_result_t;
-
-/* ============================================================================
- * Callback Types
- * ============================================================================ */
-
-/* send_records_callback_t - Callback for sending records to client
- * 
- * Called by send_records() for each event matching a filter.
- * Also called once for COUNT responses.
- * 
- * Args: json_event - JSON-formatted event string (EVENT or COUNT response)
- *                    Format: ["EVENT", subscription_id, event] or
- *                            ["COUNT", subscription_id, {count: N}]
- *       userdata - opaque context passed to send_records
- * 
- * Note: json_event is valid only for the duration of the callback
- */
-typedef void (*send_records_callback_t)(const char *json_event, void *userdata);
 
 /* Optional column-level narrowing for generic event walks. Tag interpretation
  * is deliberately left to the caller's synchronous predicate callback. */
@@ -139,9 +121,9 @@ typedef struct {
     size_t offset;
 } storage_event_scope_t;
 
-/* Called synchronously with a borrowed event view. Return true to select the
- * event for deletion. The callback is never retained by storage. */
-typedef bool (*storage_event_predicate_t)(const event_t *event, void *userdata);
+/* Legacy storage_event_predicate_t (delete_matching callback) deleted with
+ * the predicate delete path. Tag policy lives in NIP code via
+ * event_tag_has_value(), not in storage callbacks. */
 
 /* Generic opaque tag-index extension. A NIP may provide (tag name, tag value)
  * pairs at insertion and query time; storage performs no interpretation. */
@@ -150,6 +132,9 @@ typedef struct {
     char *tag_value;
     size_t filter_index;
 } storage_tag_match_t;
+
+/* Forward declaration for transaction API used in storage_context_t */
+typedef struct storage_transaction_t storage_transaction_t;
 
 /* ============================================================================
  * Storage Context Structure
@@ -234,64 +219,82 @@ typedef struct {
      */
     storage_delete_result_t (*delete_record_by_kind_and_pubkey)(int kind, const char *pubkey, time_t created_at);
     
-    /* delete_matching - Delete events narrowed by generic columns and
-     * selected by a caller-supplied synchronous predicate. The callback may
-     * inspect tags but must not retain the borrowed event pointers. `deleted`
-     * receives the number of deleted rows when non-NULL. Returns false on
-     * database/allocation failure. Storage invokes the callback in bounded
-     * batches and never stores it. */
-    bool (*delete_matching)(const storage_event_scope_t *scope,
-                            storage_event_predicate_t predicate,
-                            void *userdata, size_t *deleted,
-                            char *next_id, size_t next_id_size, bool *more);
-
-    /* Generic indexed tag-value lookup; NIP code chooses the tag semantics.
-     * Returns caller-owned event ID strings and an allocated array. */
-    bool (*find_ids_by_tag)(const char *tag_name, const char *tag_value,
-                            char ***ids, size_t *count);
-    void (*free_id_list)(char **ids, size_t count);
+    /* Legacy delete_matching (bounded scan + caller predicate) deleted.
+     * Use delete_events with the same scope as find. Legacy
+     * find_ids_by_tag (single pair) deleted; use find_ids_by_tags. */
     
     /* ====================================================================
      * Event Query and Streaming
      * ==================================================================== */
     
-/* send_records - Query and stream events matching filters (NIP-01, NIP-67)
- * 
- * Searches database for events matching filter criteria and calls
- * the sender callback for each matching event. Also supports COUNT queries.
- * 
- * Args:
- *   sender - callback function called for each result
- *   sub - subscription ID (included in response)
- *   filters - array of filter structures
- *   filters_count - number of filters in array
- *   do_count - if true, count matching events instead of streaming.
- *              When counting, the sender is NOT invoked; the total is
- *              returned via out_count (NIP-45) and the caller builds the
- *              COUNT response.
- *   has_more - if not NULL, set to true if more events exist beyond limit
- *   out_count - when do_count is true, receives the aggregated count.
- *               May be NULL when do_count is false.
- *   userdata - opaque context passed to sender callback
- * 
- * Returns: true on success, false on database error
- * 
- * Behavior:
- *   - Multiple filters are OR'd (send if ANY filter matches)
- *   - Within a filter, criteria are AND'd
- *   - If do_count is true, reports the count via out_count instead of
- *     emitting a COUNT response (NIP-45)
- *   - Fetches limit+1 events to determine has_more flag (NIP-67)
- */
-    bool (*send_records)(send_records_callback_t sender, const char *sub,
-                         const filter_t *filters, size_t filters_count,
-                         bool do_count, bool *has_more, int *out_count,
-                         const storage_tag_match_t *indexed_tags,
-                         size_t indexed_tags_count,
-                         void *userdata);
-    /* Return a module-owned array of generic tag index keys extracted from an
+/* Return a module-owned array of generic tag index keys extracted from an
      * event, for use in the next insert_record call. Caller releases it with
      * free_tag_matches(). Storage stores only the supplied opaque pairs. */
+
+    /* ====================================================================
+     * New Unified Storage API (per NOSTR_EVENT_STORAGE_SPEC.md)
+     * ==================================================================== */
+
+    /* find_events - Find events matching scope
+     * Args: scope - selection scope, out_events - receives CALLER-OWNED array,
+     *       out_count - receives number of returned events
+     * Returns: true on success, false on database error
+     * OWNERSHIP: TRANSFERS ownership of returned events to CALLER
+     */
+    bool (*find_events)(const storage_event_scope_t *scope,  /* BORROWED */
+                        event_t ***out_events, size_t *out_count);
+
+    /* count_events - Count events matching scope
+     * Args: scope - selection scope, out_count - receives total matching count
+     * Returns: true on success, false on database error
+     * OWNERSHIP: BORROWS scope - does NOT take ownership
+     */
+    bool (*count_events)(const storage_event_scope_t *scope,  /* BORROWED */
+                         size_t *out_count);
+
+    /* delete_events - Delete events matching scope
+     * Args: scope - selection scope, out_deleted - receives number of deleted rows
+     * Returns: true on success, false on database error
+     * OWNERSHIP: BORROWS scope - does NOT take ownership
+     */
+    bool (*delete_events)(const storage_event_scope_t *scope,  /* BORROWED */
+                          size_t *out_deleted);
+
+    /* Transaction API */
+    storage_transaction_t *(*transaction_begin)(void);
+    bool (*transaction_commit)(storage_transaction_t *tx);
+    void (*transaction_rollback)(storage_transaction_t *tx);
+
+    bool (*delete_events_tx)(const storage_event_scope_t *scope,  /* BORROWED */
+                             storage_transaction_t *tx, size_t *out_deleted);
+    bool (*find_events_tx)(const storage_event_scope_t *scope,  /* BORROWED */
+                           storage_transaction_t *tx,
+                           event_t ***out_events, size_t *out_count);  /* TRANSFERS ownership to caller */
+
+    /* Replaceable event upsert (atomic delete-older-then-insert)
+     * OWNERSHIP: BORROWS event - does NOT take ownership */
+    storage_insert_result_t (*upsert_replaceable)(const event_t *ev,  /* BORROWED */
+                                                  const storage_tag_match_t *indexed_tags,
+                                                  size_t indexed_tags_count);
+
+    /* Addressable event upsert (atomic delete-older-then-insert)
+     * OWNERSHIP: BORROWS event - does NOT take ownership */
+    storage_insert_result_t (*upsert_addressable)(const event_t *ev,  /* BORROWED */
+                                                  const char *d_tag_value,
+                                                  const storage_tag_match_t *indexed_tags,
+                                                  size_t indexed_tags_count);
+
+    /* Compound tag index lookup (AND across names, OR within values)
+     * OWNERSHIP: TRANSFERS ownership of ID list to CALLER
+     * Caller MUST call free_id_list() */
+    bool (*find_ids_by_tags)(const char *const *tag_names,
+                             const char *const *tag_values,
+                             size_t tag_count,
+                             char ***ids_out, size_t *count_out);
+
+    /* Free ID list from find_ids_by_tags
+     * OWNERSHIP: Caller owns the ID list, this frees it */
+    void (*free_id_list)(char **ids, size_t count);
 } storage_context_t;
 
 /* ============================================================================
@@ -304,9 +307,6 @@ typedef struct {
     size_t count;
     char error_message[256];
 } storage_count_result_t;
-
-/* storage_transaction_t - Opaque transaction handle */
-typedef struct storage_transaction_t storage_transaction_t;
 
 /* storage_find_events - Find events matching scope
  *

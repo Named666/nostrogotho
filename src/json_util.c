@@ -145,6 +145,117 @@ static char *copy_json_value(const char *start, const char *end) {
     return copy;
 }
 
+/* Decode a raw JSON string token (including surrounding quotes) with full
+ * escape support: short forms, \/ (stripped to /), \uXXXX including
+ * surrogate pairs (emitted as UTF-8), raw bytes verbatim.
+ *
+ * This exists because mongoose's decoder returns NULL for BMP escapes above
+ * U+00FF, surrogate pairs, and \/ sequences — all valid JSON that signers
+ * (e.g. Python's default json.dumps) emit. Callers use it ONLY as a fallback
+ * when mg_json_get_str returns NULL, so inputs that decode today behave
+ * byte-identically (zero behavior change there).
+ *
+ * Returns out_pos+1 on success (nonzero even for empty strings; matches
+ * json_escape() convention), or 0 on malformed input / overflow.
+ * Decoded output never exceeds the raw token length. */
+static int decode_hex4(const char *p, unsigned *out) {
+    unsigned v = 0;
+    int i;
+    for (i = 0; i < 4; i++) {
+        char c = p[i];
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (unsigned)(c - 'A' + 10);
+        else return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+static size_t emit_utf8(char *dst, size_t dstsz, size_t pos, unsigned cp) {
+    if (cp < 0x80) {
+        if (pos + 1 >= dstsz) return 0;
+        dst[pos++] = (char)cp;
+    } else if (cp < 0x800) {
+        if (pos + 2 >= dstsz) return 0;
+        dst[pos++] = (char)(0xC0u | (cp >> 6));
+        dst[pos++] = (char)(0x80u | (cp & 0x3Fu));
+    } else if (cp < 0x10000) {
+        if (pos + 3 >= dstsz) return 0;
+        dst[pos++] = (char)(0xE0u | (cp >> 12));
+        dst[pos++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        dst[pos++] = (char)(0x80u | (cp & 0x3Fu));
+    } else if (cp <= 0x10FFFF) {
+        if (pos + 4 >= dstsz) return 0;
+        dst[pos++] = (char)(0xF0u | (cp >> 18));
+        dst[pos++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        dst[pos++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        dst[pos++] = (char)(0x80u | (cp & 0x3Fu));
+    } else {
+        return 0;
+    }
+    return pos;
+}
+
+size_t json_decode_string_token(const char *start, const char *end, char *dst,
+                                size_t dstsz) {
+    const char *p;
+    size_t pos = 0;
+    if (!start || !end || !dst || dstsz == 0) return 0;
+    if (end - start < 2 || *start != '"' || *(end - 1) != '"') return 0;
+    p = start + 1;
+    end = end - 1;
+    while (p < end) {
+        if (*p != '\\') {
+            if (pos + 1 >= dstsz) return 0;
+            dst[pos++] = *p++;
+            continue;
+        }
+        p++; /* past backslash */
+        if (p >= end) return 0;
+        switch (*p) {
+            case '"': case '\\': case '/':
+                if (pos + 1 >= dstsz) return 0;
+                dst[pos++] = *p++;
+                break;
+            case 'b': if (pos + 1 >= dstsz) return 0; dst[pos++] = '\b'; p++; break;
+            case 'f': if (pos + 1 >= dstsz) return 0; dst[pos++] = '\f'; p++; break;
+            case 'n': if (pos + 1 >= dstsz) return 0; dst[pos++] = '\n'; p++; break;
+            case 'r': if (pos + 1 >= dstsz) return 0; dst[pos++] = '\r'; p++; break;
+            case 't': if (pos + 1 >= dstsz) return 0; dst[pos++] = '\t'; p++; break;
+            case 'u': {
+                unsigned cp;
+                size_t npos;
+                p++;
+                if (end - p < 4 || !decode_hex4(p, &cp)) return 0;
+                p += 4;
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    unsigned lo;
+                    if (end - p < 6 || p[0] != '\\' || p[1] != 'u' ||
+                        !decode_hex4(p + 2, &lo) || lo < 0xDC00 ||
+                        lo > 0xDFFF) {
+                        return 0; /* lone high surrogate */
+                    }
+                    p += 6;
+                    cp = 0x10000u + ((cp - 0xD800u) << 10) + (lo - 0xDC00u);
+                } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                    return 0; /* lone low surrogate */
+                }
+                npos = emit_utf8(dst, dstsz, pos, cp);
+                if (!npos) return 0;
+                pos = npos;
+                break;
+            }
+            default:
+                return 0; /* invalid escape */
+        }
+    }
+    if (pos >= dstsz) return 0;
+    dst[pos] = '\0';
+    return pos + 1;
+}
+
 /* Parse a JSON string value (assumes current position is after opening quote) */
 static char *parse_json_string(const char **p) {
     const char *start = *p;
@@ -185,6 +296,46 @@ static char *parse_json_string(const char **p) {
                 case 'n':  result[out_idx++] = '\n'; break;
                 case 'r':  result[out_idx++] = '\r'; break;
                 case 't':  result[out_idx++] = '\t'; break;
+                case 'u': {
+                    /* Full \uXXXX support (surrogate pairs -> UTF-8), mirroring
+                     * json_decode_string_token(). The old code emitted the
+                     * letter 'u', silently corrupting every escaped string
+                     * (filter ids/authors/tags/search, field names). Fail
+                     * closed on malformed escapes. Decoded output only
+                     * shrinks vs the raw span, so result stays in bounds. */
+                    unsigned cp;
+                    size_t npos;
+                    if (in_idx + 4 >= len + 1 ||
+                        !decode_hex4(start + in_idx + 1, &cp)) {
+                        free(result);
+                        return NULL;
+                    }
+                    in_idx += 5;
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        unsigned lo;
+                        if (in_idx + 5 >= len + 1 || start[in_idx] != '\\' ||
+                            start[in_idx + 1] != 'u' ||
+                            !decode_hex4(start + in_idx + 2, &lo) ||
+                            lo < 0xDC00 || lo > 0xDFFF) {
+                            free(result);
+                            return NULL; /* lone high surrogate */
+                        }
+                        in_idx += 6;
+                        cp = 0x10000u + ((cp - 0xD800u) << 10) +
+                             (lo - 0xDC00u);
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        free(result);
+                        return NULL; /* lone low surrogate */
+                    }
+                    npos = emit_utf8(result, len + 1, out_idx, cp);
+                    if (!npos) {
+                        free(result);
+                        return NULL;
+                    }
+                    out_idx = npos;
+                    /* NOTE: no in_idx++ below — already past the escape. */
+                    continue;
+                }
                 default:   result[out_idx++] = c; break;
             }
         } else {
@@ -285,54 +436,91 @@ size_t json_array_parse(const char *json_str, json_value_t *values, size_t max_v
     if (!json_str || !values || max_values == 0) {
         return 0;
     }
-    
+
     const char *p = skip_whitespace(json_str);
-    
+
     if (!p || *p != '[') {
         return 0;  /* Not an array */
     }
-    
+
     p++;  /* Skip opening bracket */
     size_t count = 0;
-    
+
     while (count < max_values) {
         p = skip_whitespace(p);
-        
+
         if (!p || !*p) {
+            json_array_free(values, count);
             return 0;  /* Unterminated array */
         }
-        
+
         if (*p == ']') {
+            p++;
+            p = skip_whitespace(p);
+            if (p == NULL || *p != '\0') {
+                json_array_free(values, count);
+                return 0;  /* Trailing garbage after array */
+            }
             return count;  /* End of array */
         }
-        
+
         if (count > 0) {
             /* Expect comma separator */
             if (*p != ',') {
+                json_array_free(values, count);
                 return 0;  /* Expected comma */
             }
             p++;
         }
-        
+
         p = skip_whitespace(p);
-        
+
         if (!p || !*p) {
+            json_array_free(values, count);
             return 0;  /* Unterminated array */
         }
-        
+
         if (*p == ']') {
-            /* Trailing comma edge case */
-            return count;
+            /* Trailing comma is invalid JSON */
+            json_array_free(values, count);
+            return 0;
         }
-        
+
+        /* Remember where this value starts so a JSON null literal can be
+         * distinguished from a parse failure. parse_json_value() returns
+         * JSON_TYPE_NULL for both, and by the time it returns the cursor
+         * has already moved past a legitimate "null", so testing the text
+         * after the value is backwards: it rejects real nulls and accepts
+         * a broken value (e.g. an unterminated string) whose remaining
+         * text happens to start with "null". */
+        const char *val_start = p;
+        memset(&values[count], 0, sizeof(values[count]));
         if (parse_json_value(&p, &values[count]) == JSON_TYPE_NULL &&
-            strncmp(skip_whitespace(p), "null", 4) != 0) {
+            (strncmp(val_start, "null", 4) != 0 ||
+             (val_start[4] != '\0' && val_start[4] != ',' &&
+              val_start[4] != ']' &&
+              !isspace((unsigned char)val_start[4])))) {
             json_array_free(values, count);
             return 0;
         }
         count++;
     }
-    
+
+    /* max_values elements parsed without seeing ']': the array is either
+     * exactly full (next non-ws char must be ']') or oversized. Reject
+     * oversized input instead of silently truncating it. */
+    p = skip_whitespace(p);
+    if (!p || *p != ']') {
+        json_array_free(values, count);
+        return 0;
+    }
+    p++;
+    p = skip_whitespace(p);
+    if (p == NULL || *p != '\0') {
+        json_array_free(values, count);
+        return 0;  /* Trailing garbage after array */
+    }
+
     return count;
 }
 
@@ -517,7 +705,7 @@ void json_builder_object_key_string(json_builder_t *builder, const char *key, co
     /* The key write must never run past the 64 KiB buffer: previously the
      * guard only checked 4 bytes while snprintf was handed a fixed 128-byte
      * budget, so keys written near the end of the buffer overflowed into
-     * adjacent memory (stack smash in send_records()/broadcast_event()). */
+     * adjacent memory. */
     if (!json_builder_ensure_space(builder, 4)) return;
 
     builder->buffer[builder->pos++] = '"';
@@ -917,7 +1105,26 @@ bool json_parse_event(const char *json_str, event_t *event) {
     json = mg_str(json_str);
     id = mg_json_get_str(json, "$.id");
     pubkey = mg_json_get_str(json, "$.pubkey");
-    content = mg_json_get_str(json, "$.content");
+    /* Decode content with our own decoder (not mg_json_get_str): mongoose
+     * truncates/NULLs on some valid escapes (BMP \uXXXX above U+00FF,
+     * surrogate pairs, \/), which would corrupt or reject the event.
+     * Differential-tested byte-identical to mg_json_get_str on all inputs
+     * the latter handles. */
+    content = NULL;
+    {
+        struct mg_str raw = mg_json_get_tok(json, "$.content");
+        if (raw.buf && raw.len >= 2 && raw.buf[0] == '"') {
+            char *dec = (char *)malloc(raw.len + 1);
+            if (dec) {
+                if (json_decode_string_token(raw.buf, raw.buf + raw.len,
+                                             dec, raw.len + 1)) {
+                    content = dec;
+                } else {
+                    free(dec);
+                }
+            }
+        }
+    }
     sig = mg_json_get_str(json, "$.sig");
     tags = mg_json_get_tok(json, "$.tags");
     if (!id || !pubkey || !content || !sig || !tags.buf ||

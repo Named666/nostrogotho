@@ -205,25 +205,105 @@ static storage_delete_result_t module_storage_delete_kind(int kind, const char *
     return result;
 }
 
-static bool module_storage_delete_matching(const storage_event_scope_t *scope,
-                                            storage_event_predicate_t predicate,
-                                            void *userdata, size_t *deleted,
-                                            char *next_id, size_t next_id_size,
-                                            bool *more) {
-    return g_host && g_host->storage_delete_matching &&
-           g_host->storage_delete_matching(g_host->userdata, scope, predicate, userdata, deleted, next_id, next_id_size, more);
+/* module_storage_delete_matching deleted with the legacy predicate API. */
+
+/* New unified storage API - forwards to host NHR services */
+static bool module_storage_find_events(const storage_event_scope_t *scope,
+                                       event_t ***out_events,
+                                       size_t *out_count) {
+    return g_host && g_host->storage_find_events
+        ? g_host->storage_find_events(g_host->userdata, scope, out_events, out_count)
+        : false;
 }
 
-static bool module_storage_send_records(send_records_callback_t sender,
-                                         const char *sub,
-                                         const filter_t *filters,
-                                         size_t filters_count, bool do_count,
-                                         bool *has_more, int *out_count,
-                                         const storage_tag_match_t *indexed_tags,
-                                         size_t indexed_tags_count,
-                                         void *userdata) {
-    return g_host && g_host->storage_send_records &&
-           g_host->storage_send_records(g_host->userdata, sender, sub, filters, filters_count, do_count, has_more, out_count, indexed_tags, indexed_tags_count, userdata);
+static bool module_storage_count_events(const storage_event_scope_t *scope,
+                                        size_t *out_count) {
+    return g_host && g_host->storage_count_events
+        ? g_host->storage_count_events(g_host->userdata, scope, out_count)
+        : false;
+}
+
+static bool module_storage_delete_events(const storage_event_scope_t *scope,
+                                         size_t *out_deleted) {
+    return g_host && g_host->storage_delete_events
+        ? g_host->storage_delete_events(g_host->userdata, scope, out_deleted)
+        : false;
+}
+
+static storage_transaction_t *module_storage_transaction_begin(void) {
+    return g_host && g_host->storage_transaction_begin
+        ? g_host->storage_transaction_begin(g_host->userdata)
+        : NULL;
+}
+
+static bool module_storage_transaction_commit(storage_transaction_t *tx) {
+    return g_host && g_host->storage_transaction_commit
+        ? g_host->storage_transaction_commit(g_host->userdata, tx)
+        : false;
+}
+
+static void module_storage_transaction_rollback(storage_transaction_t *tx) {
+    if (g_host && g_host->storage_transaction_rollback) {
+        g_host->storage_transaction_rollback(g_host->userdata, tx);
+    }
+}
+
+static bool module_storage_delete_events_tx(const storage_event_scope_t *scope,
+                                            storage_transaction_t *tx,
+                                            size_t *out_deleted) {
+    return g_host && g_host->storage_delete_events_tx
+        ? g_host->storage_delete_events_tx(g_host->userdata, scope, tx, out_deleted)
+        : false;
+}
+
+static bool module_storage_find_events_tx(const storage_event_scope_t *scope,
+                                          storage_transaction_t *tx,
+                                          event_t ***out_events,
+                                          size_t *out_count) {
+    return g_host && g_host->storage_find_events_tx
+        ? g_host->storage_find_events_tx(g_host->userdata, scope, tx, out_events, out_count)
+        : false;
+}
+
+static storage_insert_result_t module_storage_upsert_replaceable(const event_t *event,
+                                                                  const storage_tag_match_t *indexed_tags,
+                                                                  size_t indexed_tags_count) {
+    storage_insert_result_t result = {0};
+    result.result = STORAGE_ERROR;
+    snprintf(result.error_message, sizeof(result.error_message), "not implemented");
+    if (g_host && g_host->storage_upsert_replaceable) {
+        return g_host->storage_upsert_replaceable(g_host->userdata, event, indexed_tags, indexed_tags_count);
+    }
+    return result;
+}
+
+static storage_insert_result_t module_storage_upsert_addressable(const event_t *event,
+                                                                  const char *d_tag_value,
+                                                                  const storage_tag_match_t *indexed_tags,
+                                                                  size_t indexed_tags_count) {
+    storage_insert_result_t result = {0};
+    result.result = STORAGE_ERROR;
+    snprintf(result.error_message, sizeof(result.error_message), "not implemented");
+    if (g_host && g_host->storage_upsert_addressable) {
+        return g_host->storage_upsert_addressable(g_host->userdata, event, d_tag_value, indexed_tags, indexed_tags_count);
+    }
+    return result;
+}
+
+static bool module_storage_find_ids_by_tags(const char *const *tag_names,
+                                            const char *const *tag_values,
+                                            size_t tag_count,
+                                            char ***ids_out,
+                                            size_t *count_out) {
+    return g_host && g_host->storage_find_ids_by_tags
+        ? g_host->storage_find_ids_by_tags(g_host->userdata, tag_names, tag_values, tag_count, ids_out, count_out)
+        : false;
+}
+
+static void module_storage_free_id_list(char **ids, size_t count) {
+    if (g_host && g_host->storage_free_id_list) {
+        g_host->storage_free_id_list(g_host->userdata, ids, count);
+    }
 }
 
 static void module_storage_adapter_init(void) {
@@ -232,8 +312,20 @@ static void module_storage_adapter_init(void) {
     g_module_storage_adapter.insert_record = module_storage_insert;
     g_module_storage_adapter.delete_record_by_id_and_pubkey = module_storage_delete_id;
     g_module_storage_adapter.delete_record_by_kind_and_pubkey = module_storage_delete_kind;
-    g_module_storage_adapter.delete_matching = module_storage_delete_matching;
-    g_module_storage_adapter.send_records = module_storage_send_records;
+    /* delete_matching removed (legacy predicate API deleted). */
+    /* New unified storage API */
+    g_module_storage_adapter.find_events = module_storage_find_events;
+    g_module_storage_adapter.count_events = module_storage_count_events;
+    g_module_storage_adapter.delete_events = module_storage_delete_events;
+    g_module_storage_adapter.transaction_begin = module_storage_transaction_begin;
+    g_module_storage_adapter.transaction_commit = module_storage_transaction_commit;
+    g_module_storage_adapter.transaction_rollback = module_storage_transaction_rollback;
+    g_module_storage_adapter.delete_events_tx = module_storage_delete_events_tx;
+    g_module_storage_adapter.find_events_tx = module_storage_find_events_tx;
+    g_module_storage_adapter.upsert_replaceable = module_storage_upsert_replaceable;
+    g_module_storage_adapter.upsert_addressable = module_storage_upsert_addressable;
+    g_module_storage_adapter.find_ids_by_tags = module_storage_find_ids_by_tags;
+    g_module_storage_adapter.free_id_list = module_storage_free_id_list;
     g_module_storage_adapter.init = NULL;
     g_module_storage_adapter.deinit = NULL;
 }

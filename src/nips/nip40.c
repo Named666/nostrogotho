@@ -48,36 +48,43 @@ static bool nip40_event_is_expired(const event_t *event) {
     return expiration <= now;
 }
 
-static bool nip40_expiry_predicate(const event_t *event, void *userdata) {
-    (void)userdata;
-    return nip40_event_is_expired(event);
-}
-
 /* Background sweep of expired events. Runs inside the single-threaded event
- * loop (never races storage) and asks the storage layer to delete every
- * event whose expiration timestamp has passed. Best-effort: logs and never
- * fails the server. `arg` is a storage_context_t* (NULL-safe no-op). */
+ * loop (never races storage). Uses the unified find/delete API only:
+ * page through events, test expiration in NIP code, delete by ID. Best-
+ * effort: logs and never fails the server. `arg` is a storage_context_t*
+ * (NULL-safe no-op). Legacy delete_matching predicate path deleted. */
 static void nip40_garbage_collect(void *arg) {
     storage_context_t *storage = (storage_context_t *) arg;
-    storage_event_scope_t scope = {0};
-    char cursor[MAX_ID_SIZE + 1] = "";
     size_t total = 0;
-    bool more = false;
-    if (!storage || !storage->delete_matching) return;
-    do {
-        size_t deleted = 0;
-        char next_id[MAX_ID_SIZE + 1] = "";
-        scope.after_id = cursor[0] ? cursor : NULL;
-        if (!storage->delete_matching(&scope,
-                                      nip40_expiry_predicate,
-                                      NULL, &deleted, next_id, sizeof(next_id),
-                                      &more)) {
+    size_t offset = 0;
+    if (!storage || !storage->find_events || !storage->delete_events) return;
+    for (;;) {
+        storage_event_scope_t scope = {0};
+        scope.limit = 256;
+        scope.offset = offset;
+        event_t **events = NULL;
+        size_t count = 0;
+        if (!storage->find_events(&scope, &events, &count)) {
             log_nip_error("NIP-40", "GC", "storage selection failed");
             return;
         }
-        total += deleted;
-        snprintf(cursor, sizeof(cursor), "%s", next_id);
-    } while (more);
+        if (count == 0) {
+            free(events);
+            break;
+        }
+        for (size_t i = 0; i < count; i++) {
+            if (nip40_event_is_expired(events[i])) {
+                storage_event_scope_t del = {0};
+                del.id = events[i]->id;
+                size_t deleted = 0;
+                if (storage->delete_events(&del, &deleted)) total += deleted;
+            }
+            event_free(events[i]);
+        }
+        free(events);
+        if (count < 256) break;
+        offset += count;
+    }
     if (total > 0) log_nip_info("NIP-40", "GC", "deleted %lu expired event(s)", (unsigned long)total);
 }
 

@@ -30,11 +30,12 @@ typedef struct connection_snapshot connection_snapshot_t;
 #define NHR_EXPORT __attribute__((visibility("default")))
 #endif
 
-/* v4 changes relay_config_t layout (owned string buffers, verbosity enum
- * replacing bool debug_logging, nip42/hot_reload sections). v3 added the
- * multi-pubkey session services. Rebuild host and module together on
- * version change. */
-#define NHR_ABI_VERSION 4u
+/* v5 removed storage_delete_matching (predicate callback across the hot
+ * reload boundary). v4 changes relay_config_t layout (owned string buffers,
+ * verbosity enum replacing bool debug_logging, nip42/hot_reload sections).
+ * v3 added the multi-pubkey session services. Rebuild host and module
+ * together on version change. */
+#define NHR_ABI_VERSION 5u
 #define NHR_STATE_VERSION 1u
 
 typedef struct {
@@ -65,16 +66,48 @@ typedef struct Nhr_Host {
     int (NHR_CALL *storage_delete_by_kind_and_pubkey)(void *userdata, int kind,
                                                       const char *pubkey,
                                                       time_t created_at);
-    bool (NHR_CALL *storage_delete_matching)(
-        void *userdata, const storage_event_scope_t *scope,
-        storage_event_predicate_t predicate, void *predicate_userdata,
-        size_t *deleted, char *next_id, size_t next_id_size, bool *more);
-    bool (NHR_CALL *storage_send_records)(
-        void *userdata, send_records_callback_t sender, const char *sub,
-        const filter_t *filters, size_t filters_count, bool do_count,
-        bool *has_more, int *out_count,
-        const storage_tag_match_t *indexed_tags, size_t indexed_tags_count,
-        void *callback_userdata);
+    /* Legacy storage_delete_matching (predicate callback across the hot
+     * reload boundary) deleted. Modules use find/delete_events. */
+    /* New unified storage API (per NOSTR_EVENT_STORAGE_SPEC.md) -
+     * exposed for module builds; host calls global functions directly. */
+    bool (NHR_CALL *storage_find_events)(void *userdata,
+                                         const storage_event_scope_t *scope,
+                                         event_t ***out_events,
+                                         size_t *out_count);
+    bool (NHR_CALL *storage_count_events)(void *userdata,
+                                          const storage_event_scope_t *scope,
+                                          size_t *out_count);
+    bool (NHR_CALL *storage_delete_events)(void *userdata,
+                                           const storage_event_scope_t *scope,
+                                           size_t *out_deleted);
+    storage_transaction_t *(NHR_CALL *storage_transaction_begin)(void *userdata);
+    bool (NHR_CALL *storage_transaction_commit)(void *userdata, storage_transaction_t *tx);
+    void (NHR_CALL *storage_transaction_rollback)(void *userdata, storage_transaction_t *tx);
+    bool (NHR_CALL *storage_delete_events_tx)(void *userdata,
+                                              const storage_event_scope_t *scope,
+                                              storage_transaction_t *tx,
+                                              size_t *out_deleted);
+    bool (NHR_CALL *storage_find_events_tx)(void *userdata,
+                                            const storage_event_scope_t *scope,
+                                            storage_transaction_t *tx,
+                                            event_t ***out_events,
+                                            size_t *out_count);
+    storage_insert_result_t (NHR_CALL *storage_upsert_replaceable)(void *userdata,
+                                                                   const event_t *event,
+                                                                   const storage_tag_match_t *indexed_tags,
+                                                                   size_t indexed_tags_count);
+    storage_insert_result_t (NHR_CALL *storage_upsert_addressable)(void *userdata,
+                                                                   const event_t *event,
+                                                                   const char *d_tag_value,
+                                                                   const storage_tag_match_t *indexed_tags,
+                                                                   size_t indexed_tags_count);
+    bool (NHR_CALL *storage_find_ids_by_tags)(void *userdata,
+                                              const char *const *tag_names,
+                                              const char *const *tag_values,
+                                              size_t tag_count,
+                                              char ***ids_out,
+                                              size_t *count_out);
+    void (NHR_CALL *storage_free_id_list)(void *userdata, char **ids, size_t count);
     bool (NHR_CALL *crypto_check_event)(void *userdata, const event_t *event);
     void (NHR_CALL *crypto_sha256)(void *userdata, const uint8_t *data,
                                    size_t length, uint8_t digest[32]);

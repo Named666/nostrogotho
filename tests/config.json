@@ -1,0 +1,26 @@
+{
+  "database": "./nostrogotho.sqlite",
+  "port": 7447,
+  "service_url": "wss://relay.example.com",
+  "verbosity": 0,
+  "limits": {
+    "max_subscriptions_per_connection": 50,
+    "max_filters_per_subscription": 10,
+    "max_subscription_id_length": 100,
+    "max_query_limit": 500,
+    "max_event_content_length": 65536,
+    "max_event_tags": 100,
+    "max_ws_message_length": 5242880,
+    "min_pow_difficulty": 0,
+    "created_at_lower_limit": 0,
+    "created_at_upper_limit": 900
+  },
+  "nip42": {
+    "enabled": true,
+    "auth_required_for_write": false
+  },
+  "hot_reload": {
+    "enabled": false,
+    "module_path": "build/nostrogotho.dll"
+  }
+}

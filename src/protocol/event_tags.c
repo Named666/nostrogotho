@@ -3,39 +3,45 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* strndup replacement for Windows */
-static char *my_strndup(const char *s, size_t n) {
-    char *p = malloc(n + 1);
-    if (!p) return NULL;
-    memcpy(p, s, n);
-    p[n] = '\0';
-    return p;
-}
-
 /* ============================================================================
  * Internal: Build values array from a tag (mg_str)
  * Returns malloc'd NULL-terminated array of tag[1..] values.
  * Caller frees with event_tag_free().
+ *
+ * Decodes through tag_iter_element (mg_json_get_str + fallback decoder),
+ * never raw tokens: the old raw-token copy kept the surrounding JSON
+ * quotes (e.g. `"abc..."` instead of `abc...`), so indexed tag values
+ * never equalled filter values and every stored tag query came back empty.
  * ============================================================================ */
 static char **build_values_array(struct mg_str tag) {
     size_t elem_count = 0;
-    tag_iter_t elem_it;
-    tag_iter_init_tag(&elem_it, tag);
+    char **values = NULL;
+    size_t idx = 0;
+    tag_iter_t it;
 
-    struct mg_str ek, elem;
-    while (tag_iter_next(&elem_it, &ek, &elem)) elem_count++;
+    /* Count values (tag[1..]); element 0 is the tag name. */
+    tag_iter_init_tag(&it, tag);
+    for (;;) {
+        char *v = tag_iter_element(&it, elem_count + 1);
+        if (!v) break;
+        free(v);
+        elem_count++;
+        if (elem_count > MAX_TAG_ELEMENTS) break;
+    }
+    if (elem_count == 0 || elem_count > MAX_TAG_ELEMENTS) return NULL;
 
-    if (elem_count <= 1) return NULL; // No values (only name)
-
-    char **values = calloc(elem_count, sizeof(char *)); // elem_count-1 values + NULL
+    values = calloc(elem_count + 1, sizeof(char *));
     if (!values) return NULL;
 
-    tag_iter_init_tag(&elem_it, tag);
-    size_t idx = 0;
-    while (tag_iter_next(&elem_it, &ek, &elem)) {
-        if (idx == 0) { idx++; continue; } // Skip name (tag[0])
-        values[idx - 1] = elem.len > 0 ? my_strndup(elem.buf, elem.len) : strdup("");
-        idx++;
+    tag_iter_init_tag(&it, tag);
+    for (idx = 0; idx < elem_count; idx++) {
+        values[idx] = tag_iter_element(&it, idx + 1);
+        if (!values[idx]) break;
+    }
+    if (idx != elem_count) {
+        for (size_t k = 0; k < idx; k++) free(values[k]);
+        free(values);
+        return NULL;
     }
     return values;
 }
@@ -51,7 +57,14 @@ void event_tags_foreach(const event_t *event, event_tag_iter_cb cb, void *ctx) {
 
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *name = tag_iter_element(&it, 0);
+        /* NOTE: element() must run on a sub-iterator over the current tag.
+         * Calling it on the outer iterator always yields NULL (mongoose
+         * returns NULL for non-string tokens), which silently disabled every
+         * name lookup. */
+        tag_iter_t sub;
+        char *name;
+        tag_iter_init_tag(&sub, tag);
+        name = tag_iter_element(&sub, 0);
         if (!name) continue;
 
         char **values = build_values_array(tag);
@@ -82,7 +95,10 @@ char **event_tag_get(const event_t *event, const char *name) {
 
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *n = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        char *n;
+        tag_iter_init_tag(&sub, tag);
+        n = tag_iter_element(&sub, 0);
         if (!n) continue;
 
         if (strcmp(n, name) == 0) {
@@ -108,7 +124,10 @@ char ***event_tag_get_all(const event_t *event, const char *name, size_t *out_co
 
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *n = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        char *n;
+        tag_iter_init_tag(&sub, tag);
+        n = tag_iter_element(&sub, 0);
         if (!n) continue;
 
         if (strcmp(n, name) == 0) {
@@ -141,11 +160,14 @@ char *event_tag_value(const event_t *event, const char *name) {
 
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *n = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        char *n;
+        tag_iter_init_tag(&sub, tag);
+        n = tag_iter_element(&sub, 0);
         if (!n) continue;
 
         if (strcmp(n, name) == 0) {
-            char *v = tag_iter_element(&it, 1);
+            char *v = tag_iter_element(&sub, 1);
             free(n);
             return v; // Already strdup'd by tag_iter_element
         }
@@ -169,17 +191,30 @@ bool event_tag_has_value(const event_t *event, const char *name, const char *val
 
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *n = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        char *n;
+        tag_iter_init_tag(&sub, tag);
+        n = tag_iter_element(&sub, 0);
         if (!n) continue;
 
-        if (strcmp(n, name) == 0) {
-            char *v = tag_iter_element(&it, 1);
-            bool match = v && strcmp(v, value) == 0;
-            free(n);
+        bool name_match = strcmp(n, name) == 0;
+        free(n);
+        if (!name_match) continue;
+
+        /* NIP-01: a filter value matches if ANY element after the tag
+         * name equals it (tag[1..]), across ALL tags with this name.
+         * The old code only compared tag[1], so multi-value tags such
+         * as ["e", "a", "b"] never matched a filter for "b". */
+        for (size_t idx = 1;; idx++) {
+            tag_iter_t elem_it;
+            char *v;
+            tag_iter_init_tag(&elem_it, tag);
+            v = tag_iter_element(&elem_it, idx);
+            if (!v) break;
+            bool match = strcmp(v, value) == 0;
             free(v);
             if (match) return true;
         }
-        free(n);
     }
     return false;
 }
@@ -193,7 +228,10 @@ size_t event_tag_count(const event_t *event, const char *name) {
 
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *n = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        char *n;
+        tag_iter_init_tag(&sub, tag);
+        n = tag_iter_element(&sub, 0);
         if (n && strcmp(n, name) == 0) count++;
         free(n);
     }

@@ -61,4 +61,9 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err, size
 /* Write a default config.json. Never overwrites: fails if path exists. */
 bool relay_config_write_defaults(const char *path);
 
+/* Report unknown keys in path (warn level). Called by main() after log
+ * verbosity is set; kept out of relay_config_load() so early warnings
+ * aren't swallowed by the default-quiet logger. */
+void relay_config_warn_unknown(const char *path);
+
 #endif /* RELAY_CONFIG_H_ */

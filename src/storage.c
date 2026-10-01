@@ -22,13 +22,12 @@
 /* Global SQLite3 connection (single instance) */
 static sqlite3 *db_conn = NULL;
 
-/* Parameter types for bound SQL statements.
- * PARAM_TYPE_OWNED_STRING marks heap-allocated (malloc+strcpy) values that
- * must be released by params_release(); PARAM_TYPE_STRING values are
- * borrowed (e.g. they point into a filter_t) and are never freed here. */
+/* Parameter types for bound SQL statements. All values are borrowed
+ * (e.g. they point into a filter_t) and are never freed here. The legacy
+ * heap-owned LIKE-pattern path (params_release/PARAM_TYPE_OWNED_STRING)
+ * was deleted with the old filter path. */
 #define PARAM_TYPE_NUMBER 0
 #define PARAM_TYPE_STRING 1
-#define PARAM_TYPE_OWNED_STRING 2
 
 /* Parameter structure for flexible SQL binding */
 typedef struct {
@@ -42,22 +41,6 @@ typedef struct {
 /* ============================================================================
  * Utility Functions
  * ============================================================================ */
-
-/* params_release - Free heap-owned bind parameters
- *
- * send_records() mixes borrowed strings (pointing into filter_t arrays) with
- * heap-owned patterns built for LIKE/search conditions. Only OWNED_STRING
- * entries are freed; calling this after each query keeps a REQ storm from
- * leaking memory per filter iteration.
- */
-static void params_release(param_t *params, size_t param_count) {
-    for (size_t i = 0; i < param_count; i++) {
-        if (params[i].type == PARAM_TYPE_OWNED_STRING) {
-            free(params[i].value.string);
-            params[i].value.string = NULL;
-        }
-    }
-}
 
 /* append_condition - Helper to append a condition to the WHERE clause buffer
  * Returns false on buffer overflow */
@@ -263,24 +246,60 @@ static bool build_where_clause(const storage_event_scope_t *scope,
         }
     }
 
-    /* Compound tag filter: AND of EXISTS subqueries
-     * For each (tag_name, tag_value) pair:
-     *   EXISTS (SELECT 1 FROM event_tag_index WHERE event_id=event.id AND tag_name=? AND tag_value=?)
-     * All combined with AND
-     */
+    /* Compound tag filter: AND across distinct tag names, OR within
+     * values of the same name (NIP-01: within a filter, tag values for one
+     * name are OR'd, different names are AND'd). The scope carries a flat
+     * (name, value) list from filter_to_scope; group by name so each
+     * distinct name emits a single EXISTS ... IN (...) clause. The old code
+     * emitted one EXISTS per pair ANDed together, requiring multi-value
+     * filters like {"#p": ["a","b"]} to match BOTH. */
     if (scope->tag_names && scope->tag_values && scope->tag_count > 0) {
         for (size_t i = 0; i < scope->tag_count; i++) {
-            if (*param_count + 2 > max_params) return false;
-            char subquery[256];
-            snprintf(subquery, sizeof(subquery),
-                     "EXISTS (SELECT 1 FROM event_tag_index WHERE event_id=event.id AND tag_name=? AND tag_value=?)");
+            const char *name = scope->tag_names[i];
+            if (!name) return false;
+            /* Skip names already emitted (grouped globally, order-independent). */
+            bool seen = false;
+            for (size_t s = 0; s < i; s++) {
+                if (scope->tag_names[s] && strcmp(scope->tag_names[s], name) == 0) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            /* Count values for this name. */
+            size_t nvalues = 0;
+            for (size_t k = i; k < scope->tag_count; k++) {
+                if (scope->tag_names[k] && strcmp(scope->tag_names[k], name) == 0) nvalues++;
+            }
+            if (nvalues == 0) continue;
+            if (*param_count + 1 + nvalues > max_params) return false;
+            /* Build: EXISTS (SELECT 1 FROM event_tag_index
+             *         WHERE event_id=event.id AND tag_name=? AND tag_value IN (?,?,...)) */
+            char subquery[1024];
+            int written = snprintf(subquery, sizeof(subquery),
+                     "EXISTS (SELECT 1 FROM event_tag_index WHERE event_id=event.id AND tag_name=? AND tag_value IN (");
+            if (written < 0 || (size_t)written >= sizeof(subquery)) return false;
+            for (size_t k = 0; k < nvalues; k++) {
+                if (k > 0) {
+                    if (strlen(subquery) + 1 >= sizeof(subquery)) return false;
+                    strcat(subquery, ",");
+                }
+                if (strlen(subquery) + 1 >= sizeof(subquery)) return false;
+                strcat(subquery, "?");
+            }
+            if (strlen(subquery) + 2 >= sizeof(subquery)) return false;
+            strcat(subquery, "))");
             if (!append_condition(conditions, conditions_size, subquery, &first)) return false;
             params[*param_count].type = PARAM_TYPE_STRING;
-            params[*param_count].value.string = (char *)scope->tag_names[i];
+            params[*param_count].value.string = (char *)name;
             (*param_count)++;
-            params[*param_count].type = PARAM_TYPE_STRING;
-            params[*param_count].value.string = (char *)scope->tag_values[i];
-            (*param_count)++;
+            for (size_t k = i; k < scope->tag_count; k++) {
+                if (scope->tag_names[k] && strcmp(scope->tag_names[k], name) == 0) {
+                    params[*param_count].type = PARAM_TYPE_STRING;
+                    params[*param_count].value.string = (char *)scope->tag_values[k];
+                    (*param_count)++;
+                }
+            }
         }
     }
 
@@ -303,9 +322,9 @@ static bool index_event_tag(const char *event_id, const char *tag_name,
     return ok;
 }
 
-static bool find_ids_by_tag_sqlite3(const char *tag_name, const char *tag_value,
-                                    char ***ids_out, size_t *count_out);
-static void free_id_list_sqlite3(char **ids, size_t count);
+/* Legacy single-tag lookup (find_ids_by_tag_sqlite3/free_id_list_sqlite3)
+ * deleted: compound storage_find_ids_by_tags below is the single tag-index
+ * path, and history queries go through build_where_clause. */
 
 static void index_legacy_delegations(void) {
     sqlite3_stmt *scan = NULL;
@@ -325,50 +344,8 @@ static void index_legacy_delegations(void) {
     sqlite3_finalize(scan);
 }
 
-static bool find_ids_by_tag_sqlite3(const char *tag_name, const char *tag_value,
-                                    char ***ids_out, size_t *count_out) {
-    sqlite3_stmt *stmt = NULL;
-    char **ids = NULL;
-    size_t count = 0;
-    const char *sql = "SELECT event_id FROM event_tag_index WHERE tag_name = ? AND tag_value = ? ORDER BY event_id";
-    if (!db_conn || !tag_name || !tag_value || !ids_out || !count_out) return false;
-    *ids_out = NULL;
-    *count_out = 0;
-    if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) return false;
-    sqlite3_bind_text(stmt, 1, tag_name, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, tag_value, -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *id = (const char *)sqlite3_column_text(stmt, 0);
-        char **grown;
-        if (!id) continue;
-        grown = (char **)realloc(ids, (count + 1) * sizeof(*ids));
-        if (!grown) {
-            sqlite3_finalize(stmt);
-            for (size_t i = 0; i < count; i++) free(ids[i]);
-            free(ids);
-            return false;
-        }
-        ids = grown;
-        ids[count] = malloc(strlen(id) + 1);
-        if (!ids[count]) {
-            sqlite3_finalize(stmt);
-            for (size_t i = 0; i < count; i++) free(ids[i]);
-            free(ids);
-            return false;
-        }
-        strcpy(ids[count], id);
-        count++;
-    }
-    sqlite3_finalize(stmt);
-    *ids_out = ids;
-    *count_out = count;
-    return true;
-}
-
-static void free_id_list_sqlite3(char **ids, size_t count) {
-    for (size_t i = 0; i < count; i++) free(ids[i]);
-    free(ids);
-}
+/* escape_like kept as a public utility (tests cover it); the legacy
+ * tags-LIKE filter path that used it was deleted. */
 
 /* escape_like - Escape SQL LIKE special characters
  * 
@@ -688,677 +665,10 @@ static storage_delete_result_t delete_record_by_kind_and_pubkey(int kind, const 
     return result;
 }
 
-static bool conditions_append(char *conditions, size_t size, const char *text);
-
-static bool event_matches_scope(const event_t *event,
-                                const storage_event_scope_t *scope) {
-    if (!scope) return true;
-    if (scope->id && strcmp(event->id, scope->id) != 0) return false;
-    if (scope->after_id && strcmp(event->id, scope->after_id) <= 0) return false;
-    if (scope->ids && scope->ids_count > 0) {
-        bool found = false;
-        for (size_t i = 0; i < scope->ids_count; i++) {
-            if (scope->ids[i] && strcmp(event->id, scope->ids[i]) == 0) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    if (scope->pubkey && strcmp(event->pubkey, scope->pubkey) != 0) return false;
-    if (scope->pubkeys && scope->pubkeys_count > 0) {
-        bool found = false;
-        for (size_t i = 0; i < scope->pubkeys_count; i++) {
-            if (scope->pubkeys[i] && strcmp(event->pubkey, scope->pubkeys[i]) == 0) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    if (scope->has_kind && event->kind != scope->kind) return false;
-    if (scope->kinds && scope->kinds_count > 0) {
-        bool found = false;
-        for (size_t i = 0; i < scope->kinds_count; i++) {
-            if (event->kind == scope->kinds[i]) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-    if (scope->has_created_at_before &&
-        event->created_at >= scope->created_at_before) return false;
-    if (scope->has_created_at_at_or_before &&
-        event->created_at > scope->created_at_at_or_before) return false;
-    if (scope->has_created_at_after &&
-        event->created_at <= scope->created_at_after) return false;
-    if (scope->has_created_at_at_or_after &&
-        event->created_at < scope->created_at_at_or_after) return false;
-    if (scope->has_excluded_kind && event->kind == scope->excluded_kind) return false;
-    if (scope->excluded_kinds && scope->excluded_kinds_count > 0) {
-        for (size_t i = 0; i < scope->excluded_kinds_count; i++) {
-            if (event->kind == scope->excluded_kinds[i]) return false;
-        }
-    }
-    return true;
-}
-
-/* Generic bounded selector/deleter. Tag policy is supplied by the caller;
- * SQLite only narrows by ordinary event columns and deletes selected IDs. */
-static bool delete_matching_sqlite3(const storage_event_scope_t *scope,
-                                    storage_event_predicate_t predicate,
-                                    void *userdata, size_t *deleted_out,
-                                    char *next_id, size_t next_id_size,
-                                    bool *more) {
-    enum { STORAGE_SCAN_BATCH = 256 };
-    char sql[512];
-    char conditions[384] = "";
-    char last_id[MAX_ID_SIZE + 1] = "";
-    size_t page_limit = scope && scope->limit ? scope->limit : STORAGE_SCAN_BATCH;
-    size_t deleted = 0;
-    bool ok = true;
-
-    if (!db_conn) return false;
-    if (deleted_out) *deleted_out = 0;
-    if (next_id && next_id_size) next_id[0] = '\0';
-    if (more) *more = false;
-    if (page_limit > STORAGE_SCAN_BATCH) page_limit = STORAGE_SCAN_BATCH;
-
-    /* Build a bounded, parameterized keyset query. Since event IDs are
-     * unique and immutable, each batch can be finalized before deletions. */
-    if ((scope && scope->id && !conditions_append(conditions, sizeof(conditions), "id = ? AND ")) ||
-        (scope && scope->after_id && !conditions_append(conditions, sizeof(conditions), "id > ? AND ")) ||
-        (scope && scope->pubkey && !conditions_append(conditions, sizeof(conditions), "pubkey = ? AND ")) ||
-        (scope && scope->has_kind && !conditions_append(conditions, sizeof(conditions), "kind = ? AND ")) ||
-        (scope && scope->has_created_at_before && !conditions_append(conditions, sizeof(conditions), "created_at < ? AND ")) ||
-        (scope && scope->has_created_at_at_or_before && !conditions_append(conditions, sizeof(conditions), "created_at <= ? AND ")) ||
-        (scope && scope->has_created_at_after && !conditions_append(conditions, sizeof(conditions), "created_at > ? AND ")) ||
-        (scope && scope->has_created_at_at_or_after && !conditions_append(conditions, sizeof(conditions), "created_at >= ? AND ")) ||
-        (scope && scope->has_excluded_kind && !conditions_append(conditions, sizeof(conditions), "kind != ? AND "))) {
-        return false;
-    }
-    if (conditions[0]) conditions[strlen(conditions) - 5] = '\0';
-    snprintf(sql, sizeof(sql), "SELECT id,pubkey,created_at,kind,tags,content,sig FROM event WHERE %s ORDER BY id LIMIT %lu",
-             conditions[0] ? conditions : "1", (unsigned long)page_limit);
-
-    {
-        sqlite3_stmt *stmt = NULL;
-        char *ids[STORAGE_SCAN_BATCH] = {0};
-        char *pubkeys[STORAGE_SCAN_BATCH] = {0};
-        size_t ids_count = 0;
-        size_t scanned = 0;
-        int bind = 1, rc;
-
-        if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-            log_storage_error("DELETE_MATCHING", "SQL error: %s", sqlite3_errmsg(db_conn));
-            return false;
-        }
-        if (scope && scope->id) sqlite3_bind_text(stmt, bind++, scope->id, -1, SQLITE_TRANSIENT);
-        if (scope && scope->after_id) sqlite3_bind_text(stmt, bind++, scope->after_id, -1, SQLITE_TRANSIENT);
-        if (scope && scope->pubkey) sqlite3_bind_text(stmt, bind++, scope->pubkey, -1, SQLITE_TRANSIENT);
-        if (scope && scope->has_kind) sqlite3_bind_int(stmt, bind++, scope->kind);
-        if (scope && scope->has_created_at_before) sqlite3_bind_int64(stmt, bind++, (sqlite3_int64)scope->created_at_before);
-        if (scope && scope->has_created_at_at_or_before) sqlite3_bind_int64(stmt, bind++, (sqlite3_int64)scope->created_at_at_or_before);
-        if (scope && scope->has_created_at_after) sqlite3_bind_int64(stmt, bind++, (sqlite3_int64)scope->created_at_after);
-        if (scope && scope->has_created_at_at_or_after) sqlite3_bind_int64(stmt, bind++, (sqlite3_int64)scope->created_at_at_or_after);
-        if (scope && scope->has_excluded_kind) sqlite3_bind_int(stmt, bind++, scope->excluded_kind);
-        while (scanned < page_limit && (rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-            event_t event = {0};
-            const unsigned char *id = sqlite3_column_text(stmt, 0);
-            const unsigned char *pubkey = sqlite3_column_text(stmt, 1);
-            const unsigned char *sig = sqlite3_column_text(stmt, 6);
-            if (!id || !pubkey || !sig) { ok = false; break; }
-            snprintf(event.id, sizeof(event.id), "%s", (const char *)id);
-            snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *)pubkey);
-            event.created_at = (time_t)sqlite3_column_int64(stmt, 2);
-            event.kind = sqlite3_column_int(stmt, 3);
-            event.tags_json = (char *)sqlite3_column_text(stmt, 4);
-            event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
-            event.content = (char *)sqlite3_column_text(stmt, 5);
-            event.content_len = event.content ? strlen(event.content) : 0;
-            snprintf(event.sig, sizeof(event.sig), "%s", (const char *)sig);
-            if (event_matches_scope(&event, scope) && (!predicate || predicate(&event, userdata))) {
-                ids[ids_count] = malloc(strlen(event.id) + 1);
-                pubkeys[ids_count] = malloc(strlen(event.pubkey) + 1);
-                if (!ids[ids_count] || !pubkeys[ids_count]) { ok = false; break; }
-                strcpy(ids[ids_count], event.id);
-                strcpy(pubkeys[ids_count], event.pubkey);
-                ids_count++;
-            }
-            snprintf(last_id, sizeof(last_id), "%s", event.id);
-            scanned++;
-        }
-        if (ok && scanned == page_limit) {
-            rc = sqlite3_step(stmt);
-            if (rc == SQLITE_ROW) *more = true;
-            else if (rc != SQLITE_DONE) ok = false;
-        } else if (ok && rc != SQLITE_DONE) {
-            ok = false;
-        }
-        sqlite3_finalize(stmt);
-        if (ok) {
-            for (size_t i = 0; i < ids_count; i++) {
-                storage_delete_result_t result = delete_record_by_id_and_pubkey(ids[i], pubkeys[i]);
-                if (result.result != STORAGE_OK) ok = false;
-                else deleted += (size_t)result.deleted_count;
-                free(ids[i]);
-                free(pubkeys[i]);
-            }
-            for (size_t i = ids_count; i < STORAGE_SCAN_BATCH; i++) {
-                free(ids[i]);
-                free(pubkeys[i]);
-            }
-        } else {
-            for (size_t i = 0; i < STORAGE_SCAN_BATCH; i++) {
-                free(ids[i]);
-                free(pubkeys[i]);
-            }
-        }
-        if (next_id && next_id_size) snprintf(next_id, next_id_size, "%s", last_id);
-    }
-    if (deleted_out) *deleted_out = deleted;
-    return ok;
-}
-
-/* ============================================================================
- * Event Query and Streaming
- * ============================================================================ */
-
-/* conditions_append - strcat with overflow guard for the fixed WHERE buffer */
-static bool conditions_append(char *conditions, size_t size, const char *text) {
-    if (strlen(conditions) + strlen(text) + 1 > size) return false;
-    strcat(conditions, text);
-    return true;
-}
-
-/* append_tag_like_condition - Add one exact tag-element match to a WHERE
- *
- * Emits "tags LIKE ? ESCAPE '\'" once per JSON spacing variant so that an
- * exact ["name","value"] element inside the stored tags JSON is matched
- * whether the publishing client sent compact or spaced JSON. The name and
- * value are LIKE-escaped; both bind parameters are heap-owned
- * (PARAM_TYPE_OWNED_STRING) and are released by params_release(). Returns
- * false when the conditions buffer or the parameter table would overflow,
- * in which case the caller fails the whole query.
- */
-static bool append_tag_like_condition(char *conditions, size_t conditions_size,
-                                      param_t *params, size_t *param_count,
-                                      const char *name, const char *value) {
-    static const char *const formats[] = {
-        "%%[\"%s\",\"%s\"]%%",   /* compact:  ...%["p","<hex>"]%...  */
-        "%%[\"%s\", \"%s\"]%%",  /* spaced:   ...%["p", "<hex>"]%... */
-    };
-    char *name_escaped = escape_like(name, strlen(name));
-    char *value_escaped = escape_like(value, strlen(value));
-    bool ok = name_escaped != NULL && value_escaped != NULL;
-
-    for (size_t i = 0; ok && i < sizeof(formats) / sizeof(formats[0]); i++) {
-        size_t length = strlen(formats[i]) + strlen(name_escaped) +
-                        strlen(value_escaped) + 2;
-        char *pattern = (char *) malloc(length);
-        if (!pattern) { ok = false; break; }
-        snprintf(pattern, length, formats[i], name_escaped, value_escaped);
-        if (i > 0 && !conditions_append(conditions, conditions_size, " OR ")) {
-            free(pattern);
-            ok = false;
-            break;
-        }
-        if (*param_count >= 256 ||
-            strlen(conditions) + 32 >= conditions_size) {
-            free(pattern);
-            ok = false;
-            break;
-        }
-        if (!conditions_append(conditions, conditions_size,
-                               "tags LIKE ? ESCAPE '\\'")) {
-            free(pattern);
-            ok = false;
-            break;
-        }
-        params[*param_count].type = PARAM_TYPE_OWNED_STRING;
-        params[*param_count].value.string = malloc(strlen(pattern) + 1);
-        if (!params[*param_count].value.string) {
-            free(pattern);
-            ok = false;
-            break;
-        }
-        strcpy(params[*param_count].value.string, pattern);
-        (*param_count)++;
-        free(pattern);
-    }
-
-    free(name_escaped);
-    free(value_escaped);
-    return ok;
-}
-
-/* send_records - Query database and stream matching events (NIP-01, NIP-67)
- * 
- * Primary query interface. Searches for events matching filter criteria and
- * calls sender() callback for each result. Also supports COUNT queries.
- * 
- * Algorithm:
- *   1. For each filter (OR'd together):
- *      a. Build WHERE clause from filter criteria (AND'd)
- *      b. Bind parameters for ids, authors, kinds, since, until, search
- *      c. Execute query with ORDER BY created_at DESC
- *      d. Fetch results and send via callback
- *      e. Track if more events exist beyond limit (NIP-67)
- *   2. If do_count, aggregate counts and send COUNT response
- *   3. Skip expired events before sending
- * 
- * Args:
- *   sender - callback called for each event result
- *   sub - subscription ID (included in response)
- *   filters - array of filter structures
- *   filters_count - number of filters
- *   do_count - if true, count events instead of streaming
- *   has_more - if not NULL, set to true if more events exist
- * 
- * Returns: true on success, false on database error
- * 
- * Features:
- *   - Fetches limit+1 events to determine has_more (NIP-67)
- *   - Filters can contain:
- *     - ids: event IDs (full or prefix match)
- *     - authors: pubkeys (full or prefix match)
- *     - kinds: event kinds
- *     - since: minimum created_at
- *     - until: maximum created_at
- *     - search: full-text search in content (LIKE with escaping)
- *   - Skips expired events
- *   - Generates JSON responses: ["EVENT", sub, event] or ["COUNT", sub, {count}]
- * 
- * Thread safety: NOT thread-safe; requires external synchronization
- * 
- * LIMITATIONS:
- *   - conditions buffer: 2048 bytes (limits very large filters)
- *   - sql buffer: 4096 bytes (limits very large queries)
- *   - param array: 256 parameters (limits filter complexity)
- *   TODO: Replace fixed buffers with dynamic allocation for arbitrary filter sizes
- */
-static bool send_records(send_records_callback_t sender, const char *sub,
-                         const filter_t *filters, size_t filters_count,
-                         bool do_count, bool *has_more, int *out_count,
-                         const storage_tag_match_t *indexed_tags,
-                         size_t indexed_tags_count,
-                         void *userdata) {
-    if (!db_conn || !sender) return false;
-    if (has_more) *has_more = false;
-    if (do_count && out_count) *out_count = 0;
-    
-    /* Validate input sizes to prevent buffer overflows */
-    if (filters_count > 256) {
-        log_storage_warn("SEND_RECORDS", "too many filters (%zu > 256)", filters_count);
-        return false;
-    }
-    
-    /* Complexity guard: bound the total query cost of a single REQ/COUNT.
-     * Each filter compiles to one SQL statement whose cost scales with its
-     * author/id/tag list length; thousands of authors across many filters
-     * would otherwise let one client monopolize the storage thread. The
-     * per-filter caps (256) still apply; this caps the aggregate. */
-    size_t total_authors = 0;
-    for (size_t f = 0; f < filters_count; f++) {
-        total_authors += filters[f].authors_count;
-    }
-    if (total_authors > 1024) {
-        log_storage_warn("SEND_RECORDS", "REQ too complex (%zu total authors across %zu filters)",
-                total_authors, filters_count);
-        return false;
-    }
-    
-    int total_count = 0;
-    
-    for (size_t f = 0; f < filters_count; f++) {
-        const filter_t *filter = &filters[f];
-        
-        /* Validate filter array sizes to prevent buffer overflows */
-        if (filter->ids_count > 256 || filter->authors_count > 256 || 
-            filter->kinds_count > 256 || filter->tags_count > 256) {
-            log_storage_warn("SEND_RECORDS", "filter arrays too large");
-            return false;
-        }
-        
-        /* Build SQL query */
-        char sql[4096] = "";
-        if (do_count) {
-            strcpy(sql, "SELECT COUNT(id) FROM event");
-        } else {
-            strcpy(sql, "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event");
-        }
-        
-        int limit = 500;
-        if (filter->limit > 0 && filter->limit < limit) {
-            limit = filter->limit;
-        }
-        
-        param_t params[256];
-        size_t param_count = 0;
-        char conditions[2048] = "";
-
-        /* Build WHERE clause. Every write to `conditions` and `params` below
-         * is bounds-checked: the per-field caps (<=256 each) multiply across
-         * fields and both buffers are shared, so each append must fail
-         * safely instead of assuming the caps guarantee enough room. */
-        bool first = true;
-
-        if (filter->ids_count > 0) {
-            bool ids_ok = true;
-            if (!first) ids_ok = conditions_append(conditions, sizeof(conditions), " AND ");
-            first = false;
-
-            if (filter->ids_count == 1) {
-                if (!conditions_append(conditions, sizeof(conditions), "id = ?")) ids_ok = false;
-                if (param_count >= 256) ids_ok = false;
-                if (ids_ok) {
-                    params[param_count].type = PARAM_TYPE_STRING;
-                    params[param_count].value.string = filter->ids[0];
-                    param_count++;
-                }
-            } else {
-                if (!conditions_append(conditions, sizeof(conditions), "id IN (")) ids_ok = false;
-                for (size_t i = 0; ids_ok && i < filter->ids_count; i++) {
-                    if (!conditions_append(conditions, sizeof(conditions),
-                                           i < filter->ids_count - 1 ? "?," : "?")) {
-                        ids_ok = false;
-                        break;
-                    }
-                    if (param_count >= 256) { ids_ok = false; break; }
-                    params[param_count].type = PARAM_TYPE_STRING;
-                    params[param_count].value.string = filter->ids[i];
-                    param_count++;
-                }
-                if (ids_ok &&
-                    !conditions_append(conditions, sizeof(conditions), ")")) ids_ok = false;
-            }
-            if (!ids_ok) {
-                log_storage_warn("SEND_RECORDS", "ids filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-        }
-
-        if (filter->authors_count > 0) {
-            bool authors_ok = true;
-            if (!first) authors_ok = conditions_append(conditions, sizeof(conditions), " AND ");
-            first = false;
-
-            /* The caller supplies author values; the generic tag index
-             * contributes additional event IDs when a NIP module has inserted
-             * policy-specific tag criteria into this filter adapter. */
-            if (!authors_ok ||
-                !conditions_append(conditions, sizeof(conditions), "(pubkey IN (")) authors_ok = false;
-            for (size_t i = 0; authors_ok && i < filter->authors_count; i++) {
-                if (!conditions_append(conditions, sizeof(conditions),
-                                       i < filter->authors_count - 1 ? "?," : "?")) {
-                    authors_ok = false;
-                    break;
-                }
-                if (param_count >= 256) { authors_ok = false; break; }
-                params[param_count].type = PARAM_TYPE_STRING;
-                params[param_count].value.string = filter->authors[i];
-                param_count++;
-            }
-            bool delegated_group_open = false;
-            for (size_t i = 0; authors_ok && i < indexed_tags_count; i++) {
-                if (indexed_tags[i].filter_index != f) continue;
-                if (!delegated_group_open) {
-                    if (!conditions_append(conditions, sizeof(conditions), ") OR (")) {
-                        authors_ok = false;
-                        break;
-                    }
-                    delegated_group_open = true;
-                } else if (!conditions_append(conditions, sizeof(conditions), " OR ")) {
-                    authors_ok = false;
-                    break;
-                }
-                if (!conditions_append(conditions, sizeof(conditions),
-                                       "id IN (SELECT event_id FROM event_tag_index WHERE tag_name = ? AND tag_value = ?)")) {
-                    authors_ok = false;
-                    break;
-                }
-                if (param_count + 2 > 256) { authors_ok = false; break; }
-                params[param_count].type = PARAM_TYPE_STRING;
-                params[param_count++].value.string = (char *)indexed_tags[i].tag_name;
-                params[param_count].type = PARAM_TYPE_STRING;
-                params[param_count++].value.string = (char *)indexed_tags[i].tag_value;
-            }
-            if (authors_ok && delegated_group_open &&
-                !conditions_append(conditions, sizeof(conditions), ")")) authors_ok = false;
-            if (authors_ok && !conditions_append(conditions, sizeof(conditions), ")")) authors_ok = false;
-            if (!authors_ok) {
-                log_storage_warn("SEND_RECORDS", "authors filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-        }
-        
-        if (filter->kinds_count > 0) {
-            bool kinds_ok = true;
-            if (!first) kinds_ok = conditions_append(conditions, sizeof(conditions), " AND ");
-            first = false;
-
-            if (filter->kinds_count == 1) {
-                if (!conditions_append(conditions, sizeof(conditions), "kind = ?")) kinds_ok = false;
-                if (param_count >= 256) kinds_ok = false;
-                if (kinds_ok) {
-                    params[param_count].type = PARAM_TYPE_NUMBER;
-                    params[param_count].value.number = filter->kinds[0];
-                    param_count++;
-                }
-            } else {
-                if (!conditions_append(conditions, sizeof(conditions), "kind IN (")) kinds_ok = false;
-                for (size_t i = 0; kinds_ok && i < filter->kinds_count; i++) {
-                    if (!conditions_append(conditions, sizeof(conditions),
-                                           i < filter->kinds_count - 1 ? "?," : "?")) {
-                        kinds_ok = false;
-                        break;
-                    }
-                    if (param_count >= 256) { kinds_ok = false; break; }
-                    params[param_count].type = PARAM_TYPE_NUMBER;
-                    params[param_count].value.number = filter->kinds[i];
-                    param_count++;
-                }
-                if (kinds_ok &&
-                    !conditions_append(conditions, sizeof(conditions), ")")) kinds_ok = false;
-            }
-            if (!kinds_ok) {
-                log_storage_warn("SEND_RECORDS", "kinds filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-        }
-        
-        if (filter->since > 0) {
-            char since_str[32];
-            snprintf(since_str, sizeof(since_str), "created_at >= %lld",
-                     (long long) filter->since);
-            if ((!first && !conditions_append(conditions, sizeof(conditions), " AND ")) ||
-                !conditions_append(conditions, sizeof(conditions), since_str)) {
-                log_storage_warn("SEND_RECORDS", "since filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-            first = false;
-        }
-        
-        if (filter->until > 0) {
-            char until_str[32];
-            snprintf(until_str, sizeof(until_str), "created_at <= %lld",
-                     (long long) filter->until);
-            if ((!first && !conditions_append(conditions, sizeof(conditions), " AND ")) ||
-                !conditions_append(conditions, sizeof(conditions), until_str)) {
-                log_storage_warn("SEND_RECORDS", "until filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-            first = false;
-        }
-        
-        if (filter->tags_count > 0) {
-            bool tags_ok = true;
-            if (!first && !conditions_append(conditions, sizeof(conditions), " AND ")) tags_ok = false;
-            first = false;
-            
-            if (!conditions_append(conditions, sizeof(conditions), "(")) tags_ok = false;
-            for (size_t t = 0; tags_ok && t < filter->tags_count; t++) {
-                const tag_t *tag = &filter->tags[t];
-                if (t > 0 && !conditions_append(conditions, sizeof(conditions), " AND ")) { tags_ok = false; break; }
-                if (!conditions_append(conditions, sizeof(conditions), "(")) { tags_ok = false; break; }
-                for (size_t v = 1; v < tag->count; v++) {
-                    if (v > 1 && !conditions_append(conditions, sizeof(conditions), " OR ")) { tags_ok = false; break; }
-                    if (!append_tag_like_condition(conditions, sizeof(conditions),
-                                                   params, &param_count,
-                                                   tag->elements[0], tag->elements[v])) {
-                        tags_ok = false;
-                        break;
-                    }
-                }
-                if (tags_ok && !conditions_append(conditions, sizeof(conditions), ")")) tags_ok = false;
-            }
-            if (tags_ok) {
-                if (!conditions_append(conditions, sizeof(conditions), ")")) tags_ok = false;
-            }
-            if (!tags_ok) {
-                log_storage_warn("SEND_RECORDS", "tag filter conditions too large");
-                params_release(params, param_count);
-                return false;
-            }
-        }
-        
-        if (filter->search && strlen(filter->search) > 0) {
-            if (param_count >= 256) {
-                log_storage_warn("SEND_RECORDS", "too many query parameters for search filter");
-                params_release(params, param_count);
-                return false;
-            }
-            if (!first && !conditions_append(conditions, sizeof(conditions), " AND ")) {
-                log_storage_warn("SEND_RECORDS", "search filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-            if (!conditions_append(conditions, sizeof(conditions),
-                                   "content LIKE ? ESCAPE '\\'")) {
-                log_storage_warn("SEND_RECORDS", "search filter too large for query buffers");
-                params_release(params, param_count);
-                return false;
-            }
-            first = false;
-
-            params[param_count].type = PARAM_TYPE_OWNED_STRING;
-            char *escaped = escape_like(filter->search, strlen(filter->search));
-            char pattern[512];
-            snprintf(pattern, sizeof(pattern), "%%%s%%", escaped ? escaped : filter->search);
-            params[param_count].value.string = malloc(strlen(pattern) + 1);
-            if (!params[param_count].value.string) {
-                if (escaped) free(escaped);
-                params_release(params, param_count);
-                return false;
-            }
-            strcpy(params[param_count].value.string, pattern);
-            if (escaped) free(escaped);
-            param_count++;
-        }
-        
-        if (strlen(conditions) > 0) {
-            if (snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql),
-                         " WHERE %s", conditions) >= (int) sizeof(sql)) {
-                log_storage_warn("SEND_RECORDS", "query too large for SQL buffer");
-                params_release(params, param_count);
-                return false;
-            }
-        }
-        
-        if (!do_count) {
-            if (param_count >= 256) {
-                log_storage_warn("SEND_RECORDS", "too many query parameters");
-                params_release(params, param_count);
-                return false;
-            }
-            if (snprintf(sql + strlen(sql), sizeof(sql) - strlen(sql),
-                         " ORDER BY created_at DESC LIMIT ?") >= (int) sizeof(sql)) {
-                log_storage_warn("SEND_RECORDS", "query too large for SQL buffer");
-                params_release(params, param_count);
-                return false;
-            }
-            params[param_count].type = PARAM_TYPE_NUMBER;
-            params[param_count].value.number = limit + 1;  /* Fetch one extra */
-            param_count++;
-        }
-        
-        /* Execute query */
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-            log_storage_error("SEND_RECORDS", "SQL error: %s", sqlite3_errmsg(db_conn));
-            params_release(params, param_count);
-            return false;
-        }
-        
-        /* Bind parameters */
-        for (size_t i = 0; i < param_count; i++) {
-            if (params[i].type == PARAM_TYPE_NUMBER) {
-                sqlite3_bind_int(stmt, i + 1, params[i].value.number);
-            } else {
-                sqlite3_bind_text(stmt, i + 1, params[i].value.string, -1, SQLITE_TRANSIENT);
-            }
-        }
-        /* Bind copies the text (SQLITE_TRANSIENT), so owned patterns can be
-         * released immediately after binding. */
-        params_release(params, param_count);
-        
-        if (do_count) {
-            if (sqlite3_step(stmt) == SQLITE_ROW) total_count += sqlite3_column_int(stmt, 0);
-            sqlite3_finalize(stmt);
-        } else {
-            int fetched = 0;
-            
-            while (sqlite3_step(stmt) == SQLITE_ROW) {
-                fetched++;
-                
-                if (fetched > limit) {
-                    if (has_more) *has_more = true;
-                    break;
-                }
-                
-                event_t event = {0};
-                json_builder_t builder;
-                const char *col_id = (const char *)sqlite3_column_text(stmt, 0);
-                const char *col_pubkey = (const char *)sqlite3_column_text(stmt, 1);
-                const char *col_sig = (const char *)sqlite3_column_text(stmt, 6);
-                /* Skip corrupt rows instead of dereferencing NULL text. */
-                if (col_id == NULL || col_pubkey == NULL || col_sig == NULL) {
-                    continue;
-                }
-                snprintf(event.id, sizeof(event.id), "%s", col_id);
-                snprintf(event.pubkey, sizeof(event.pubkey), "%s", col_pubkey);
-                event.created_at = (time_t) sqlite3_column_int64(stmt, 2);
-                event.kind = sqlite3_column_int(stmt, 3);
-                event.tags_json = (char *) sqlite3_column_text(stmt, 4);
-                event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
-                event.content = (char *) sqlite3_column_text(stmt, 5);
-                event.content_len = event.content ? strlen(event.content) : 0;
-                snprintf(event.sig, sizeof(event.sig), "%s", col_sig);
-                json_builder_start(&builder);
-                json_builder_append_string(&builder, "EVENT");
-                json_builder_append_string(&builder, sub);
-                json_serialize_event(&event, &builder);
-                sender(json_builder_finish(&builder), userdata);
-            }
-            
-            sqlite3_finalize(stmt);
-        }
-    }
-    
-    if (do_count) {
-        /* NIP-45: report the aggregated count to the caller, which builds
-         * the ["COUNT", sub, {"count": N}] response via nip45. */
-        if (out_count) *out_count = total_count;
-    }
-    
-    return true;
-}
+/* Legacy delete_matching/event_matches_scope/conditions_append/tags-LIKE
+ * path deleted. Bounded deletes go through storage_delete_events (same
+ * WHERE builder as find); tag predicates live in NIP code with
+ * event_tag_has_value(), not in storage callbacks. */
 
 /* ============================================================================
  * New Unified Storage API (per NOSTR_EVENT_STORAGE_SPEC.md)
@@ -2067,37 +1377,83 @@ bool storage_find_ids_by_tags(const char *const *tag_names,
     if (!db_conn || !tag_names || !tag_values || tag_count == 0 || !ids_out || !count_out) {
         return false;
     }
-    
-    /* Build query: find events that have ALL specified tag name/value pairs */
-    char sql[2048];
-    snprintf(sql, sizeof(sql),
-             "SELECT event_id FROM event_tag_index WHERE (tag_name = ? AND tag_value = ?)");
-    
-    for (size_t i = 1; i < tag_count; i++) {
-        char clause[256];
-        snprintf(clause, sizeof(clause),
-                 " AND event_id IN (SELECT event_id FROM event_tag_index WHERE tag_name = ? AND tag_value = ?)");
-        if (strlen(sql) + strlen(clause) + 1 >= sizeof(sql)) return false;
-        strcat(sql, clause);
+
+    /* Group by distinct tag name: AND across names, OR (IN) within values
+     * of the same name. The old query ANDed every pair, so a multi-value
+     * filter for one name could never match. */
+    const char *distinct[64];
+    size_t distinct_count = 0;
+    for (size_t i = 0; i < tag_count && distinct_count < 64; i++) {
+        if (!tag_names[i]) return false;
+        bool seen = false;
+        for (size_t s = 0; s < distinct_count; s++) {
+            if (strcmp(distinct[s], tag_names[i]) == 0) { seen = true; break; }
+        }
+        if (!seen) distinct[distinct_count++] = tag_names[i];
     }
-    
+    if (distinct_count == 0) return false;
+
+    char sql[4096];
+    sql[0] = '\0';
+    int bind_index = 1;
+    /* Bind order must follow SQL construction: for each distinct name,
+     * name first, then its values. Collect binds in order. */
+    const char *bind_names[256];
+    const char *bind_values[256];
+    size_t nbind = 0;
+    for (size_t d = 0; d < distinct_count; d++) {
+        size_t nvalues = 0;
+        for (size_t i = 0; i < tag_count; i++) {
+            if (strcmp(tag_names[i], distinct[d]) == 0) nvalues++;
+        }
+        char clause[1024];
+        if (d == 0) {
+            snprintf(clause, sizeof(clause),
+                     "SELECT event_id FROM event_tag_index WHERE tag_name = ? AND tag_value IN (");
+        } else {
+            snprintf(clause, sizeof(clause),
+                     " AND event_id IN (SELECT event_id FROM event_tag_index WHERE tag_name = ? AND tag_value IN (");
+        }
+        for (size_t k = 0; k < nvalues; k++) {
+            if (k > 0) strcat(clause, ",");
+            strcat(clause, "?");
+        }
+        strcat(clause, ")");
+        if (d > 0) strcat(clause, ")");
+        if (strlen(sql) + strlen(clause) + 16 >= sizeof(sql)) return false;
+        strcat(sql, clause);
+        bind_names[nbind] = distinct[d];
+        bind_values[nbind] = NULL;
+        nbind++;
+        for (size_t i = 0; i < tag_count; i++) {
+            if (strcmp(tag_names[i], distinct[d]) == 0) {
+                bind_names[nbind] = NULL;
+                bind_values[nbind] = tag_values[i];
+                nbind++;
+            }
+        }
+    }
+    if (strlen(sql) + 16 >= sizeof(sql)) return false;
     strcat(sql, " ORDER BY event_id");
-    
+
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
         log_storage_error("STORAGE", "SQL error: %s", sqlite3_errmsg(db_conn));
         return false;
     }
-    
-    /* Bind parameters: 2 per tag (name, value) */
-    for (size_t i = 0; i < tag_count; i++) {
-        sqlite3_bind_text(stmt, i * 2 + 1, tag_names[i], -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, i * 2 + 2, tag_values[i], -1, SQLITE_TRANSIENT);
+
+    for (size_t b = 0; b < nbind; b++) {
+        const char *v = bind_names[b] ? bind_names[b] : bind_values[b];
+        sqlite3_bind_text(stmt, (int)(bind_index++), v, -1, SQLITE_TRANSIENT);
     }
     
-    char **ids = NULL;
+    char **ids = (char **)malloc(16 * sizeof(char *));
     size_t count = 0;
     size_t capacity = 16;
+    if (!ids) {
+        sqlite3_finalize(stmt);
+        return false;
+    }
     
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         const char *id = (const char *)sqlite3_column_text(stmt, 0);
@@ -2296,7 +1652,10 @@ static void storage_deinit_sqlite3(void) {
  *   - get_event_by_id: retrieve single event
  *   - insert_record: store new event
  *   - delete_*: remove events (various criteria)
- *   - send_records: query and stream events
+ *   - find_events, count_events, delete_events: unified query API
+ *   - transaction_*: transaction management
+ *   - upsert_replaceable, upsert_addressable: atomic upserts
+ *   - find_ids_by_tags, free_id_list: compound tag index lookup
  */
 void storage_context_init_sqlite3(storage_context_t *ctx) {
     if (!ctx) return;
@@ -2307,8 +1666,18 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->insert_record = insert_record;
     ctx->delete_record_by_id_and_pubkey = delete_record_by_id_and_pubkey;
     ctx->delete_record_by_kind_and_pubkey = delete_record_by_kind_and_pubkey;
-    ctx->delete_matching = delete_matching_sqlite3;
-    ctx->find_ids_by_tag = find_ids_by_tag_sqlite3;
-    ctx->free_id_list = free_id_list_sqlite3;
-    ctx->send_records = send_records;
+    /* Legacy delete_matching/find_ids_by_tag removed: unified find/delete API only. */
+    /* New unified storage API */
+    ctx->find_events = storage_find_events;
+    ctx->count_events = storage_count_events;
+    ctx->delete_events = storage_delete_events;
+    ctx->transaction_begin = storage_transaction_begin;
+    ctx->transaction_commit = storage_transaction_commit;
+    ctx->transaction_rollback = storage_transaction_rollback;
+    ctx->delete_events_tx = storage_delete_events_tx;
+    ctx->find_events_tx = storage_find_events_tx;
+    ctx->upsert_replaceable = storage_upsert_replaceable;
+    ctx->upsert_addressable = storage_upsert_addressable;
+    ctx->find_ids_by_tags = storage_find_ids_by_tags;
+    ctx->free_id_list = storage_free_id_list;
 }

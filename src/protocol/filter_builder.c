@@ -23,26 +23,101 @@ filter_builder_t *filter_builder_new(void) {
 
 void filter_builder_free(filter_builder_t *b) {
     if (!b) return;
-    free(b->filter);
+    /* Build detaches ownership, so only free the struct here.
+     * Filters still owned by the builder (never built) are released. */
+    if (b->filter) {
+        filter_release(b->filter);
+        free(b->filter);
+    }
     free(b);
 }
 
-static bool grow_array(void ***arr, size_t *count, size_t *capacity, size_t elem_size) {
-    if (*count >= *capacity) {
-        size_t new_cap = *capacity ? *capacity * 2 : 8;
-        void *new_arr = realloc(*arr, new_cap * elem_size);
-        if (!new_arr) return false;
-        *arr = new_arr;
-        *capacity = new_cap;
+/* filter_t has no capacity fields, so grow by one element per append.
+ * Returns false on allocation failure. */
+static bool append_string_copy(char ***arr, size_t *count, const char *s) {
+    char **grown;
+    char *copy;
+    if (!arr || !count || !s) return false;
+    copy = strdup(s);
+    if (!copy) return false;
+    grown = (char **)realloc(*arr, (*count + 1) * sizeof(char *));
+    if (!grown) {
+        free(copy);
+        return false;
     }
+    *arr = grown;
+    (*arr)[*count] = copy;
+    (*count)++;
     return true;
+}
+
+static bool append_kind_copy(int **arr, size_t *count, int kind) {
+    int *grown;
+    if (!arr || !count) return false;
+    grown = (int *)realloc(*arr, (*count + 1) * sizeof(int));
+    if (!grown) return false;
+    *arr = grown;
+    (*arr)[*count] = kind;
+    (*count)++;
+    return true;
+}
+
+static bool append_tag_copy(tag_t **arr, size_t *count, const tag_t *tag) {
+    tag_t *grown;
+    if (!arr || !count || !tag) return false;
+    grown = (tag_t *)realloc(*arr, (*count + 1) * sizeof(tag_t));
+    if (!grown) return false;
+    *arr = grown;
+    (*arr)[*count] = *tag;
+    (*count)++;
+    return true;
+}
+
+/* Allocate a tag with room for (1 + nvalues) elements, capped. */
+static tag_t *make_tag(const char *name, const char **values, size_t count) {
+    tag_t *tag;
+    size_t n;
+    if (!name || !values || count == 0) return NULL;
+    n = count + 1;
+    if (n > MAX_TAG_ELEMENTS) n = MAX_TAG_ELEMENTS;
+    tag = (tag_t *)calloc(1, sizeof(tag_t));
+    if (!tag) return NULL;
+    tag->elements = (char **)calloc(n, sizeof(char *));
+    if (!tag->elements) {
+        free(tag);
+        return NULL;
+    }
+    tag->capacity = n;
+    tag->elements[tag->count++] = strdup(name);
+    if (!tag->elements[0]) {
+        free(tag->elements);
+        free(tag);
+        return NULL;
+    }
+    for (size_t i = 0; i < count && tag->count < n; i++) {
+        tag->elements[tag->count] = strdup(values[i]);
+        if (!tag->elements[tag->count]) {
+            for (size_t k = 0; k < tag->count; k++) free(tag->elements[k]);
+            free(tag->elements);
+            free(tag);
+            return NULL;
+        }
+        tag->count++;
+    }
+    if (tag->count < 2) {
+        for (size_t k = 0; k < tag->count; k++) free(tag->elements[k]);
+        free(tag->elements);
+        free(tag);
+        return NULL;
+    }
+    return tag;
 }
 
 filter_builder_t *filter_builder_ids(filter_builder_t *b, const char **ids, size_t count) {
     if (!b || !ids || count == 0) return b;
     for (size_t i = 0; i < count; i++) {
-        if (!grow_array((void ***)&b->filter->ids, &b->filter->ids_count, (size_t *)&b->filter->ids_count, sizeof(char *))) return b;
-        b->filter->ids[b->filter->ids_count++] = strdup(ids[i]);
+        if (!ids[i]) continue;
+        if (!append_string_copy(&b->filter->ids, &b->filter->ids_count, ids[i])) return b;
     }
     return b;
 }
@@ -50,8 +125,7 @@ filter_builder_t *filter_builder_ids(filter_builder_t *b, const char **ids, size
 filter_builder_t *filter_builder_kinds(filter_builder_t *b, const int *kinds, size_t count) {
     if (!b || !kinds || count == 0) return b;
     for (size_t i = 0; i < count; i++) {
-        if (!grow_array((void ***)&b->filter->kinds, &b->filter->kinds_count, (size_t *)&b->filter->kinds_count, sizeof(int))) return b;
-        b->filter->kinds[b->filter->kinds_count++] = kinds[i];
+        if (!append_kind_copy(&b->filter->kinds, &b->filter->kinds_count, kinds[i])) return b;
     }
     return b;
 }
@@ -59,72 +133,62 @@ filter_builder_t *filter_builder_kinds(filter_builder_t *b, const int *kinds, si
 filter_builder_t *filter_builder_authors(filter_builder_t *b, const char **pubkeys, size_t count) {
     if (!b || !pubkeys || count == 0) return b;
     for (size_t i = 0; i < count; i++) {
-        if (!grow_array((void ***)&b->filter->authors, &b->filter->authors_count, (size_t *)&b->filter->authors_count, sizeof(char *))) return b;
-        b->filter->authors[b->filter->authors_count++] = strdup(pubkeys[i]);
+        if (!pubkeys[i]) continue;
+        if (!append_string_copy(&b->filter->authors, &b->filter->authors_count, pubkeys[i])) return b;
     }
     return b;
 }
 
 filter_builder_t *filter_builder_d_tags(filter_builder_t *b, const char **values, size_t count) {
+    tag_t *tag;
     if (!b || !values || count == 0) return b;
-    tag_t *tag = calloc(1, sizeof(tag_t));
+    tag = make_tag("d", values, count);
     if (!tag) return b;
-    tag->elements[tag->count++] = strdup("d");
-    for (size_t i = 0; i < count; i++) {
-        if (tag->count >= MAX_TAG_ELEMENTS) break;
-        tag->elements[tag->count++] = strdup(values[i]);
-    }
-    if (tag->count >= 2) {
-        if (!grow_array((void ***)&b->filter->tags, &b->filter->tags_count, (size_t *)&b->filter->tags_count, sizeof(tag_t))) {
-            for (size_t i = 0; i < tag->count; i++) free(tag->elements[i]);
-            free(tag);
-            return b;
-        }
-        b->filter->tags[b->filter->tags_count++] = *tag;
+    if (!append_tag_copy(&b->filter->tags, &b->filter->tags_count, tag)) {
+        for (size_t i = 0; i < tag->count; i++) free(tag->elements[i]);
+        free(tag->elements);
+        free(tag);
+        return b;
     }
     free(tag);
     return b;
 }
 
 filter_builder_t *filter_builder_k_tags(filter_builder_t *b, const int *kinds, size_t count) {
+    tag_t *tag;
+    char **strs = NULL;
+    char buf[16];
     if (!b || !kinds || count == 0) return b;
-    tag_t *tag = calloc(1, sizeof(tag_t));
-    if (!tag) return b;
-    tag->elements[tag->count++] = strdup("k");
+    strs = (char **)calloc(count, sizeof(char *));
+    if (!strs) return b;
     for (size_t i = 0; i < count; i++) {
-        if (tag->count >= MAX_TAG_ELEMENTS) break;
-        char kind_str[16];
-        snprintf(kind_str, sizeof(kind_str), "%d", kinds[i]);
-        tag->elements[tag->count++] = strdup(kind_str);
+        snprintf(buf, sizeof(buf), "%d", kinds[i]);
+        strs[i] = buf;
     }
-    if (tag->count >= 2) {
-        if (!grow_array((void ***)&b->filter->tags, &b->filter->tags_count, (size_t *)&b->filter->tags_count, sizeof(tag_t))) {
-            for (size_t i = 0; i < tag->count; i++) free(tag->elements[i]);
-            free(tag);
-            return b;
-        }
-        b->filter->tags[b->filter->tags_count++] = *tag;
+    /* make_tag strdups each value, so stack buffers are safe. */
+    tag = make_tag("k", (const char **)strs, count);
+    free(strs);
+    if (!tag) return b;
+    if (!append_tag_copy(&b->filter->tags, &b->filter->tags_count, tag)) {
+        for (size_t i = 0; i < tag->count; i++) free(tag->elements[i]);
+        free(tag->elements);
+        free(tag);
+        return b;
     }
     free(tag);
     return b;
 }
 
 filter_builder_t *filter_builder_tag(filter_builder_t *b, const char *name, const char **values, size_t count) {
+    tag_t *tag;
     if (!b || !name || !values || count == 0) return b;
-    tag_t *tag = calloc(1, sizeof(tag_t));
+    tag = make_tag(name, values, count);
     if (!tag) return b;
-    tag->elements[tag->count++] = strdup(name);
-    for (size_t i = 0; i < count; i++) {
-        if (tag->count >= MAX_TAG_ELEMENTS) break;
-        tag->elements[tag->count++] = strdup(values[i]);
-    }
-    if (tag->count >= 2) {
-        if (!grow_array((void ***)&b->filter->tags, &b->filter->tags_count, (size_t *)&b->filter->tags_count, sizeof(tag_t))) {
-            for (size_t i = 0; i < tag->count; i++) free(tag->elements[i]);
-            free(tag);
-            return b;
-        }
-        b->filter->tags[b->filter->tags_count++] = *tag;
+    if (!append_tag_copy(&b->filter->tags, &b->filter->tags_count, tag)) {
+        for (size_t i = 0; i < tag->count; i++) free(tag->elements[i]);
+        free(tag->elements);
+        free(tag);
+        return b;
     }
     free(tag);
     return b;
@@ -149,7 +213,12 @@ filter_builder_t *filter_builder_limit(filter_builder_t *b, size_t limit) {
 }
 
 filter_t *filter_builder_build(filter_builder_t *b) {
-    return b ? b->filter : NULL;
+    filter_t *f;
+    if (!b) return NULL;
+    /* Detach so filter_builder_free() will not release the built filter. */
+    f = b->filter;
+    b->filter = NULL;
+    return f;
 }
 
 filter_t **filter_builder_build_multi(filter_builder_t **builders, size_t count) {
@@ -190,10 +259,10 @@ char *filter_to_json(const filter_t *f) {
             est += strlen(f->tags[i].elements[j]) + 4;
         }
     }
-    
+
     char *json = malloc(est);
     if (!json) return NULL;
-    
+
     // Simplified - in practice would need full builder
     // This is a placeholder for now
     snprintf(json, est, "{}");

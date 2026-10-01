@@ -84,48 +84,48 @@ static nip01_process_result_t nip01_kind_handler_process_event(
  * NIP-16 Replaceable Events (moved to NIP-01)
  * ============================================================================ */
 
-/* Helper: Extract indexable tags (e, p, a) from event for tag index */
+/* Helper: Extract indexable tags (e, p, a) from event for tag index.
+ * Uses event_tag_get_all so EVERY tag with a matching name is indexed,
+ * not just the first one. The old event_tag_get() version dropped values
+ * from repeated tags (e.g. two ["p", ...] tags), making stored multi-value
+ * filters unmatchable. All values (tag[1..]) of each tag are indexed so
+ * they agree with event_tag_has_value() semantics. */
+static void nip01_index_tag_name(const event_t *event, const char *name,
+                                 storage_tag_match_t *indexed_tags,
+                                 size_t *indexed_tags_count) {
+    size_t tag_count = 0;
+    char ***all = event_tag_get_all(event, name, &tag_count);
+    if (!all) return;
+    for (size_t t = 0; t < tag_count; t++) {
+        if (!all[t]) continue;
+        for (size_t i = 0; all[t][i]; i++) {
+            if (*indexed_tags_count < 64) {
+                indexed_tags[*indexed_tags_count].tag_name = (char *)name;
+                /* Own the copy: event_tag_free_all() below releases the
+                 * get_all buffers, so borrowed pointers would dangle. */
+                indexed_tags[*indexed_tags_count].tag_value = strdup(all[t][i]);
+                indexed_tags[*indexed_tags_count].filter_index = 0;
+                (*indexed_tags_count)++;
+            }
+        }
+    }
+    event_tag_free_all(all, tag_count);
+}
+
 static void nip01_extract_indexed_tags(const event_t *event,
                                        storage_tag_match_t *indexed_tags,
                                        size_t *indexed_tags_count) {
-    char **tags_e = event_tag_get(event, "e");
-    if (tags_e) {
-        for (size_t i = 0; tags_e[i]; i++) {
-            if (*indexed_tags_count < 64) {
-                indexed_tags[*indexed_tags_count].tag_name = "e";
-                indexed_tags[*indexed_tags_count].tag_value = tags_e[i];
-                indexed_tags[*indexed_tags_count].filter_index = 0;
-                (*indexed_tags_count)++;
-            }
-        }
-        event_tag_free(tags_e);
-    }
-    
-    char **tags_p = event_tag_get(event, "p");
-    if (tags_p) {
-        for (size_t i = 0; tags_p[i]; i++) {
-            if (*indexed_tags_count < 64) {
-                indexed_tags[*indexed_tags_count].tag_name = "p";
-                indexed_tags[*indexed_tags_count].tag_value = tags_p[i];
-                indexed_tags[*indexed_tags_count].filter_index = 0;
-                (*indexed_tags_count)++;
-            }
-        }
-        event_tag_free(tags_p);
-    }
-    
-    char **tags_a = event_tag_get(event, "a");
-    if (tags_a) {
-        for (size_t i = 0; tags_a[i]; i++) {
-            if (*indexed_tags_count < 64) {
-                indexed_tags[*indexed_tags_count].tag_name = "a";
-                indexed_tags[*indexed_tags_count].tag_value = tags_a[i];
-                indexed_tags[*indexed_tags_count].filter_index = 0;
-                (*indexed_tags_count)++;
-            }
-        }
-        event_tag_free(tags_a);
-    }
+    nip01_index_tag_name(event, "e", indexed_tags, indexed_tags_count);
+    nip01_index_tag_name(event, "p", indexed_tags, indexed_tags_count);
+    nip01_index_tag_name(event, "a", indexed_tags, indexed_tags_count);
+}
+
+/* Release copies made by nip01_extract_indexed_tags (call after insert). */
+static void nip01_free_indexed_tags(storage_tag_match_t *indexed_tags,
+                                    size_t indexed_tags_count) {
+    size_t i;
+    if (!indexed_tags) return;
+    for (i = 0; i < indexed_tags_count; i++) free(indexed_tags[i].tag_value);
 }
 
 static nip01_process_result_t nip01_replaceable_listener(const event_t *event, storage_context_t *storage) {
@@ -142,7 +142,8 @@ static nip01_process_result_t nip01_replaceable_listener(const event_t *event, s
     nip01_extract_indexed_tags(event, indexed_tags, &indexed_tags_count);
     
     /* Use new atomic upsert for replaceable events */
-    storage_insert_result_t insert_result = storage_upsert_replaceable(event, indexed_tags, indexed_tags_count);
+    storage_insert_result_t insert_result = storage->upsert_replaceable(event, indexed_tags, indexed_tags_count);
+    nip01_free_indexed_tags(indexed_tags, indexed_tags_count);
     
     nip01_process_result_t result = {0};
     if (insert_result.result == STORAGE_OK || insert_result.result == STORAGE_DUPLICATE) {
@@ -183,7 +184,8 @@ static nip01_process_result_t nip01_addressable_listener(const event_t *event, s
     nip01_extract_indexed_tags(event, indexed_tags, &indexed_tags_count);
     
     /* Use new atomic upsert for addressable events */
-    storage_insert_result_t insert_result = storage_upsert_addressable(event, dvalue, indexed_tags, indexed_tags_count);
+    storage_insert_result_t insert_result = storage->upsert_addressable(event, dvalue, indexed_tags, indexed_tags_count);
+    nip01_free_indexed_tags(indexed_tags, indexed_tags_count);
     free(dvalue);
     
     result.accepted = true;

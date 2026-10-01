@@ -8,6 +8,7 @@
 
 #include "nip_capability.h"
 #include "nips/nip42.h"      /* nip42_authenticated_pubkey_by_id */
+#include "nips/nip_env.h"    /* multi-pubkey session iteration */
 #include "protocol/event_tags.h"
 #include "protocol/protocol.h"
 #include <stdio.h>
@@ -58,9 +59,18 @@ static nip_capability_t nip17_caps[] = {
 };
 
 static bool nip17_delivery_policy_can_deliver(const event_t *event, uintptr_t connection_id, void *ctx) {
+    size_t n, i;
     (void)ctx;
-    const char *authenticated_pubkey = nip42_authenticated_pubkey_by_id(connection_id);
-    return nip17_is_visible_to(event, authenticated_pubkey);
+    if (!event || (event->kind != 1059 && event->kind != 21059)) return true;
+    /* NIP-42 allows multiple authenticated pubkeys per connection; any
+     * recipient match authorizes delivery (first-pubkey-only would hide
+     * gift-wraps for the other authenticated identities). */
+    n = nip_env_session_auth_count(connection_id);
+    for (i = 0; i < n; i++) {
+        const char *pk = nip_env_session_auth_at(connection_id, i);
+        if (nip17_is_visible_to(event, pk)) return true;
+    }
+    return false;
 }
 
 static bool nip17_protocol_response_needs_auth_hint(const filter_t *filters, size_t filters_count,

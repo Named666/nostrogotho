@@ -7,8 +7,11 @@
  * is handled by scoping the two ambiguous "enabled" keys to their parent
  * object's brace span; all other keys are unique file-wide.
  *
- * Unknown keys are ignored with a warning (forward compatibility).
- * Wrong-type values are hard errors naming the field.
+ * Absent keys keep compiled defaults. Wrong-type values are hard errors
+ * naming the field. Unknown keys are reported by relay_config_warn_unknown
+ * (kept separate from load: the loader runs before log verbosity is known,
+ * so warnings emitted there would be swallowed — main() calls warn after
+ * log_set_verbosity()).
  * ============================================================================ */
 
 #include "relay/config.h"
@@ -81,7 +84,7 @@ static const char *find_key(const char *begin, const char *end,
             continue;
         }
         p++; /* past opening quote */
-        if ((size_t)(end - p) >= keylen && memcmp(p, key, keylen) == 0 &&
+        if ((size_t)(end - p) >= keylen + 1 && memcmp(p, key, keylen) == 0 &&
             p[keylen] == '"') {
             const char *q = p + keylen + 1;
             skip_ws(&q, end);
@@ -106,8 +109,7 @@ static bool find_object_span(const char *begin, const char *end,
     depth = 1;
     while (p < end && depth > 0) {
         if (*p == '"') {
-            /* skip string (keys and string values can't contain braces
-             * that matter if we skip them) */
+            /* Skip strings so braces inside them don't count. */
             p++;
             while (p < end && *p != '"') {
                 if (*p == '\\' && p + 1 < end) p++;
@@ -130,12 +132,12 @@ static bool find_object_span(const char *begin, const char *end,
 }
 
 /* Parse a JSON string value at *p (past any ws). Writes to dst (NUL
- * terminated, truncated safely). Returns false on type mismatch. */
+ * terminated, truncated safely to dstsz). Returns false on type mismatch. */
 static bool parse_string(const char **p, const char *end, char *dst,
                          size_t dstsz) {
     size_t out = 0;
     skip_ws(p, end);
-    if (*p >= end || **p != '"') return false;
+    if (*p >= end || **p != '"' || dstsz == 0) return false;
     (*p)++;
     while (*p < end && **p != '"') {
         char c = **p;
@@ -163,8 +165,13 @@ static bool parse_string(const char **p, const char *end, char *dst,
 static bool parse_int(const char **p, const char *end, int *out) {
     long v;
     char *stop;
+    const char *s;
     skip_ws(p, end);
     if (*p >= end) return false;
+    /* Reject non-numeric values (strtol would skip ws and parse prefixes). */
+    s = *p;
+    if (*s == '-' || *s == '+') s++;
+    if (s >= end || *s < '0' || *s > '9') return false;
     v = strtol(*p, &stop, 10);
     if (stop == *p || v < INT_MIN || v > INT_MAX) return false;
     *p = stop;
@@ -187,12 +194,12 @@ static bool parse_bool(const char **p, const char *end, bool *out) {
     return false;
 }
 
-/* ---- field application -------------------------------------------------- */
+/* ---- field application (absent key keeps default) ----------------------- */
 
-#define FAIL(field, what)                                              \
-    do {                                                               \
-        snprintf(err, errsz, "%s: expected %s", field, what);          \
-        return false;                                                  \
+#define FAIL(field, what)                                     \
+    do {                                                      \
+        snprintf(err, errsz, "%s: expected %s", field, what); \
+        return false;                                         \
     } while (0)
 
 static bool apply_string(const char *doc, const char *end, const char *key,
@@ -225,7 +232,8 @@ static bool apply_bool(const char *doc, const char *end, const char *key,
     return true;
 }
 
-/* Known keys for the unknown-key warning pass. */
+/* ---- unknown-key reporting ---------------------------------------------- */
+
 static const char *known_keys[] = {
     "database", "port", "service_url", "verbosity",
     "max_subscriptions_per_connection", "max_filters_per_subscription",
@@ -247,16 +255,19 @@ static bool is_known_key(const char *key, size_t len) {
     return false;
 }
 
-/* Warn once per unknown "key": occurrence. Only treats quoted strings
- * followed by ':' as keys, so string values are never flagged. */
-static void warn_unknown_keys(const char *doc, const char *end) {
-    const char *p = doc;
+void relay_config_warn_unknown(const char *path) {
+    char *doc = NULL;
+    size_t len = 0;
+    const char *end, *p;
+    if (!path) return;
+    doc = read_entire_file(path, &len);
+    if (!doc) return;
+    end = doc + len;
+    p = doc;
     while (p < end) {
-        const char *start;
-        const char *q;
-        size_t len;
+        const char *start, *q;
+        size_t klen, copylen;
         char keybuf[128];
-        size_t copylen;
         if (*p != '"') {
             p++;
             continue;
@@ -267,19 +278,22 @@ static void warn_unknown_keys(const char *doc, const char *end) {
             if (*q == '\\' && q + 1 < end) q++;
             q++;
         }
-        if (q >= end) return;
-        len = (size_t)(q - start);
+        if (q >= end) break;
+        klen = (size_t)(q - start);
         p = q + 1;
         skip_ws(&p, end);
         if (p >= end || *p != ':') continue; /* a value, not a key */
         p++;
-        if (is_known_key(start, len)) continue;
-        copylen = len < sizeof(keybuf) - 1 ? len : sizeof(keybuf) - 1;
+        if (is_known_key(start, klen)) continue;
+        copylen = klen < sizeof(keybuf) - 1 ? klen : sizeof(keybuf) - 1;
         memcpy(keybuf, start, copylen);
         keybuf[copylen] = '\0';
         log_warn("MAIN", "CONFIG", "unknown config key ignored: %s", keybuf);
     }
+    free(doc);
 }
+
+/* ---- public API ---------------------------------------------------------- */
 
 bool relay_config_load(const char *path, relay_config_t *config, char *err,
                        size_t errsz) {
@@ -289,6 +303,7 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
     const char *limits_b, *limits_e, *nip42_b, *nip42_e, *hr_b, *hr_e;
     bool has_limits, has_nip42, has_hr;
     int tmp;
+    bool lower_present, upper_present;
     if (!path || !config || !err || errsz == 0) return false;
 
     doc = read_entire_file(path, &len);
@@ -298,7 +313,25 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
     }
     end = doc + len;
 
-    /* Top-level scalars (unique file-wide). */
+    /* Reject non-object documents outright: otherwise a corrupt file would
+     * silently yield compiled defaults. */
+    {
+        const char *first = doc, *last = end;
+        skip_ws(&first, end);
+        while (last > first) {
+            char c = *(last - 1);
+            if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+            last--;
+        }
+        if (first >= end || *first != '{' || last <= first ||
+            *(last - 1) != '}') {
+            snprintf(err, errsz, "not a JSON object");
+            free(doc);
+            return false;
+        }
+    }
+
+    /* Top-level scalars (unique file-wide). Absent keys keep defaults. */
     if (!apply_string(doc, end, "database", config->database_path,
                       sizeof(config->database_path), err, errsz)) goto fail;
     if (!apply_int(doc, end, "port", &config->port, err, errsz)) goto fail;
@@ -307,8 +340,12 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
     if (!apply_int(doc, end, "verbosity", &config->verbosity, err,
                    errsz)) goto fail;
 
-    /* limits.* scope. */
     has_limits = find_object_span(doc, end, "limits", &limits_b, &limits_e);
+    if (!has_limits && find_key(doc, end, "limits")) {
+        snprintf(err, errsz, "limits: expected object");
+        free(doc);
+        return false;
+    }
     if (has_limits) {
         if (!apply_int(limits_b, limits_e, "max_subscriptions_per_connection",
                        &config->max_subscriptions_per_connection, err,
@@ -330,20 +367,29 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
                        &config->max_ws_message_length, err, errsz)) goto fail;
         if (!apply_int(limits_b, limits_e, "min_pow_difficulty",
                        &config->min_pow_difficulty, err, errsz)) goto fail;
-        if (!apply_int(limits_b, limits_e, "created_at_lower_limit", &tmp,
-                       err, errsz)) goto fail;
-        else if (find_key(limits_b, limits_e, "created_at_lower_limit")) {
+        lower_present =
+            find_key(limits_b, limits_e, "created_at_lower_limit") != NULL;
+        if (lower_present) {
+            if (!apply_int(limits_b, limits_e, "created_at_lower_limit",
+                           &tmp, err, errsz)) goto fail;
             config->created_at_lower_limit = (time_t)tmp;
         }
-        if (!apply_int(limits_b, limits_e, "created_at_upper_limit", &tmp,
-                       err, errsz)) goto fail;
-        else if (find_key(limits_b, limits_e, "created_at_upper_limit")) {
+        upper_present =
+            find_key(limits_b, limits_e, "created_at_upper_limit") != NULL;
+        if (upper_present) {
+            if (!apply_int(limits_b, limits_e, "created_at_upper_limit",
+                           &tmp, err, errsz)) goto fail;
             config->created_at_upper_limit = (time_t)tmp;
         }
     }
 
     /* nip42.* scope ("enabled" disambiguated by span). */
     has_nip42 = find_object_span(doc, end, "nip42", &nip42_b, &nip42_e);
+    if (!has_nip42 && find_key(doc, end, "nip42")) {
+        snprintf(err, errsz, "nip42: expected object");
+        free(doc);
+        return false;
+    }
     if (has_nip42) {
         if (!apply_bool(nip42_b, nip42_e, "enabled", &config->nip42_enabled,
                         err, errsz)) goto fail;
@@ -354,6 +400,11 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
 
     /* hot_reload.* scope. */
     has_hr = find_object_span(doc, end, "hot_reload", &hr_b, &hr_e);
+    if (!has_hr && find_key(doc, end, "hot_reload")) {
+        snprintf(err, errsz, "hot_reload: expected object");
+        free(doc);
+        return false;
+    }
     if (has_hr) {
         if (!apply_bool(hr_b, hr_e, "enabled", &config->hot_reload_enabled,
                         err, errsz)) goto fail;
@@ -363,7 +414,6 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
                           errsz)) goto fail;
     }
 
-    warn_unknown_keys(doc, end);
     free(doc);
     return true;
 

@@ -27,7 +27,6 @@ static bool nip62_should_vanish(const event_t *event, const char *service_url) {
 /* Delete all events by pubkey up to created_at, excluding keep_kind */
 static bool nip62_delete_events(storage_context_t *storage, const char *pubkey,
                                 time_t created_at, int keep_kind) {
-    (void)storage;  /* Not needed with new API */
     storage_event_scope_t scope = {0};
     scope.pubkey = pubkey;
     scope.has_created_at_at_or_before = true;
@@ -36,7 +35,7 @@ static bool nip62_delete_events(storage_context_t *storage, const char *pubkey,
     scope.excluded_kind = keep_kind;
     
     size_t deleted = 0;
-    return storage_delete_events(&scope, &deleted);
+    return storage->delete_events(&scope, &deleted);
 }
 
 static bool nip62_kind_handler_handles_kind(int kind, void *ctx);
@@ -90,7 +89,7 @@ static nip01_process_result_t nip62_kind_handler_process_event(
         /* Delete all of the author's events except the vanish request itself
          * (kind 62). The exclusion is a NIP-62 policy decision, so it lives
          * here in the NIP — the storage layer stays generic. */
-        if (!storage->delete_matching ||
+        if (!storage->delete_events ||
             !nip62_delete_events(storage, event->pubkey, event->created_at,
                                  event->kind)) {
             nip01_process_result_t result = {0};

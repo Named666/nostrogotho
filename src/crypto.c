@@ -617,6 +617,182 @@ size_t event_hash_input_size(const event_t *ev) {
     return 128 + escaped_pubkey_max + escaped_content_max + strlen(tags_json);
 }
 
+/* ============================================================================
+ * Canonical JSON String Escaping (NIP-01 01.md:45-56 + signer parity)
+ *
+ * json_escape() above assumes its input is already proper Unicode text. But
+ * mongoose's unescaper emits U+0080..U+00FF as single Latin-1 bytes (and fails
+ * entirely above U+00FF), so a `\u00e9` escape decodes to byte E9 while the
+ * signer hashed UTF-8 C3 A9. This repair pass copies valid UTF-8 sequences
+ * verbatim and re-encodes lone high bytes (which can only come from that
+ * decoder, since raw lone bytes are invalid JSON) as U+0080..U+00FF, then
+ * escapes per json_escape(). Output bound is identical (<=6x input).
+ * NOTE: BMP escapes above U+00FF and surrogate pairs make mongoose return
+ * NULL upstream, so those never reach here — thirdparty decoder ceiling,
+ * reported separately.
+ * ============================================================================ */
+
+static size_t canonical_json_string(const char *src, char *dst,
+                                    size_t dst_size) {
+    size_t out_pos = 0;
+    const unsigned char *p;
+    if (!src || !dst || dst_size == 0) return 0;
+    p = (const unsigned char *)src;
+    while (*p && out_pos < dst_size - 1) {
+        unsigned char c = *p;
+        size_t seqlen = 0;
+        if (c < 0x80) {
+            seqlen = 0; /* ASCII: handled below */
+        } else if (c >= 0xC2 && c <= 0xDF) {
+            seqlen = 2;
+        } else if (c >= 0xE0 && c <= 0xEF) {
+            seqlen = 3;
+        } else if (c >= 0xF0 && c <= 0xF4) {
+            seqlen = 4;
+        }
+        if (seqlen > 1) {
+            size_t k;
+            for (k = 1; k < seqlen; k++) {
+                if (p[k] < 0x80 || p[k] > 0xBF) break;
+            }
+            if (k == seqlen) {
+                /* Valid UTF-8 sequence: verbatim (signer parity). */
+                if (out_pos + seqlen >= dst_size) return 0;
+                memcpy(dst + out_pos, p, seqlen);
+                out_pos += seqlen;
+                p += seqlen;
+                continue;
+            }
+            /* else: fall through, lone byte */
+        }
+        if (c >= 0x80) {
+            /* Lone high byte c: codepoint U+00XX -> 2-byte UTF-8. */
+            unsigned v = c;
+            if (out_pos + 2 >= dst_size) return 0;
+            dst[out_pos++] = (char)(0xC0u | (v >> 6));
+            dst[out_pos++] = (char)(0x80u | (v & 0x3Fu));
+            p++;
+            continue;
+        }
+        /* ASCII: NIP-01 short escapes, \uXXXX for other C0, verbatim rest. */
+        {
+            const char *escape = NULL;
+            switch (c) {
+                case '"': escape = "\\\""; break;
+                case '\\': escape = "\\\\"; break;
+                case '\b': escape = "\\b"; break;
+                case '\f': escape = "\\f"; break;
+                case '\n': escape = "\\n"; break;
+                case '\r': escape = "\\r"; break;
+                case '\t': escape = "\\t"; break;
+                default: break;
+            }
+            if (escape) {
+                if (out_pos + 2 >= dst_size) return 0;
+                dst[out_pos++] = escape[0];
+                dst[out_pos++] = escape[1];
+            } else if (c < 0x20) {
+                char buf[7];
+                int len = snprintf(buf, sizeof(buf), "\\u%04x", c);
+                if (len <= 0 || out_pos + (size_t)len >= dst_size) return 0;
+                memcpy(dst + out_pos, buf, (size_t)len);
+                out_pos += (size_t)len;
+            } else {
+                dst[out_pos++] = (char)c;
+            }
+            p++;
+        }
+    }
+    if (out_pos >= dst_size) return 0;
+    dst[out_pos] = '\0';
+    return out_pos + 1;
+}
+
+/* ============================================================================
+ * Canonical Tag Serialization (NIP-01 01.md:45-56)
+ *
+ * The event id commits to the whitespace-free serialization
+ * `[0,"<pubkey>",<created_at>,<kind>,<tags>,"<content>"]`. Hashing the raw
+ * wire bytes for <tags> rejects valid events whose tags carry insignificant
+ * whitespace (e.g. `["a", "b"]` vs signed `["a","b"]`). This rebuilds tags
+ * canonically: compact separators, each element decoded then re-escaped with
+ * json_escape() (same table signers use: NIP-01 short escapes + \uXXXX for
+ * other C0, verbatim otherwise). Canonical output never exceeds the raw
+ * length (escapes only shrink or hold), so strlen(tags_json)+1 always fits.
+ * Returns bytes written (excl NUL), or 0 on any failure (fail closed).
+ * ============================================================================ */
+
+/* Decode the i-th element of a tag sub-array. tag_iter_element() itself
+ * falls back past mongoose's decoder ceiling, so this is a thin alias kept
+ * for readability at the call site. */
+static char *tag_element_decode(tag_iter_t *sub, size_t index) {
+    return tag_iter_element(sub, index);
+}
+
+static size_t build_canonical_tags(const event_t *ev, char *dst,
+                                   size_t dstsz) {
+    tag_iter_t it;
+    struct mg_str key, tag;
+    size_t pos = 0;
+    bool first_tag = true;
+    if (!ev || !dst || dstsz < 3) return 0;
+    tag_iter_init(&it, ev); /* NULL tags_json becomes "[]" */
+    if (pos + 1 >= dstsz) return 0;
+    dst[pos++] = '[';
+    while (tag_iter_next(&it, &key, &tag)) {
+        tag_iter_t sub;
+        struct mg_str ek, elem;
+        size_t count = 0;
+        size_t i;
+        tag_iter_init_tag(&sub, tag);
+        while (tag_iter_next(&sub, &ek, &elem)) count++;
+        if (!first_tag) {
+            if (pos + 1 >= dstsz) return 0;
+            dst[pos++] = ',';
+        }
+        first_tag = false;
+        if (pos + 1 >= dstsz) return 0;
+        dst[pos++] = '[';
+        for (i = 0; i < count; i++) {
+            char *decoded = tag_element_decode(&sub, i);
+            char *esc;
+            size_t esclen;
+            if (!decoded) return 0; /* non-string element: fail closed */
+            esc = (char *)malloc(strlen(decoded) * 6 + 1);
+            if (!esc) {
+                free(decoded);
+                return 0;
+            }
+            /* Repair + escape in one pass (signer parity for \u00XX). */
+            if (!canonical_json_string(decoded, esc,
+                                       strlen(decoded) * 6 + 1)) {
+                free(decoded);
+                free(esc);
+                return 0;
+            }
+            free(decoded);
+            esclen = strlen(esc);
+            /* ','? '"' esc '"' */
+            if (pos + (i ? 1 : 0) + 1 + esclen + 1 >= dstsz) {
+                free(esc);
+                return 0;
+            }
+            if (i) dst[pos++] = ',';
+            dst[pos++] = '"';
+            memcpy(dst + pos, esc, esclen);
+            pos += esclen;
+            dst[pos++] = '"';
+            free(esc);
+        }
+        if (pos + 1 >= dstsz) return 0;
+        dst[pos++] = ']';
+    }
+    if (pos + 1 >= dstsz) return 0;
+    dst[pos++] = ']';
+    dst[pos] = '\0';
+    return pos;
+}
+
 size_t event_build_hash_input(const event_t *ev, char *buffer, size_t buffer_size) {
     if (!ev || !buffer || buffer_size == 0) return 0;
     
@@ -636,20 +812,38 @@ size_t event_build_hash_input(const event_t *ev, char *buffer, size_t buffer_siz
         free(escaped_pubkey);
         return 0;
     }
-    if (!json_escape(content, escaped_content, strlen(content) * 6 + 1)) {
+    /* Repair + escape (signer parity for \u00XX content escapes). */
+    if (!canonical_json_string(content, escaped_content,
+                               strlen(content) * 6 + 1)) {
         free(escaped_pubkey);
         free(escaped_content);
         return 0;
     }
     
-    int written = snprintf(buffer, buffer_size,
-                          "[0,\"%s\",%lld,%d,%s,\"%s\"]",
-                          escaped_pubkey, (long long)ev->created_at, ev->kind,
-                          tags_json,
-                          escaped_content);
-    
+    int written;
+    char *canon_tags;
+    /* Canonical tags per NIP-01: never hash raw wire bytes (see above). */
+    canon_tags = (char *)malloc(strlen(tags_json) + 1);
+    if (!canon_tags) {
+        free(escaped_pubkey);
+        free(escaped_content);
+        return 0;
+    }
+    if (!build_canonical_tags(ev, canon_tags, strlen(tags_json) + 1)) {
+        free(escaped_pubkey);
+        free(escaped_content);
+        free(canon_tags);
+        return 0;
+    }
+    written = snprintf(buffer, buffer_size,
+                       "[0,\"%s\",%lld,%d,%s,\"%s\"]",
+                       escaped_pubkey, (long long)ev->created_at, ev->kind,
+                       canon_tags,
+                       escaped_content);
+
     free(escaped_pubkey);
     free(escaped_content);
+    free(canon_tags);
     
     if (written < 0 || (size_t)written >= buffer_size) return 0;
     return (size_t)written;
