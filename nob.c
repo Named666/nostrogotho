@@ -10,6 +10,7 @@
  *   nob              -> auto-detect the host OS and build for it
  *   nob win|linux    -> force the requested target
  *   nob [target] -hr -> run the hot-reload supervisor
+ *   nob [target] -test -> build and run the C unit/integration suite
  * ============================================================================ */
 
 int main(int argc, char **argv)
@@ -20,6 +21,7 @@ int main(int argc, char **argv)
      * to auto-detection based on the compiler's host target. */
     int want_win = -1; /* -1 = auto */
     int hot_reload = 0;
+    int run_tests = 0;
     int separator = argc;
     int target_argc = 0;
     char **target_argv = NULL;
@@ -28,10 +30,12 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "win") == 0)        want_win = 1;
         else if (strcmp(argv[i], "linux") == 0) want_win = 0;
         else if (strcmp(argv[i], "-hr") == 0)   hot_reload = 1;
+        else if (strcmp(argv[i], "-test") == 0) run_tests = 1;
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            nob_log(INFO, "Usage: nob [win|linux] [-hr] [-- relay-args...]");
+            nob_log(INFO, "Usage: nob [win|linux] [-hr] [-test] [-- relay-args...]");
             nob_log(INFO, "  (no argument)  auto-detect host OS");
             nob_log(INFO, "  -hr            build, run, and watch reloadable module");
+            nob_log(INFO, "  -test          build and run the C test suite");
             return 0;
         } else if (argv[i][0] == '-') {
             nob_log(ERROR, "Unknown nob option: %s", argv[i]);
@@ -93,6 +97,7 @@ int main(int argc, char **argv)
     cmd.count = 0;
     cmd_append(&cmd, executable_path);
     if (hot_reload) nob_cmd_append(&cmd, "-hr");
+    if (run_tests) nob_cmd_append(&cmd, "-test");
     for (int i = 0; i < target_argc; i++) nob_cmd_append(&cmd, target_argv[i]);
     if (!cmd_run(&cmd)) return 1;
 

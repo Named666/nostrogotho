@@ -24,26 +24,21 @@ nostrogotho/
 │   ├── nostrogotho.h/c      Core data structures
 │   ├── crypto.h/c           Cryptographic ops
 │   ├── storage.h/c          SQLite3 layer
-│   ├── server.c             WebSocket server + NIP plugins
-│   └── main.c               Example main entry point
+│   ├── relay.h/c            Relay runtime + policy dispatch
+│   ├── connection_session.h/c  Connection/session abstraction
+│   ├── transport/server.h/c   Pure Mongoose transport adapter
+│   ├── protocol/            Protocol parsing/serialization
+│   ├── protocol/               Generic event/tag utilities
+│   ├── validation/          Event validation pipeline
+│   ├── subscriptions/       Subscription lifecycle + matching
+│   └── nips/                NIP capability modules (01, 09, 11, 13, 17, 26, 40, 42, 45, 62, 67)
+│       ├── nip_capability.c/h  Capability registry + composition
+│       └── nip_template.c      New-NIP scaffold (excluded from build)
 ├── thirdparty/              Bundled dependencies
 │   ├── sqlite3.c/h          SQLite3 amalgamation
 │   ├── mongoose/            WebSocket library
 │   └── secp256k1/           Schnorr signature library
-└── src/nips/                NIP protocol plugins
-    ├── nip01.c            Basic Protocol Flow
-    ├── nip09.c            Event Deletion Request
-    ├── nip11.c            Relay Information Document
-    ├── nip13.c            Proof of Work
-    ├── nip17.c            Private Direct Messages
-    ├── nip26.c            Delegated Event Signing
-    ├── nip40.c            Expiration Timestamp
-    ├── nip42.c            Client Authentication
-    ├── nip45.c            Event Counts
-    ├── nip62.c            Request to Vanish
-    ├── nip67.c            EOSE Completeness Hint
-    ├── nip_template.c        New-NIP scaffold (excluded from build)
-    └── nip_capability.c/h       Capability registry + composition
+└── tests/                   C + Node.js test suites (run with `nob -test`)
 ```
 
 ## Quick Build & Run (Windows PowerShell)
@@ -70,6 +65,58 @@ Put public relays behind a TLS-terminating reverse proxy and configure the exter
 
 See [QUICKSTART.md](QUICKSTART.md) for detailed local setup and deployment guidance.
 
+## Testing
+
+One command runs the entire regression suite (C unit/integration tests plus
+Node.js end-to-end tests), verifying every suite's exit code:
+
+```powershell
+.\nob.exe -test
+```
+
+`nob -test` builds the relay first (the JS suites spawn it themselves),
+then runs each suite and fails if **any** suite exits nonzero. Prerequisites
+are the same C compiler `nob` uses, plus Node 18+ for the JS phase
+(`tests/node_modules` is installed automatically when missing). Stop any
+dev relay on the test ports first; each suite uses fixed ports and cleans
+up its own database files.
+
+### C suites (compiled with relay-identical flags)
+
+| Suite | File | What it proves |
+|---|---|---|
+| crypto | `tests/test_crypto.c` | 83 checks: SHA-256 NIST vectors; hex conversion edge cases; event-ID canonical serialization byte-identical to OS-hashed vectors; in-test libsecp256k1 signing vs `crypto.c` verification with tamper matrix; full `check_event` incl. NIP-26 delegation; `json_escape` table; NIP-13 difficulty |
+| sha256 | `tests/test_sha256.c` | FIPS 180-4 vectors (`""`, `"abc"`, 56-byte, 1M `'a'`) through the public `sha256()` API |
+| storage | `tests/test_storage.c` | `escape_like` boundaries; `filter_free` ownership |
+| json_util | `tests/test_json_util.c` | 7 security regressions: 40-id filter intactness, ~65 KB builder boundedness, oversized-tag rejection, size prediction, hex64 enforcement, empty-filter defaults, builder number format |
+| json_fuzz | `tests/test_json_fuzz.c` | Deterministic structured fuzzing of `json_array_parse`, `json_parse_event`, `json_parse_filter` (200k mutated frames; bounds, free-safety, determinism, heap integrity). Reproduce case N: `build/test_json_fuzz 1 <seed> -v <N>` |
+| composition | `tests/test_nip_composition.c` | 47 checks of `nip_capability.c` rules with two conflicting mock policies per type |
+| hotreload | `tests/test_hotreload.c` + `tests/hr_test_policy.c` | Real module DLL build → load with ABI-symbol validation → policy check → rebuild with flipped policy while loaded → reload → new policy active; bad-ABI and missing-file refusal |
+| relay | `tests/test_relay.c` | Boot smoke test: storage init + `relay_create` + listen on `:7457` |
+
+### Node.js suites (`node tests/<script>`, helpers in `tests/relay.js`)
+
+| Suite | File | What it proves |
+|---|---|---|
+| auth | `test_auth.js` | NIP-42 AUTH challenge round trip |
+| nip13 | `test_nip13.js` | NIP-13 PoW: mined event accepted, unmined rejected (`-min-pow 8`) |
+| integration | `test_integration.js` | 15 scenarios: publish/subscribe, filters, tags, subscription/filter limits, COUNT, NIP-09 deletion, NIP-40 expiry, stored/live equivalence, invalid events, malformed messages, concurrency, duplicates, PoW, wrong-relay AUTH, kind-4 DM gating |
+| hotreload_integration | `test_hotreload_integration.js` | Linux: two live module publications preserve socket + REQ/EOSE (self-skips elsewhere) |
+| ws | `test_ws.js` | AUTH + REQ/EOSE round trip (own relay on `:7472`; `--uri` probes a running one) |
+| ws2 | `test_ws2.js` | REQ + id-filtered REQ + COUNT with response assertions (own relay on `:7473`) |
+| hotreload_ws | `test_hotreload_ws.js` | Live reload over WS: hot host up, REQ/EOSE pre-reload, module rebuilt, new `nhr_<pid>_*` generation observed, same socket REQ/EOSE post-reload |
+
+`tests/hotreload_live_smoke.js` is intentionally **not** part of `-test`: it is
+interactive (idles 20s for a manual module rebuild). Its automated counterpart
+is `test_hotreload_ws.js`. See [tests/README.md](tests/README.md) for
+contributor conventions (deterministic vectors, mock-over-reimplementation,
+fixed test ports).
+
+The suites have caught real bugs: a NIP-26 delegation-verification bypass
+(off-by-one tag index), `json_escape` silent truncation, order-dependent
+kind-handler composition, unindexed stored tag queries, and silent filter-list
+truncation -- all fixed with regression coverage above.
+
 ## Configuration
 
 | Option | Environment Variable | Default | Description |
@@ -85,53 +132,59 @@ Run `.\build\main.exe --help` for the built executable's options.
 
 ## NIP Support Status
 
-The relay implements 13 NIPs. Status as of the 2026-09-03 audit:
+The relay implements 11 NIPs via the capability interface. Status as of 2026-09-26:
 
-| NIP | Title | Status | Wired into server |
-|-----|-------|--------|-------------------|
-| 01 | Basic Protocol Flow | ✅ Complete | Yes |
-| 09 | Event Deletion Request | ✅ Complete | Yes |
-| 11 | Relay Information Document | ✅ Complete | Yes (HTTP) |
-| 13 | Proof of Work | ✅ Complete | Yes |
-| 16 | Event Treatment | ✅ Complete (→ NIP-01) | Yes |
-| 17 | Private Direct Messages | ✅ Complete | Yes |
-| 26 | Delegated Event Signing | ✅ Complete | Yes |
-| 33 | Parameterized Replaceable Events | ✅ Complete (→ NIP-01) | Yes |
-| 40 | Expiration Timestamp | ✅ Complete | Yes |
-| 42 | Client Authentication | ✅ Complete | Yes |
-| 45 | Event Counts | ✅ Complete | Yes |
-| 62 | Request to Vanish | ✅ Complete | Yes |
-| 67 | EOSE Completeness Hint | ✅ Complete | Yes |
+| NIP | Title | Capabilities | Status |
+|-----|-------|--------------|--------|
+| 01 | Basic Protocol Flow | kind_handler (replaceable/addressable) | ✅ Complete |
+| 09 | Event Deletion Request | kind_handler (kind 5 deletion) | ✅ Complete |
+| 11 | Relay Information Document | lifecycle + metadata | ✅ Complete |
+| 13 | Proof of Work | lifecycle + publication_policy (PoW) | ✅ Complete |
+| 17 | Private Direct Messages | delivery_policy + protocol_response (auth hint) | ✅ Complete |
+| 26 | Delegated Event Signing | publication_policy (delegation) | ✅ Complete |
+| 40 | Expiration Timestamp | publication_policy + delivery_policy + maintenance (expiry/GC) | ✅ Complete |
+| 42 | Client Authentication | lifecycle + connection + message_intercept + publication_policy + delivery_policy (kind-4 DM gating) + query_policy (DM early-reject) + protocol_response (challenge) | ✅ Complete |
+| 45 | Event Counts | protocol_response (COUNT) | ✅ Complete |
+| 62 | Request to Vanish | kind_handler (kind 62 vanish) | ✅ Complete |
+| 67 | EOSE Completeness Hint | protocol_response (EOSE hints) | ✅ Complete |
 
-**Target `supported_nips`:** `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62, 67]`
+**Target `supported_nips`:** `[1, 9, 11, 13, 17, 26, 40, 42, 45, 62, 67]`
 
-## Limits And Operations
+All NIPs are implemented as single-file capability providers in `src/nips/nipXX.c` with self-registration. No per-NIP headers, no `*_capability.*` split, no `nip_plugin_t` — deleted. `nip_capability.h` holds the registry plus the kind-handler result type and the nip26/nip42 decls shared with core code.
 
-- WebSocket frames: 5 MiB maximum.
-- Events: 100 tags and 16 KiB content maximum.
-- Client subscriptions: 20 maximum, with 10 filters per subscription.
-- Query limit: 500 events per filter by default.
-- Storage: one process and one SQLite connection. Back up the database and test
-  retention, reverse-proxy, rate-limit, and monitoring policies before a public
-  deployment.
+## Capabilities
+
+The relay supports the client messages `EVENT`, `REQ`, `COUNT`, `CLOSE`, and `AUTH`. It uses SQLite persistence with indexes for event IDs, authors, kinds, creation timestamps, and `e`/`p`/`a` tags. Filters support exact 64-char lowercase-hex IDs/authors (prefixes are rejected per NIP-01), kinds, tags, time ranges, and content search; stored events are delivered before EOSE. Over-limit filter lists are rejected (`NOTICE: error: invalid filter`); the server sends no acknowledgement for client `CLOSE` (the subscription is silently removed).
+
+Protocol policy is handled through the NIP capability interface (`nip_capability.h`) rather than transport-layer plugins. The core dispatch lives in `relay.c` (protocol parsing/validation/subscription matching/policy evaluation) with pure transport in `transport/server.c` (Mongoose event loop + WebSocket framing).
+
+The capability interface defines deterministic composition rules:
+- Publication policies: ALL must permit (AND)
+- Delivery policies: ANY may veto (OR)
+- Query policies: ALL must permit (AND)
+- Kind handlers: ALL matched handlers are consulted; ANY reject wins (AND).
+  A later accept never flips a prior reject back to true.
+- Maintenance handlers: ALL run
+- Lifecycle/connection/message-intercept: all run
+- Metadata/protocol-response: first non-NULL wins
 
 ## Development
 
 | Guide | Use it for |
 | --- | --- |
 | [QUICKSTART.md](QUICKSTART.md) | Building and operating a local relay. |
-| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Architecture, behavior boundaries, and contribution workflow. |
 | [API_REFERENCE.md](API_REFERENCE.md) | Public C data structures and interfaces. |
-| [NOSTR.md](NOSTR.md) | Nostr message types and supported-NIP reference. |
+| [PLAN.md](PLAN.md) | Architecture refactor plan with completion criteria. |
+| [NOB_HOTRELOAD.md](NOB_HOTRELOAD.md) | Hot-reload build and supervision. |
 
-The build definition uses [nob](nob.c). Before submitting a change, run the
-validation command in [IMPLEMENTATION.md](IMPLEMENTATION.md).
+The build definition uses [nob](nob.c). Before submitting a change, run the validation command in [PLAN.md](PLAN.md).
 
 ## Capabilities
 
 The relay supports the client messages `EVENT`, `REQ`, `COUNT`, `CLOSE`, and
 `AUTH`. It uses SQLite persistence with indexes for event IDs, authors, kinds,
-and creation timestamps. Filters support ID and author prefixes, kinds, tags,
+creation timestamps, and `e`/`p`/`a` tags. Filters support exact 64-char
+lowercase-hex IDs/authors (prefixes are rejected per NIP-01), kinds, tags,
 time ranges, and content search; stored events are delivered before EOSE.
 
 | NIP | Status | Relay support |
@@ -145,7 +198,7 @@ time ranges, and content search; stored events are delivered before EOSE.
 | 26 | Supported | Verifies delegation signatures and delegation conditions. |
 | 33 | Supported | Replaces parameterized replaceable events using their `d` tag. |
 | 40 | Supported | Omits expired events from stored event queries. |
-| 42 | Supported | Issues cryptographically random challenges and verifies signed client authentication events. |
+| 42 | Supported | Issues cryptographically random single-use challenges and verifies signed client authentication events with relay-tag binding (wrong-relay and tagless AUTH is rejected; replays fail). Kind-4 DMs are gated per-event to authenticated participants (author or `p` tag) across live, stored, and COUNT queries, with query-time early rejection. |
 | 45 | Supported | Handles `COUNT` queries. |
 | 62 | Supported | Processes Request to Vanish events targeting this relay or `ALL_RELAYS`. |
 | 67 | Supported | Emits an EOSE completeness hint when a query exceeds its configured limit. |
@@ -187,7 +240,4 @@ gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
 .\nob.exe
 ```
 
-`nob` compiles the relay and SQLite amalgamation directly. It links the other
-bundled dependencies from `thirdparty/install`, which must contain the
-configured headers and static libraries for mongoose, secp256k1, and
-OpenSSL. The output executable is `build/nostrogotho.exe`.
+`nob` compiles the relay and SQLite amalgamation directly. It links the other bundled dependencies from `thirdparty/`, which must contain the configured headers and static libraries for mongoose, secp256k1, and OpenSSL. The output executable is `build/main.exe`.
