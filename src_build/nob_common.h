@@ -95,10 +95,10 @@ static void nob_handle_stop_signal(int signal_number) {
 #define NOB_OS_NHR_SRC SRC_FOLDER"nhr_windows.c"
 #define NOB_OS_EXTRA_DEFINES "-DSECP256K1_STATIC"
 #define NOB_OS_MODULE_FLAGS "-shared", "-Wl,--export-all-symbols"
-#define NOB_OS_LIBS "-lbcrypt", "-lws2_32", "-lwinpthread", "-ldbghelp"
-/* Crash stack traces need symbols (-g). Windows hosts also link DbgHelp
- * (see src/crash.c) for CaptureStackBackTrace symbol resolution. */
-#define NOB_OS_DEBUG_FLAGS "-g"
+#define NOB_OS_LIBS "-lbcrypt", "-lws2_32", "-lwinpthread"
+/* Stacktraces need symbols + frame pointers + CRASH_DEBUG.
+ * Release omits CRASH_DEBUG (compiles to nothing). */
+#define NOB_OS_DEBUG_FLAGS "-g", "-Og", "-fno-omit-frame-pointer", "-DCRASH_DEBUG"
 #else
 #define NOB_OS_MODULE_NEXT "build/nostrogotho.next.so"
 #define NOB_OS_MODULE_PUBLISHED BUILD_FOLDER"nostrogotho.so"
@@ -107,9 +107,8 @@ static void nob_handle_stop_signal(int signal_number) {
 #define NOB_OS_EXTRA_DEFINES "-D_GNU_SOURCE"
 #define NOB_OS_MODULE_FLAGS "-fPIC", "-fvisibility=hidden", "-shared"
 #define NOB_OS_LIBS "-lpthread", "-lm", "-ldl"
-/* Linux backtrace() needs -rdynamic so frames resolve to function names
- * instead of raw addresses (gcc -g -rdynamic). */
-#define NOB_OS_DEBUG_FLAGS "-g", "-rdynamic"
+/* addr2line needs -g; FP walk needs -fno-omit-frame-pointer; dladdr needs -rdynamic. */
+#define NOB_OS_DEBUG_FLAGS "-g", "-Og", "-fno-omit-frame-pointer", "-rdynamic", "-DCRASH_DEBUG"
 #endif
 
 /* Core sources shared by every artifact. Policy layer removed: relay.c owns
@@ -247,6 +246,38 @@ static bool nob_build_host(bool dynamic_module) {
     return cmd_run(&cmd);
 }
 
+/* Phase 3: ASan+UBSan build (Linux only; not supported on MinGW).
+ * Flags: -fsanitize=address,undefined -g -fno-omit-frame-pointer.
+ * Plus -Wall -Wextra (via nob_cc_flags) + -fanalyzer for static analysis. */
+static bool nob_build_asan(void) {
+#ifdef _WIN32
+    nob_log(ERROR, "ASan: -fsanitize=address,undefined not supported on MinGW; use Linux gcc");
+    return false;
+#else
+    Cmd cmd = {0};
+    nob_cc(&cmd);
+    nob_cc_flags(&cmd);
+    nob_cmd_append(&cmd, "-std=c99", NOB_OS_EXTRA_DEFINES, NOB_SECP_DEFINES,
+                   "-g", "-Og", "-fno-omit-frame-pointer", "-rdynamic",
+                   "-DCRASH_DEBUG",
+                   "-DNHR_STATIC_MODULE",
+                   "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                   "-fanalyzer",
+                   "-I"BUILD_FOLDER, "-I.", "-I"SRC_FOLDER, "-I"SRC_FOLDER"nips",
+                   "-I"THIRD_PARTY_FOLDER, "-I"THIRD_PARTY_FOLDER"mongoose",
+                   "-I"THIRD_PARTY_FOLDER"secp256k1/include",
+                   "-I"THIRD_PARTY_FOLDER"secp256k1",
+                   "-I"THIRD_PARTY_FOLDER"secp256k1/src");
+    nob_cc_output(&cmd, BUILD_FOLDER"main_asan");
+    nob_cc_inputs(&cmd, NOB_HOST_SOURCES, SRC_FOLDER"nhr.c", NOB_OS_NHR_SRC,
+                  NOB_THIRD_PARTY_SOURCES);
+    nob_cmd_append(&cmd, SRC_FOLDER"nips/nip_composition_policy.c");
+    if (!nob_add_nip_sources(&cmd)) return false;
+    nob_cmd_append(&cmd, NOB_OS_LIBS);
+    return cmd_run(&cmd);
+#endif
+}
+
 static void nob_refresh_nip_stamps(File_Paths *watched_nips, struct stat **nip_stamps) {
     free(watched_nips->items);
     free(*nip_stamps);
@@ -276,7 +307,9 @@ static Nob_Proc nob_start_hot_host(int argc, char **argv) {
 
 /* Classify a dead host: 1 = clean exit (stop supervisor), 0 = crashed and
  * successfully restarted (keep watching), -1 = stop requested or restart
- * failed (terminate supervisor with an error unless stopped). */
+ * failed (terminate supervisor with an error unless stopped).
+ * The host prints its own stacktrace to stderr (inherited), so it appears
+ * in the same terminal as nob logs. */
 static int nob_handle_hot_host_exit(Nob_Proc *host, int status, int argc,
                                     char **argv, unsigned *crash_restarts,
                                     uint64_t *host_start_nanos) {
@@ -638,9 +671,6 @@ static int nob_build_and_run_tests(void) {
     static const char *crash_srcs[] = {
         SRC_FOLDER"crash.c",
     };
-    static const char *crash_fixtures_srcs[] = {
-        SRC_FOLDER"crash.c",
-    };
     static const char *sha256_srcs[] = {
         SRC_FOLDER"nips/nip26.c",
         SRC_FOLDER"nips/nip_capability.c",
@@ -678,6 +708,7 @@ static int nob_build_and_run_tests(void) {
         NOB_TEST_NHR_PLATFORM,
         SRC_FOLDER"nips/nip26.c",
         SRC_FOLDER"nips/nip_capability.c",
+        SRC_FOLDER"nips/nip_composition_policy.c",
         THIRD_PARTY_FOLDER"mongoose/mongoose.c",
         THIRD_PARTY_FOLDER"sqlite3.c",
     };

@@ -1,490 +1,637 @@
-#include "crash.h"
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <signal.h>
-#include <string.h>
-
-#ifdef _WIN32
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <dbghelp.h>
-
-/* Readable Windows traces.
+/* Crash handler: readable terminal stacktrace, no files.
  *
- * DbgHelp resolves PDB symbols (MSVC). MinGW/DWARF has no PDB, so we
- * additionally shell out to addr2line (ships with the GCC toolchain) to
- * turn module+offset into function (file:line). System DLL frames are
- * shown without addr2line probing to keep the trace fast and focused.
+ * Prints function + file:line per frame to stderr on fatal signals
+ * (Linux) / unhandled exception + abort (Windows). Nothing is written
+ * to disk.
+ *
+ * Safety domains (kept separate on purpose):
+ *  handler  = signal/SEH context: FP-walk only, no backtrace().
+ *  helper   = normal code (crash_print_stacktrace): backtrace() is fine.
+ *
+ * Requires: -g -Og -fno-omit-frame-pointer (+ -rdynamic on Linux).
  */
 
-#define CRASH_MAX_FRAMES 32
-#define CRASH_SKIP_FRAMES 1
+/* _GNU_SOURCE must precede ALL system headers (even via crash.h):
+ * glibc locks in feature macros on first <features.h> inclusion,
+ * which is what exposes Dl_info/dladdr and REG_RIP/REG_RBP. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
-static int crash_sym_initialized = 0;
+#include "crash.h"
 
-static void crash_strip_newline(char *s) {
+#ifndef CRASH_DEBUG
+
+void crash_install_handlers(void) {}
+void crash_print_stacktrace(void) {}
+void crash_assert_fail(const char *c, const char *f, int l, const char *m, ...) {
+    (void)c; (void)f; (void)l; (void)m;
+}
+
+#else /* CRASH_DEBUG */
+
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdarg.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#else
+#include <ucontext.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <execinfo.h>
+#endif
+
+#define CRASH_MAX_FRAMES 64
+
+static volatile sig_atomic_t crash_in_handler = 0;
+
+/* --- tiny color helper (TTY only, respects NO_COLOR) --- */
+static int use_color(void) {
+    static int init = 0, val = 0;
+    if (!init) {
+        const char *no = getenv("NO_COLOR");
+        const char *term = getenv("TERM");
+        init = 1;
+        val = !no && (!term || strcmp(term, "dumb") != 0);
+#ifdef _WIN32
+        val = val && _isatty(_fileno(stderr));
+#else
+        val = val && isatty(STDERR_FILENO);
+#endif
+    }
+    return val;
+}
+
+static const char *c_red(void)   { return use_color() ? "\033[1;31m" : ""; }
+static const char *c_cyan(void)  { return use_color() ? "\033[1;36m" : ""; }
+static const char *c_dim(void)   { return use_color() ? "\033[2m" : ""; }
+static const char *c_reset(void) { return use_color() ? "\033[0m" : ""; }
+
+static void strip_nl(char *s) {
     size_t n;
     if (!s) return;
     n = strlen(s);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = '\0';
+    while (n > 0 && (s[n-1] == '\n' || s[n-1] == '\r')) s[--n] = '\0';
 }
 
-static const char *crash_file_name(const char *path) {
+static const char *file_name(const char *p) {
     const char *a, *b;
-    if (!path || !*path) return path ? path : "";
-    a = strrchr(path, '\\');
-    b = strrchr(path, '/');
+    if (!p || !*p) return p ? p : "";
+    a = strrchr(p, '\\');
+    b = strrchr(p, '/');
     if (a && b) return (a > b ? a : b) + 1;
     if (a) return a + 1;
     if (b) return b + 1;
-    return path;
+    return p;
 }
 
-static int crash_is_system_module(const char *path) {
-    size_t i;
-    static const char *sys_hints[] = {
+static int is_system_module(const char *path) {
+    static const char *hints[] = {
         "\\windows\\", "\\system32\\", "\\syswow64\\",
         "ntdll", "kernel32", "kernelbase", "msvcrt", "ucrtbase",
         "ws2_32", "winpthread", "bcrypt", "dbghelp",
+        "libc.", "ld-linux", "libpthread", "libdl", "libm",
+        "/lib/", "/usr/lib/",
     };
-    char lower[MAX_PATH];
-    size_t n;
+    char lower[1024];
+    size_t n, i;
     if (!path) return 1;
     n = strlen(path);
     if (n >= sizeof(lower)) n = sizeof(lower) - 1;
     for (i = 0; i < n; i++) {
         char c = path[i];
-        lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+        lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
     }
     lower[n] = '\0';
-    for (i = 0; i < sizeof(sys_hints) / sizeof(sys_hints[0]); i++) {
-        if (strstr(lower, sys_hints[i]) != NULL) return 1;
-    }
+    for (i = 0; i < sizeof(hints) / sizeof(hints[0]); i++)
+        if (strstr(lower, hints[i]) != NULL) return 1;
     return 0;
 }
 
-/* Preferred (link-time) image base from the file on disk. The in-memory
- * PE headers are rebased by ASLR, so they cannot be used. addr2line wants
- * file VMAs (preferred_base + RVA). */
-static DWORD64 crash_file_preferred_base(const char *path) {
+static int is_verbose(void) {
+    const char *v = getenv("CRASH_VERBOSE");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+/* --- platform shims in one place --- */
+static FILE *crash_popen(const char *cmd) {
+#ifdef _WIN32
+    return _popen(cmd, "r");
+#else
+    return popen(cmd, "r");
+#endif
+}
+
+static void crash_pclose(FILE *p) {
+#ifdef _WIN32
+    _pclose(p);
+#else
+    pclose(p);
+#endif
+}
+
+/* PE preferred (link-time) base from file, for MinGW DWARF VMA math. */
+#ifdef _WIN32
+static unsigned long long pe_preferred_base(const char *path) {
     FILE *f = NULL;
     unsigned char hdr[64];
-    unsigned long e_lfanew;
-    unsigned long sig;
+    unsigned long e_lfanew, sig;
     unsigned short magic;
-    DWORD64 base = 0;
+    unsigned long long base = 0;
+    int i;
     if (!path || !*path) return 0;
     f = fopen(path, "rb");
     if (!f) return 0;
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) { fclose(f); return 0; }
     if (hdr[0] != 'M' || hdr[1] != 'Z') { fclose(f); return 0; }
-    e_lfanew = (unsigned long)hdr[0x3c] |
-               ((unsigned long)hdr[0x3d] << 8) |
-               ((unsigned long)hdr[0x3e] << 16) |
-               ((unsigned long)hdr[0x3f] << 24);
+    e_lfanew = (unsigned long)hdr[0x3c] | ((unsigned long)hdr[0x3d] << 8) |
+               ((unsigned long)hdr[0x3e] << 16) | ((unsigned long)hdr[0x3f] << 24);
     if (fseek(f, (long)e_lfanew, SEEK_SET) != 0) { fclose(f); return 0; }
     if (fread(&sig, 4, 1, f) != 1 || sig != 0x00004550) { fclose(f); return 0; }
     if (fseek(f, (long)e_lfanew + 4 + 20, SEEK_SET) != 0) { fclose(f); return 0; }
     if (fread(&magic, 2, 1, f) != 1) { fclose(f); return 0; }
-    if (magic == 0x20b) { /* PE32+ */
-        unsigned char opt[112];
-        DWORD64 img = 0;
-        int i;
+    if (magic == 0x20b) {
+        unsigned char opt[8];
         if (fseek(f, (long)e_lfanew + 4 + 20 + 24, SEEK_SET) != 0) { fclose(f); return 0; }
         if (fread(opt, 1, 8, f) != 8) { fclose(f); return 0; }
         for (i = 7; i >= 0; i--) base = (base << 8) | opt[i];
-        (void)img;
-    } else if (magic == 0x10b) { /* PE32 */
+    } else if (magic == 0x10b) {
         unsigned char opt[4];
         if (fseek(f, (long)e_lfanew + 4 + 20 + 28, SEEK_SET) != 0) { fclose(f); return 0; }
         if (fread(opt, 1, 4, f) != 4) { fclose(f); return 0; }
-        base = (DWORD64)opt[0] | ((DWORD64)opt[1] << 8) |
-               ((DWORD64)opt[2] << 16) | ((DWORD64)opt[3] << 24);
+        base = (unsigned long long)opt[0] | ((unsigned long long)opt[1] << 8) |
+               ((unsigned long long)opt[2] << 16) | ((unsigned long long)opt[3] << 24);
     }
     fclose(f);
     return base;
 }
+#endif
 
-/* In-memory PEbase helper retained for diagnostics (file-based lookup
- * above is authoritative since ASLR rebases in-memory headers). */
-static DWORD64 crash_preferred_base(HMODULE mod) {
-    PIMAGE_DOS_HEADER dos;
-    PIMAGE_NT_HEADERS nt;
-    if (!mod) return 0;
-    dos = (PIMAGE_DOS_HEADER)mod;
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    nt = (PIMAGE_NT_HEADERS)((unsigned char *)mod + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE) return 0;
-    return (DWORD64)nt->OptionalHeader.ImageBase;
-}
-
-/* Resolve one frame via addr2line. Returns 1 on success (func not "??"). */
-static int crash_addr2line(const char *module_path, DWORD64 vma,
-                           char *func_out, size_t func_sz,
-                           char *loc_out, size_t loc_sz) {
-    char cmd[2048];
-    FILE *pipe;
-    char func[512] = {0};
-    char loc[1024] = {0};
-    int ok = 0;
-
-    if (!module_path || !module_path[0]) return 0;
-    snprintf(cmd, sizeof(cmd), "addr2line -e \"%s\" -f -C 0x%llx",
-             module_path, (unsigned long long)vma);
-    pipe = _popen(cmd, "r");
-    if (!pipe) return 0;
-    if (fgets(func, sizeof(func), pipe) != NULL &&
-        fgets(loc, sizeof(loc), pipe) != NULL) {
-        crash_strip_newline(func);
-        crash_strip_newline(loc);
-        if (func[0] && strcmp(func, "??") != 0) {
-            if (func_out && func_sz) snprintf(func_out, func_sz, "%s", func);
-            if (loc_out && loc_sz) snprintf(loc_out, loc_sz, "%s", loc);
-            ok = 1;
-        }
-    }
-    _pclose(pipe);
-    return ok;
-}
-
-void crash_print_stacktrace(void) {
-    void *frames[CRASH_MAX_FRAMES];
-    USHORT captured;
-    HANDLE process;
-    SYMBOL_INFO_PACKAGE sym_pkg;
-    PSYMBOL_INFO sym;
-    int have_sym = 0;
-    USHORT i;
-
-    captured = CaptureStackBackTrace(CRASH_SKIP_FRAMES,
-                                     CRASH_MAX_FRAMES - CRASH_SKIP_FRAMES,
-                                     frames, NULL);
-    if (captured == 0) {
-        fprintf(stderr, "  <empty stack>\n");
-        fflush(stderr);
-        return;
-    }
-
-    process = GetCurrentProcess();
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
-    if (SymInitialize(process, NULL, TRUE)) {
-        have_sym = 1;
-        crash_sym_initialized = 1;
-    } else {
-        fprintf(stderr, "  (no PDB symbols; resolving via addr2line where possible)\n");
-    }
-
-    if (have_sym) {
-        memset(&sym_pkg, 0, sizeof(sym_pkg));
-        sym = &sym_pkg.si;
-        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-        sym->MaxNameLen = MAX_SYM_NAME;
-    } else {
-        sym = NULL;
-    }
-
-    for (i = 0; i < captured; i++) {
-        DWORD64 address = (DWORD64)(uintptr_t)frames[i];
+/* Resolve an effective address to module + query address for addr2line.
+ * Single platform branch; returns 1 with mod_path set when a module owns it. */
+static int resolve_module(uintptr_t eff, char *mod_path, size_t mod_sz,
+                          unsigned long long *qaddr, int *is_sys) {
+    if (mod_path && mod_sz) mod_path[0] = '\0';
+    if (qaddr) *qaddr = (unsigned long long)eff;
+    if (is_sys) *is_sys = 0;
+#ifdef _WIN32
+    {
         HMODULE mod = NULL;
-        char mod_path[MAX_PATH] = {0};
-        const char *mod_short = "<unknown>";
-        DWORD64 rva = 0;
-        int got_module = 0;
-        DWORD64 displacement = 0;
-        DWORD line_disp = 0;
-        IMAGEHLP_LINE64 line;
-
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR)frames[i], &mod) && mod &&
-            GetModuleFileNameA(mod, mod_path, sizeof(mod_path))) {
-            got_module = 1;
-            mod_short = crash_file_name(mod_path);
-            rva = address - (DWORD64)(uintptr_t)mod;
-        }
-
-        fprintf(stderr, "  #%u  %p ", (unsigned)i, frames[i]);
-
-        /* 1) PDB path (MSVC): function + source line. */
-        if (have_sym && SymFromAddr(process, address, &displacement, sym)) {
-            fprintf(stderr, "%s+0x%llx", sym->Name,
-                    (unsigned long long)displacement);
-            memset(&line, 0, sizeof(line));
-            line.SizeOfStruct = sizeof(line);
-            if (SymGetLineFromAddr64(process, address, &line_disp, &line)) {
-                fprintf(stderr, " (%s:%lu)", line.FileName,
-                        (unsigned long)line.LineNumber);
-            }
-            if (got_module) {
-                fprintf(stderr, " [%s+0x%llx]", mod_short,
-                        (unsigned long long)rva);
-            }
-            fprintf(stderr, "\n");
-            continue;
-        }
-
-        /* 2) DWARF path (MinGW): addr2line on app modules only. */
-        if (got_module && !crash_is_system_module(mod_path)) {
-            DWORD64 pref = crash_file_preferred_base(mod_path);
-            DWORD64 vma = pref ? pref + rva : address;
-            char func[512] = {0};
-            char loc[1024] = {0};
-            if (crash_addr2line(mod_path, vma, func, sizeof(func),
-                                loc, sizeof(loc))) {
-                if (loc[0] && strcmp(loc, "??:?") != 0 && strcmp(loc, "??:0") != 0) {
-                    fprintf(stderr, "%s (%s)", func, loc);
-                } else {
-                    fprintf(stderr, "%s", func);
-                }
-                fprintf(stderr, " [%s+0x%llx]\n", mod_short,
-                        (unsigned long long)rva);
-                continue;
-            }
-        }
-
-        /* 3) Fallback: module+offset is still addr2line/gdb actionable. */
-        if (got_module) {
-            fprintf(stderr, "%s+0x%llx [abs %p]\n", mod_short,
-                    (unsigned long long)rva, frames[i]);
-        } else {
-            fprintf(stderr, "<unknown> [abs %p]\n", frames[i]);
-        }
-    }
-    fprintf(stderr, "  Tip: gdb -batch -ex bt --args <exe> <args>, or "
-            "addr2line -e <module> -f -C <link-time-addr>\n");
-    fflush(stderr);
-    if (have_sym) SymCleanup(process);
-}
-
-static const char *crash_sig_name(int sig) {
-    switch (sig) {
-        case SIGSEGV: return "SIGSEGV (invalid memory access)";
-        case SIGFPE:  return "SIGFPE (arithmetic fault)";
-        case SIGILL:  return "SIGILL (illegal instruction)";
-        case SIGABRT: return "SIGABRT (abort)";
-        default: return "UNKNOWN";
-    }
-}
-
-static void crash_signal_handler(int sig) {
-    fprintf(stderr, "\nCRASH: Signal %d (%s).\n", sig, crash_sig_name(sig));
-    crash_print_stacktrace();
-    fflush(stderr);
-    fflush(stdout);
-    signal(sig, SIG_DFL);
-    /* Non-zero exit lets the nob hot-reload supervisor detect the crash
-     * and restart the host. */
-    _exit(1);
-}
-
-static LONG WINAPI crash_seh_filter(EXCEPTION_POINTERS *info) {
-    DWORD code = info && info->ExceptionRecord
-        ? info->ExceptionRecord->ExceptionCode : 0;
-    const char *name = "UNKNOWN";
-    const char *op = "";
-    void *fault = NULL;
-    switch (code) {
-        case EXCEPTION_ACCESS_VIOLATION:         name = "ACCESS_VIOLATION (segfault-like)"; break;
-        case EXCEPTION_INT_DIVIDE_BY_ZERO:       name = "INT_DIVIDE_BY_ZERO"; break;
-        case EXCEPTION_ILLEGAL_INSTRUCTION:      name = "ILLEGAL_INSTRUCTION"; break;
-        case EXCEPTION_STACK_OVERFLOW:           name = "STACK_OVERFLOW"; break;
-        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:    name = "ARRAY_BOUNDS_EXCEEDED"; break;
-        default: break;
-    }
-    if (info && info->ExceptionRecord &&
-        info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
-        info->ExceptionRecord->NumberParameters >= 2) {
-        ULONG_PTR w = info->ExceptionRecord->ExceptionInformation[0];
-        fault = (void *)info->ExceptionRecord->ExceptionInformation[1];
-        op = (w == 0) ? "read" : (w == 1) ? "write" : "execute";
-    }
-    fprintf(stderr, "\nCRASH: Exception 0x%08lX (%s)",
-            (unsigned long)code, name);
-    if (fault) fprintf(stderr, " while attempting to %s address %p", op, fault);
-    fprintf(stderr, ".\n");
-    crash_print_stacktrace();
-    fflush(stderr);
-    fflush(stdout);
-    ExitProcess(1);
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-
-void crash_install_handlers(void) {
-    signal(SIGSEGV, crash_signal_handler);
-    signal(SIGFPE, crash_signal_handler);
-    signal(SIGILL, crash_signal_handler);
-    signal(SIGABRT, crash_signal_handler);
-    SetUnhandledExceptionFilter(crash_seh_filter);
-}
-
-#else /* POSIX (Linux) */
-
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
-#include <unistd.h>
-#include <execinfo.h>
-#include <dlfcn.h>
-#include <sys/types.h>
-
-#define CRASH_MAX_FRAMES 32
-#define CRASH_SKIP_FRAMES 2
-
-static void crash_strip_newline(char *s) {
-    size_t n;
-    if (!s) return;
-    n = strlen(s);
-    while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r')) s[--n] = '\0';
-}
-
-/* Best-effort file:line via addr2line. Tries the ASLR absolute address
- * first, then the file-relative offset for PIE binaries. */
-static int crash_addr2line(const char *module, void *addr, void *base,
-                           char *out, size_t out_sz) {
-    char cmd[2048];
-    char exe[1024];
-    FILE *pipe;
-    char func[512] = {0};
-    char loc[1024] = {0};
-
-    if (!module || !module[0]) return 0;
-    snprintf(exe, sizeof(exe), "%s", module);
-    snprintf(cmd, sizeof(cmd), "addr2line -e \"%s\" -f -C %p",
-             exe, addr);
-    pipe = popen(cmd, "r");
-    if (pipe) {
-        int ok = 0;
-        if (fgets(func, sizeof(func), pipe) != NULL &&
-            fgets(loc, sizeof(loc), pipe) != NULL) {
-            crash_strip_newline(func);
-            crash_strip_newline(loc);
-            if (func[0] && strcmp(func, "??") != 0) ok = 1;
-        }
-        pclose(pipe);
-        if (ok) {
-            if (loc[0] && strcmp(loc, "??:?") != 0 && strcmp(loc, "??:0") != 0)
-                snprintf(out, out_sz, "%s (%s)", func, loc);
-            else
-                snprintf(out, out_sz, "%s", func);
+                               (LPCSTR)(void *)eff, &mod) && mod &&
+            GetModuleFileNameA(mod, mod_path, (DWORD)(mod_sz - 1))) {
+            unsigned long long rva =
+                (unsigned long long)eff - (unsigned long long)(uintptr_t)mod;
+            unsigned long long pref = pe_preferred_base(mod_path);
+            if (qaddr) *qaddr = pref ? pref + rva : rva;
+            if (is_sys) *is_sys = is_system_module(mod_path);
             return 1;
         }
     }
-    if (base) {
-        unsigned long long off =
-            (unsigned long long)((char *)addr - (char *)base);
-        snprintf(cmd, sizeof(cmd), "addr2line -e \"%s\" -f -C 0x%llx",
-                 exe, off);
-        pipe = popen(cmd, "r");
-        if (!pipe) return 0;
-        {
-            int ok = 0;
-            if (fgets(func, sizeof(func), pipe) != NULL &&
-                fgets(loc, sizeof(loc), pipe) != NULL) {
-                crash_strip_newline(func);
-                crash_strip_newline(loc);
-                if (func[0] && strcmp(func, "??") != 0) ok = 1;
-            }
-            pclose(pipe);
-            if (ok) {
-                if (loc[0] && strcmp(loc, "??:?") != 0 && strcmp(loc, "??:0") != 0)
-                    snprintf(out, out_sz, "%s (%s)", func, loc);
-                else
-                    snprintf(out, out_sz, "%s", func);
-                return 1;
-            }
+#else
+    {
+        Dl_info li;
+        if (dladdr((void *)eff, &li) != 0 && li.dli_fname) {
+            snprintf(mod_path, mod_sz, "%s", li.dli_fname);
+            if (li.dli_fbase && qaddr)
+                *qaddr = (unsigned long long)eff -
+                         (unsigned long long)(uintptr_t)li.dli_fbase;
+            if (is_sys) *is_sys = is_system_module(mod_path);
+            return 1;
         }
+    }
+#endif
+    return 0;
+}
+
+/* One addr2line probe. Returns 1 when the function is known. */
+static int addr2line_one(const char *mod, unsigned long long addr,
+                         char *func, size_t func_sz,
+                         char *loc, size_t loc_sz) {
+    char cmd[2048];
+    FILE *pipe;
+    char fbuf[512] = {0}, lbuf[1024] = {0};
+    int ok = 0;
+    if (!mod || !mod[0]) return 0;
+    snprintf(cmd, sizeof(cmd), "addr2line -e \"%s\" -f -C 0x%llx", mod, addr);
+    pipe = crash_popen(cmd);
+    if (!pipe) return 0;
+    if (fgets(fbuf, sizeof(fbuf), pipe) && fgets(lbuf, sizeof(lbuf), pipe)) {
+        strip_nl(fbuf);
+        strip_nl(lbuf);
+        if (fbuf[0] && strcmp(fbuf, "??") != 0) {
+            snprintf(func, func_sz, "%s", fbuf);
+            snprintf(loc, loc_sz, "%s", lbuf);
+            ok = 1;
+        }
+    }
+    crash_pclose(pipe);
+    return ok;
+}
+
+static void rel_path(const char *abs, char *out, size_t out_sz) {
+    const char *p;
+    if (!abs || !out || out_sz == 0) return;
+    p = strstr(abs, "src/");
+    if (!p) p = strstr(abs, "tests/");
+    if (!p) p = strstr(abs, "src\\");
+    if (p) { snprintf(out, out_sz, "%s", p); return; }
+    snprintf(out, out_sz, "%s", file_name(abs));
+}
+
+/* Source context with a fixed stack buffer (no malloc in crash path). */
+static void print_src_context(const char *file, long line_no) {
+    FILE *f;
+    char line[2048];
+    long cur = 0, start;
+    char kept[7][512];
+    int have[7] = {0};
+    int i;
+    if (!file || !file[0] || strstr(file, "??") != NULL || line_no <= 0) return;
+    f = fopen(file, "r");
+    if (!f) return;
+    start = line_no - 3;
+    if (start < 1) start = 1;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        cur++;
+        if (cur >= start && cur <= line_no + 3) {
+            strip_nl(line);
+            snprintf(kept[cur - start], sizeof(kept[0]), "%.511s", line);
+            have[cur - start] = 1;
+            if (cur == line_no + 3) break;
+        }
+        if (cur > line_no + 3) break;
+    }
+    fclose(f);
+    for (i = 0; i < 7; i++) {
+        if (!have[i]) continue;
+        if (start + i == line_no)
+            fprintf(stderr, "      %s> %ld | %s%s\n",
+                    c_cyan(), start + i, kept[i], c_reset());
+        else
+            fprintf(stderr, "      %s  %ld | %s%s\n",
+                    c_dim(), start + i, kept[i], c_reset());
+    }
+}
+
+/* Resolve once: module offset first, then absolute (ELF PIE vs non-PIE). */
+static int resolve_frame(const char *mod_path, unsigned long long query_addr,
+                         unsigned long long raw_addr,
+                         char *func, size_t func_sz,
+                         char *loc, size_t loc_sz) {
+    if (mod_path && mod_path[0]) {
+        if (addr2line_one(mod_path, query_addr, func, func_sz, loc, loc_sz))
+            return 1;
+        if (query_addr != raw_addr)
+            return addr2line_one(mod_path, raw_addr, func, func_sz, loc, loc_sz);
     }
     return 0;
 }
 
-static void crash_print_frames(void *const *array, int size, int skip) {
-    int i;
-    if (size <= skip) {
-        fprintf(stderr, "  <empty stack>\n");
-        fflush(stderr);
-        return;
+/* Split "file:line" into filepart; returns the line number (0 if none). */
+static long split_loc(const char *loc, char *filepart, size_t fp_sz) {
+    char *colon = strrchr(loc, ':');
+    if (colon) {
+        size_t fl = (size_t)(colon - loc);
+        if (fl >= fp_sz) fl = fp_sz - 1;
+        memcpy(filepart, loc, fl);
+        filepart[fl] = '\0';
+        return atol(colon + 1);
     }
-    for (i = skip; i < size; i++) {
-        Dl_info dlinfo;
-        const char *func = NULL;
-        const char *mod = NULL;
-        unsigned long long off = 0;
-        char resolved[1536] = {0};
-        if (dladdr(array[i], &dlinfo) != 0) {
-            func = dlinfo.dli_sname;
-            mod = dlinfo.dli_fname;
-            if (dlinfo.dli_saddr)
-                off = (unsigned long long)((char *)array[i] -
-                                           (char *)dlinfo.dli_saddr);
-            else if (dlinfo.dli_fbase)
-                off = (unsigned long long)((char *)array[i] -
-                                           (char *)dlinfo.dli_fbase);
+    snprintf(filepart, fp_sz, "%s", loc);
+    return 0;
+}
+
+/* Print one resolved group: single frame, or "#a-#b ... (xN)" for a run
+ * of identical frames (recursion). Context is shown once. */
+static void print_group(int first, int count, const char *mod_path,
+                        unsigned long long query_addr,
+                        unsigned long long raw_addr,
+                        const char *func, const char *loc, int ok) {
+    if (ok) {
+        char rel[1024] = {0}, filepart[1024] = {0};
+        long lineno = split_loc(loc, filepart, sizeof(filepart));
+        int known_loc = loc[0] && loc[0] != '?';
+        rel_path(filepart[0] ? filepart : loc, rel, sizeof(rel));
+        if (count > 1 && known_loc)
+            fprintf(stderr, "  #%d-#%d  %s%s%s  %s%s%s  %s(x%d)%s\n",
+                    first, first + count - 1,
+                    c_cyan(), func, c_reset(), c_dim(), rel, c_reset(),
+                    c_dim(), count, c_reset());
+        else if (count > 1)
+            fprintf(stderr, "  #%d-#%d  %s%s%s  %s(x%d)%s\n",
+                    first, first + count - 1,
+                    c_cyan(), func, c_reset(),
+                    c_dim(), count, c_reset());
+        else if (known_loc && strcmp(rel, "??:?") != 0 && strcmp(rel, "??:0") != 0)
+            fprintf(stderr, "  #%d  %s%s%s  %s%s%s\n", first,
+                    c_cyan(), func, c_reset(), c_dim(), rel, c_reset());
+        else
+            fprintf(stderr, "  #%d  %s%s%s\n", first, c_cyan(), func, c_reset());
+        if (known_loc && filepart[0] && !strstr(filepart, "??") && lineno > 0)
+            print_src_context(filepart, lineno);
+    } else if (mod_path && mod_path[0]) {
+        fprintf(stderr, "  #%d  %s+0x%llx %s[abs 0x%llx]%s\n",
+                first, file_name(mod_path), query_addr,
+                c_dim(), raw_addr, c_reset());
+    } else {
+        fprintf(stderr, "  #%d  %s[abs 0x%llx]%s\n",
+                first, c_dim(), raw_addr, c_reset());
+    }
+}
+
+/* FP-chain walk; needs -fno-omit-frame-pointer.
+ *
+ * Note what this can and cannot see: it records return addresses, so a
+ * function that never returns (calls noreturn abort(), fastfails, or is
+ * entered via frameless libc assembly) leaves no address behind and will
+ * not appear as its own frame -- the trace stays truthful, just without
+ * it (e.g. abort_inner is absent on Linux while present via Windows
+ * unwind tables). Segfaults in user code always resolve exactly. */
+static void fp_walk(uintptr_t fp, uintptr_t *out, int *count, int max) {
+    int n = *count, steps;
+    for (steps = 0; steps < 60 && n < max; steps++) {
+        uintptr_t next_fp, ret;
+        uintptr_t *p;
+        if (fp == 0 || (fp & (sizeof(void *) - 1)) != 0) break;
+        p = (uintptr_t *)fp;
+        next_fp = p[0];
+        ret = p[1];
+        if (ret == 0) break;
+        if (next_fp != 0 && (next_fp <= fp || next_fp - fp > (uintptr_t)(1024 * 1024))) break;
+        out[n++] = ret;
+        if (next_fp == 0) break;
+        fp = next_fp;
+    }
+    *count = n;
+}
+
+static const char *sig_name(int sig) {
+    if (sig == SIGSEGV) return "SIGSEGV";
+    if (sig == SIGABRT) return "SIGABRT";
+    if (sig == SIGFPE) return "SIGFPE";
+    if (sig == SIGILL) return "SIGILL";
+#ifdef SIGBUS
+    if (sig == SIGBUS) return "SIGBUS";
+#endif
+    return "SIGNAL";
+}
+
+static void print_collapsed(const char *names) {
+    fprintf(stderr, "  %s#-%s  [system] %s %s(CRASH_VERBOSE=1 shows all)%s\n",
+            c_dim(), c_reset(), names, c_dim(), c_reset());
+}
+
+static void print_trace(uintptr_t *frames, int nframes, int sig,
+                        uintptr_t fault, const char *fault_op) {
+    int i, shown = 0, sys_run = 0, verbose = is_verbose();
+    char sys_names[512] = {0};
+    fprintf(stderr, "\n%sCRASH: %s%s", c_red(), sig_name(sig), c_reset());
+    if (fault)
+        fprintf(stderr, " %s 0x%llx", fault_op ? fault_op : "at",
+                (unsigned long long)fault);
+    fprintf(stderr, "\n");
+    {
+        /* Pending group for collapsing runs of identical frames. */
+        char p_func[512] = {0}, p_loc[1024] = {0}, p_mod[1024] = {0};
+        unsigned long long p_q = 0, p_raw = 0;
+        int p_first = 0, p_n = 0, p_ok = 0;
+        for (i = 0; i <= nframes; i++) {
+            int end = (i == nframes);
+            uintptr_t raw = end ? 0 : frames[i];
+            uintptr_t eff = (!end && i > 0 && raw > 0) ? raw - 1 : raw;
+            char mod_path[1024] = {0};
+            unsigned long long qaddr = (unsigned long long)eff;
+            char func[512] = {0}, loc[1024] = {0};
+            int have_mod = 0, is_sys = 0, ok = 0;
+            if (!end) {
+                /* Fast path: identical raw address = same call site
+                 * (recursion). Skip module resolve + addr2line entirely. */
+                if (p_n > 0 && sys_run == 0 &&
+                    (unsigned long long)raw == p_raw) {
+                    p_n++;
+                    continue;
+                }
+                have_mod = resolve_module(eff, mod_path, sizeof(mod_path),
+                                          &qaddr, &is_sys);
+                if (is_sys && !verbose) {
+                    const char *bn = have_mod ? file_name(mod_path) : "?";
+                    if (p_n > 0) {
+                        print_group(p_first, p_n, p_mod[0] ? p_mod : NULL,
+                                    p_q, p_raw, p_func, p_loc, p_ok);
+                        shown += p_n;
+                        p_n = 0;
+                    }
+                    if (sys_run == 0) snprintf(sys_names, sizeof(sys_names), "%s", bn);
+                    else if (strlen(sys_names) + 2 + strlen(bn) < sizeof(sys_names))
+                        snprintf(sys_names + strlen(sys_names),
+                                 sizeof(sys_names) - strlen(sys_names), ", %s", bn);
+                    sys_run++;
+                    continue;
+                }
+                if (sys_run > 0) {
+                    print_collapsed(sys_names);
+                    sys_run = 0;
+                    sys_names[0] = '\0';
+                }
+                ok = resolve_frame(have_mod ? mod_path : NULL, qaddr,
+                                   (unsigned long long)raw,
+                                   func, sizeof(func), loc, sizeof(loc));
+            }
+            if (!end && p_n > 0 && sys_run == 0 && ok && p_ok &&
+                strcmp(func, p_func) == 0 && strcmp(loc, p_loc) == 0) {
+                p_n++; /* same frame repeats (recursion): just count */
+                continue;
+            }
+            if (p_n > 0) {
+                print_group(p_first, p_n, p_mod[0] ? p_mod : NULL,
+                            p_q, p_raw, p_func, p_loc, p_ok);
+                shown += p_n;
+                p_n = 0;
+            }
+            if (end) break;
+            p_first = shown;
+            p_n = 1;
+            p_ok = ok;
+            p_q = qaddr;
+            p_raw = (unsigned long long)raw;
+            if (ok) {
+                snprintf(p_func, sizeof(p_func), "%s", func);
+                snprintf(p_loc, sizeof(p_loc), "%s", loc);
+            } else {
+                p_func[0] = '\0';
+                p_loc[0] = '\0';
+            }
+            if (have_mod) snprintf(p_mod, sizeof(p_mod), "%s", mod_path);
+            else p_mod[0] = '\0';
         }
-        if (mod && crash_addr2line(mod, array[i], dlinfo.dli_fbase,
-                                   resolved, sizeof(resolved))) {
-            fprintf(stderr, "  #%d  %s [%s %p]\n", i - skip, resolved,
-                    mod ? mod : "?", array[i]);
-        } else if (func) {
-            fprintf(stderr, "  #%d  %s+0x%llx [%s %p]\n", i - skip, func, off,
-                    mod ? mod : "?", array[i]);
-        } else {
-            fprintf(stderr, "  #%d  %s [%p]\n", i - skip,
-                    mod ? mod : "<unknown>", array[i]);
-        }
+        if (sys_run > 0) print_collapsed(sys_names);
     }
     fflush(stderr);
+}
+
+/* Current-stack capture for normal code (abort path, smoke test).
+ * Skips the capture helper and its immediate caller wrapper so #0 is
+ * always user code (inner_frame / abort internals), not this helper. */
+static int capture_current(uintptr_t *frames, int max) {
+    int n = 0, i;
+#ifdef _WIN32
+    void *stack[CRASH_MAX_FRAMES];
+    USHORT cap = CaptureStackBackTrace(2, CRASH_MAX_FRAMES, stack, NULL);
+    for (i = 0; i < cap && n < max; i++)
+        frames[n++] = (uintptr_t)stack[i];
+#else
+    void *stack[CRASH_MAX_FRAMES];
+    int cap = backtrace(stack, CRASH_MAX_FRAMES);
+    for (i = 2; i < cap && n < max; i++)
+        frames[n++] = (uintptr_t)stack[i];
+#endif
+    return n;
+}
+
+/* Shared fatal exit: print once, restore default, exit. */
+static void fatal_trace(int sig, uintptr_t fault, const char *op,
+                        uintptr_t *frames, int nframes, int exit_code) {
+    print_trace(frames, nframes, sig, fault, op);
+    signal(sig, SIG_DFL);
+    _exit(exit_code);
 }
 
 void crash_print_stacktrace(void) {
-    void *array[CRASH_MAX_FRAMES];
-    int size = backtrace(array, CRASH_MAX_FRAMES);
-    if (size <= 0) {
-        fprintf(stderr, "  <empty stack>\n");
-        fflush(stderr);
-        return;
+    uintptr_t frames[CRASH_MAX_FRAMES];
+    int n = capture_current(frames, CRASH_MAX_FRAMES);
+    print_trace(frames, n, 0, 0, NULL);
+}
+
+void crash_assert_fail(const char *cond, const char *file, int line,
+                       const char *fmt, ...) {
+    char msg[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n%sASSERT FAILED:%s %s at %s%s:%d%s: %s\n",
+            c_red(), c_reset(), cond ? cond : "?",
+            "", file ? file : "?", line, "", msg);
+    fflush(stderr);
+    raise(SIGABRT);
+    _exit(1);
+}
+
+#ifndef _WIN32
+static char altstack_mem[64 * 1024];
+
+static void linux_handler(int sig, siginfo_t *info, void *uctx) {
+    uintptr_t fault = 0, ip = 0, fp = 0;
+    uintptr_t frames[CRASH_MAX_FRAMES];
+    int n = 0;
+    if (crash_in_handler) _exit(127);
+    crash_in_handler = 1;
+    if (info && info->si_code != SI_USER) fault = (uintptr_t)info->si_addr;
+    if (uctx) {
+        ucontext_t *uc = (ucontext_t *)uctx;
+#if defined(__x86_64__)
+        ip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+        fp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+#elif defined(__i386__)
+        ip = (uintptr_t)uc->uc_mcontext.gregs[REG_EIP];
+        fp = (uintptr_t)uc->uc_mcontext.gregs[REG_EBP];
+#elif defined(__aarch64__)
+        ip = (uintptr_t)uc->uc_mcontext.pc;
+        fp = (uintptr_t)uc->uc_mcontext.regs[29];
+#endif
     }
-    crash_print_frames(array, size, 1);
+    if (ip && n < CRASH_MAX_FRAMES) frames[n++] = ip;
+    if (fp) fp_walk(fp, frames, &n, CRASH_MAX_FRAMES);
+    fatal_trace(sig, fault, "at", frames, n,
+                sig == SIGABRT ? 1 : 128 + sig);
+}
+#else
+static LONG WINAPI seh_filter(EXCEPTION_POINTERS *info) {
+    unsigned long code = 0;
+    uintptr_t fault = 0, ip = 0, fp = 0;
+    const char *op = "at";
+    uintptr_t frames[CRASH_MAX_FRAMES];
+    int n = 0, sig = SIGSEGV;
+    if (crash_in_handler) _exit(127);
+    crash_in_handler = 1;
+    if (info && info->ExceptionRecord) {
+        code = info->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_ACCESS_VIOLATION &&
+            info->ExceptionRecord->NumberParameters >= 2) {
+            ULONG_PTR w = info->ExceptionRecord->ExceptionInformation[0];
+            fault = (uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
+            op = (w == 0) ? "reading" : (w == 1) ? "writing" : "executing";
+        }
+        if (code == EXCEPTION_INT_DIVIDE_BY_ZERO) sig = SIGFPE;
+        else if (code == EXCEPTION_ILLEGAL_INSTRUCTION) sig = SIGILL;
+    }
+    if (info && info->ContextRecord) {
+#if defined(_M_X64) || defined(__x86_64__)
+        ip = (uintptr_t)info->ContextRecord->Rip;
+        fp = (uintptr_t)info->ContextRecord->Rbp;
+#elif defined(_M_IX86) || defined(__i386__)
+        ip = (uintptr_t)info->ContextRecord->Eip;
+        fp = (uintptr_t)info->ContextRecord->Ebp;
+#endif
+    }
+    if (ip && n < CRASH_MAX_FRAMES) frames[n++] = ip;
+    if (fp) fp_walk(fp, frames, &n, CRASH_MAX_FRAMES);
+    print_trace(frames, n, sig, fault, op);
+    _exit(1);
+    return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static void crash_handler(int sig, siginfo_t *info, void *ctx) {
-    void *array[CRASH_MAX_FRAMES];
-    int size;
-    const char *sig_name = strsignal(sig);
-    void *fault = info ? info->si_addr : NULL;
-    (void)ctx;
-
-    fprintf(stderr, "\nCRASH: Signal %d (%s)",
-            sig, sig_name ? sig_name : "UNKNOWN");
-    if (fault) fprintf(stderr, " at address %p", fault);
-    fprintf(stderr, ".\n");
-    fflush(stderr);
-
-    size = backtrace(array, CRASH_MAX_FRAMES);
-    crash_print_frames(array, size, CRASH_SKIP_FRAMES);
-    fprintf(stderr, "  Tip: rebuild with -g -rdynamic; "
-            "gdb -batch -ex bt --args <exe> <args>\n");
-    fflush(stdout);
-    fflush(stderr);
-    signal(sig, SIG_DFL);
-    _exit(128 + sig);
+static void win_abort_handler(int sig) {
+    uintptr_t frames[CRASH_MAX_FRAMES];
+    int n;
+    if (crash_in_handler) _exit(127);
+    crash_in_handler = 1;
+    n = capture_current(frames, CRASH_MAX_FRAMES);
+    fatal_trace(sig, 0, NULL, frames, n, 1);
 }
+#endif
 
 void crash_install_handlers(void) {
+#ifdef _WIN32
+    ULONG guarantee = 64 * 1024;
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (k32) {
+        BOOL (WINAPI *set_g)(ULONG *) =
+            (void *)GetProcAddress(k32, "SetThreadStackGuarantee");
+        if (set_g) set_g(&guarantee);
+    }
+    SetUnhandledExceptionFilter(seh_filter);
+    signal(SIGABRT, win_abort_handler);
+#else
+    stack_t ss;
     struct sigaction act;
-    int sigs[] = { SIGSEGV, SIGFPE, SIGILL, SIGABRT,
+    int sigs[] = {SIGSEGV, SIGFPE, SIGILL, SIGABRT,
 #ifdef SIGBUS
         SIGBUS,
 #endif
     };
     size_t i;
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_sp = altstack_mem;
+    ss.ss_size = sizeof(altstack_mem);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, NULL);
     memset(&act, 0, sizeof(act));
-    act.sa_sigaction = crash_handler;
+    act.sa_sigaction = linux_handler;
     sigemptyset(&act.sa_mask);
-    act.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    act.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
     for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++)
         sigaction(sigs[i], &act, NULL);
+#endif
 }
 
-#endif /* _WIN32 */
+#endif /* CRASH_DEBUG */
