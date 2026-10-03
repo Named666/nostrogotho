@@ -1,7 +1,7 @@
 #include "nhr_module.h"
 #include "nip_capability.h" /* registry types + composition functions */
 #include "nips/nip26.h"      /* nip26_check_delegation, nip26_extract_index_tags */
-#include "nips/nip42.h"      /* nip42_save_state, nip42_restore_state, nip42_* types */
+#include "nips/nip42.h"      /* nip42 auth API (stateless reload: no save/restore blob) */
 #include "crypto.h"
 #include "protocol/tag_iter.h"
 #include <string.h>
@@ -10,7 +10,6 @@
 
 static const Nhr_Host *g_host = NULL;
 static relay_config_t g_config = {0};
-static storage_context_t g_module_storage_adapter = {0};
 static nip_registry_t *g_module_registry = NULL;
 
 /* Session-auth + send shims: thin forwards to host services. Safe to call
@@ -165,12 +164,7 @@ static storage_insert_result_t module_storage_insert(const event_t *event,
     snprintf(result.error_message, sizeof(result.error_message), "not implemented");
 
     if (g_host && g_host->storage_insert_record) {
-        storage_tag_match_t *matches = NULL;
-        size_t match_count = 0;
-        if (!nip26_extract_index_tags(event, &matches, &match_count)) return result;
-        storage_insert_result_t insert_result = g_host->storage_insert_record(g_host->userdata, event, matches, match_count);
-        nip26_free_index_tags(matches, match_count);
-        return insert_result;
+        return g_host->storage_insert_record(g_host->userdata, event, tags, count);
     }
     return result;
 }
@@ -204,8 +198,6 @@ static storage_delete_result_t module_storage_delete_kind(int kind, const char *
     }
     return result;
 }
-
-/* module_storage_delete_matching deleted with the legacy predicate API. */
 
 /* New unified storage API - forwards to host NHR services */
 static bool module_storage_find_events(const storage_event_scope_t *scope,
@@ -306,30 +298,6 @@ static void module_storage_free_id_list(char **ids, size_t count) {
     }
 }
 
-static void module_storage_adapter_init(void) {
-    memset(&g_module_storage_adapter, 0, sizeof(g_module_storage_adapter));
-    g_module_storage_adapter.get_event_by_id = module_storage_get_event;
-    g_module_storage_adapter.insert_record = module_storage_insert;
-    g_module_storage_adapter.delete_record_by_id_and_pubkey = module_storage_delete_id;
-    g_module_storage_adapter.delete_record_by_kind_and_pubkey = module_storage_delete_kind;
-    /* delete_matching removed (legacy predicate API deleted). */
-    /* New unified storage API */
-    g_module_storage_adapter.find_events = module_storage_find_events;
-    g_module_storage_adapter.count_events = module_storage_count_events;
-    g_module_storage_adapter.delete_events = module_storage_delete_events;
-    g_module_storage_adapter.transaction_begin = module_storage_transaction_begin;
-    g_module_storage_adapter.transaction_commit = module_storage_transaction_commit;
-    g_module_storage_adapter.transaction_rollback = module_storage_transaction_rollback;
-    g_module_storage_adapter.delete_events_tx = module_storage_delete_events_tx;
-    g_module_storage_adapter.find_events_tx = module_storage_find_events_tx;
-    g_module_storage_adapter.upsert_replaceable = module_storage_upsert_replaceable;
-    g_module_storage_adapter.upsert_addressable = module_storage_upsert_addressable;
-    g_module_storage_adapter.find_ids_by_tags = module_storage_find_ids_by_tags;
-    g_module_storage_adapter.free_id_list = module_storage_free_id_list;
-    g_module_storage_adapter.init = NULL;
-    g_module_storage_adapter.deinit = NULL;
-}
-
 static bool module_check_event(const event_t *event) {
     if (!g_host || !g_host->crypto_check_event || !g_host->crypto_check_event(g_host->userdata, event)) return false;
     if (!event->tags_json) return true;
@@ -337,11 +305,13 @@ static bool module_check_event(const event_t *event) {
     tag_iter_init(&it, event);
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *name = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        tag_iter_init_tag(&sub, tag);
+        char *name = tag_iter_element(&sub, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = tag_iter_element(&it, 1);
-            char *conditions = tag_iter_element(&it, 2);
-            char *signature = tag_iter_element(&it, 3);
+            char *delegator = tag_iter_element(&sub, 1);
+            char *conditions = tag_iter_element(&sub, 2);
+            char *signature = tag_iter_element(&sub, 3);
             bool valid = delegator && conditions && signature &&
                          nip26_check_delegation(event, delegator, conditions, signature);
             free(delegator);
@@ -373,7 +343,6 @@ bool NHR_CALL nhr_module_init(const Nhr_Host *host, const relay_config_t *config
     g_host = host;
     g_config = *config;
     (void)storage_handle;
-    module_storage_adapter_init();
 
     g_module_registry = nip_registry_create();
     if (!g_module_registry) return false;
@@ -382,21 +351,13 @@ bool NHR_CALL nhr_module_init(const Nhr_Host *host, const relay_config_t *config
      * (constructors registered them at load time). */
     nip_registry_register_providers(g_module_registry);
 
-    for (nip_capability_t *cap = g_module_registry->capabilities; cap; cap = cap->next) {
-        if (cap->type == NIP_CAP_LIFECYCLE && cap->caps.lifecycle.init) {
-            cap->caps.lifecycle.init(config, cap->ctx);
-        }
-    }
+    nip_composition_run_init(g_module_registry, config);
     return true;
 }
 
 void NHR_CALL nhr_module_shutdown(void) {
     if (g_module_registry) {
-        for (nip_capability_t *cap = g_module_registry->capabilities; cap; cap = cap->next) {
-            if (cap->type == NIP_CAP_LIFECYCLE && cap->caps.lifecycle.shutdown) {
-                cap->caps.lifecycle.shutdown(cap->ctx);
-            }
-        }
+        nip_composition_run_shutdown(g_module_registry);
         /* Registry nodes are host- or module-owned heap copies; ctx blocks
          * are static or NULL (see nip_template.c), so there is nothing to
          * free here beyond the registry itself. */
@@ -405,7 +366,6 @@ void NHR_CALL nhr_module_shutdown(void) {
     }
     g_host = NULL;
     g_config = (relay_config_t){0};
-    memset(&g_module_storage_adapter, 0, sizeof(g_module_storage_adapter));
 }
 
 Nhr_State NHR_CALL nhr_module_pre_reload(void) {
@@ -440,4 +400,9 @@ void NHR_CALL nhr_module_register_capabilities(nip_registry_t *host_registry) {
     for (nip_capability_t *cap = g_module_registry->capabilities; cap; cap = cap->next) {
         nip_registry_register(host_registry, cap);
     }
+}
+
+unsigned nhr_module_count_leading_zero_bits(const char *hex) {
+    if (!g_host || !g_host->crypto_count_leading_zero_bits) return 0;
+    return g_host->crypto_count_leading_zero_bits(g_host->userdata, hex);
 }

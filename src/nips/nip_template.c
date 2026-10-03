@@ -32,8 +32,7 @@
  *   - Composition is deterministic, never registration-order dependent:
  *       publication policy : ALL must permit (AND)
  *       delivery policy    : ANY may veto
- *       kind handlers      : disjoint kinds; first ACCEPT wins, all
- *                            rejections are collected for the OK reason
+ *       kind handlers      : ALL matched consulted; any rejection wins (AND on accepted), broadcast/store are OR
  *       maintenance        : ALL run every interval tick
  *       EOSE/COUNT/metadata: FIRST non-NULL wins (explicit priority)
  *
@@ -161,6 +160,24 @@ static const char *nipxx_info_document(void *ctx) {
     return NULL;
 }
 
+/* Query policy: authorize REQ queries. */
+static bool nipxx_authorize_query(connection_id_t id, filter_t *filters, size_t count,
+                                   char *reason, size_t reason_size, void *ctx) {
+    (void)id; (void)filters; (void)count; (void)reason; (void)reason_size; (void)ctx;
+    return true;
+}
+
+/* Protocol response: custom EOSE/COUNT (optional). First non-NULL wins. */
+static char *nipxx_build_eose(const char *sub, bool has_more, bool auth_hint, void *ctx) {
+    (void)sub; (void)has_more; (void)auth_hint; (void)ctx;
+    return NULL;
+}
+
+static char *nipxx_build_count(const char *sub, unsigned long count, void *ctx) {
+    (void)sub; (void)count; (void)ctx;
+    return NULL;
+}
+
 /* ============================================================================
  * Capability descriptors — one per capability type you implement.
  * `ctx` points at the shared static above: no alloc, no leak, no
@@ -170,6 +187,7 @@ static const char *nipxx_info_document(void *ctx) {
  */
 
 static nip_capability_t nipxx_caps[] = {
+    /* Uncomment the capabilities your NIP actually needs:
     {
         .name = "nipxx-lifecycle", .type = NIP_CAP_LIFECYCLE, .ctx = &nipxx_ctx,
         .caps.lifecycle = { .init = nipxx_lifecycle_init, .shutdown = nipxx_lifecycle_shutdown },
@@ -178,7 +196,6 @@ static nip_capability_t nipxx_caps[] = {
         .name = "nipxx-connection", .type = NIP_CAP_CONNECTION, .ctx = &nipxx_ctx,
         .caps.connection = { .on_connect = nipxx_on_connect, .on_disconnect = nipxx_on_disconnect },
     },
-    /* Uncomment the capabilities your NIP actually needs:
     {
         .name = "nipxx-message", .type = NIP_CAP_MESSAGE_INTERCEPT, .ctx = &nipxx_ctx,
         .caps.message_intercept = { .on_message = nipxx_on_message },
@@ -196,12 +213,20 @@ static nip_capability_t nipxx_caps[] = {
         .caps.delivery_policy = { .can_deliver = nipxx_can_deliver },
     },
     {
+        .name = "nipxx-query", .type = NIP_CAP_QUERY_POLICY, .ctx = &nipxx_ctx,
+        .caps.query_policy = { .authorize_query = nipxx_authorize_query },
+    },
+    {
         .name = "nipxx-maintenance", .type = NIP_CAP_MAINTENANCE, .ctx = &nipxx_ctx,
         .caps.maintenance = { .timer = nipxx_timer, .interval_ms = 60 * 1000 },
     },
     {
         .name = "nipxx-metadata", .type = NIP_CAP_METADATA, .ctx = &nipxx_ctx,
         .caps.metadata = { .info_document = nipxx_info_document },
+    },
+    {
+        .name = "nipxx-protocol", .type = NIP_CAP_PROTOCOL_RESPONSE, .ctx = &nipxx_ctx,
+        .caps.protocol_response = { .build_eose = nipxx_build_eose, .build_count = nipxx_build_count },
     },
      */
 };

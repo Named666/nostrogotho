@@ -135,3 +135,11 @@ bool nip_env_accepts_event(const event_t *event) {
     return check_event(event);
 #endif
 }
+
+unsigned nip_env_count_leading_zero_bits(const char *hex) {
+#ifdef NHR_BUILD_MODULE
+    return nhr_module_count_leading_zero_bits(hex);
+#else
+    return count_leading_zero_bits(hex);
+#endif
+}

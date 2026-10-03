@@ -1,5 +1,7 @@
 /**
- * Automated live hot-reload test over WebSocket (all platforms).
+ * Test: Automated live hot-reload test over WebSocket (all platforms)
+ * NIPs: N/A (Hot-reload infrastructure)
+ * PLAN.md sections: §1.1 (Hot Reload Without State Loss - NHR), §1.3 (Host Services as ABI Boundary)
  *
  * Builds the policy module, starts a hot host, verifies REQ/EOSE on one
  * held-open connection, rebuilds the module (new generation), waits until
@@ -95,6 +97,7 @@ async function main() {
     { cwd: ROOT, stdio: 'ignore' },
   );
   const cleanupDb = () => {
+    // Give host time to release DB locks
     for (const s of ['', '-shm', '-wal', '-journal']) {
       try { fs.unlinkSync(dbPath + s); } catch { /* ignore */ }
     }
@@ -159,7 +162,9 @@ async function main() {
     failed = true;
     console.error(`FAIL: ${err.message}`);
   } finally {
+    // Kill host first, wait for it to exit and release DB locks, then cleanup
     host.kill();
+    await new Promise(resolve => setTimeout(resolve, 500));
     cleanupDb();
   }
   process.exit(failed ? 1 : 0);

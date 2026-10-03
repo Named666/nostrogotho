@@ -9,3 +9,7 @@ build/
 *.so
 *.old
 TODO.md
+node_modules/
+crashes/
+config.json
+.opencode/

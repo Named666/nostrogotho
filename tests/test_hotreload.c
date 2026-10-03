@@ -2,6 +2,10 @@
  * Hot-reload test: build a module, load it, evaluate its policy, rebuild
  * with a changed policy, reload, and verify the new policy is active.
  *
+ * NIPs: N/A (Hot-reload infrastructure - NHR)
+ * PLAN.md sections: §1.1 (Hot Reload Without State Loss - NHR), §1.3 (Host Services as ABI Boundary)
+ *                   §1.4 (Composability and Extensibility)
+ *
  * Each phase shells out to the system C compiler (same prerequisite as
  * nob itself) to build tests/hr_test_policy.c into a DLL/.so with a
  * different -DHR_POLICY_ALLOW flag. Loading mirrors src/nhr.c's

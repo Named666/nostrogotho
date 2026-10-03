@@ -1,3 +1,16 @@
+/* ============================================================================
+ * Unit tests for src/storage.c: escape_like, filter management
+ *
+ * NIPs: NIP-01 (event storage/query), NIP-09 (deletion), NIP-40 (expiration), NIP-45 (COUNT)
+ * Spec sections: NIP-01 § "Communication" (filter format), NIP-09 § "Deletion"
+ *                NIP-40 § "Expiration", NIP-45 § "COUNT"
+ * PLAN.md sections: §1.7 (Storage Layer - SQLite ORM, no NIP logic)
+ *
+ * Note: These are unit tests for storage utilities. Full storage integration
+ * tests (event persistence, query by filter, deletion, COUNT, expiration cleanup)
+ * should be added to exercise the storage layer through the host ABI.
+ * ============================================================================ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

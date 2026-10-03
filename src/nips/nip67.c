@@ -33,15 +33,7 @@ static char *nip67_build_eose_response_ex(const char *sub_id, bool has_more,
     json_builder_append_string(&builder, has_more ? "more" : "finish");
     json_builder_end_array(&builder);
 
-    const char *result = json_builder_finish(&builder);
-    if (!result) return NULL;
-
-    /* json_builder_finish returns a pointer to internal buffer,
-     * so duplicate it for the caller to own. */
-    char *dup = malloc(strlen(result) + 1);
-    if (!dup) return NULL;
-    strcpy(dup, result);
-    return dup;
+    return json_builder_dup(&builder);
 }
 
 /* Function must be defined before the static table below that references it. */

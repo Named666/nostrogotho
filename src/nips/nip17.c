@@ -7,15 +7,16 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "nips/nip42.h"      /* nip42_authenticated_pubkey_by_id */
-#include "nips/nip_env.h"    /* multi-pubkey session iteration */
+#include "nips/nip_env.h"    /* session auth only; no cross-NIP include per PLAN 1.2 */    /* multi-pubkey session iteration */
 #include "protocol/event_tags.h"
 #include "protocol/protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Gift-wrap kinds whose visibility may require NIP-42 auth. */
+/* Gift-wrap kinds whose visibility may require NIP-42 auth.
+ * NIP-17 names 1059; 21059 (NIP-59 ephemeral gift-wrap) is an intentional superset for live DMs.
+ * Ephemeral 20000-29999 are never stored (relay default), so this only gates live broadcast. */
 static bool nip17_targets_gift_wraps(const filter_t *filter) {
     if (!filter) return false;
     for (size_t i = 0; i < filter->kinds_count; i++) {
@@ -78,7 +79,7 @@ static bool nip17_protocol_response_needs_auth_hint(const filter_t *filters, siz
     (void)ctx;
     /* Unauthenticated gift-wrap subscriptions may hide results behind NIP-42
      * auth: hint the client (and refresh its challenge) before EOSE. */
-    if (nip42_authenticated_pubkey_by_id(connection_id)) return false;
+    if (nip_env_session_auth_count(connection_id) > 0) return false;
     if (!filters) return false;
     for (size_t i = 0; i < filters_count; i++) {
         if (nip17_targets_gift_wraps(&filters[i])) return true;

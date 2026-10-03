@@ -1,5 +1,8 @@
 /**
- * Linux integration test for module replacement without dropping a socket.
+ * Test: Linux integration test for module replacement without dropping a socket
+ * NIPs: N/A (Hot-reload infrastructure)
+ * PLAN.md sections: §1.1 (Hot Reload Without State Loss - NHR), §1.3 (Host Services as ABI Boundary)
+ *
  * Port of test_hotreload_integration.py.
  *
  * Starts a hot relay, connects a WebSocket, and publishes two module builds
@@ -14,7 +17,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { Conn, sleep, ROOT } from './relay.js';
+import { Conn, sleep, ROOT, authEvent, randomSecretKey, assert, withRelay } from './relay.js';
 
 const BUILD = path.join(ROOT, 'build');
 const FILTER = { ids: ['f'.repeat(64)] };
@@ -59,34 +62,48 @@ async function waitForEose(conn, subId) {
 }
 
 async function verifySocket(uri, relayProc, generations) {
-  const conn = await Conn.open(uri, 10000);
-  try {
-    conn.sendJson(['REQ', 'before', FILTER]);
-    await waitForEose(conn, 'before');
-    for (let i = 0; i < 2; i++) {
-      const r = spawnSync(path.join(BUILD, 'nob_configed'), ['-module-only'], {
-        cwd: ROOT,
-        stdio: 'ignore',
-      });
-      if (r.status !== 0) throw new Error('module-only rebuild failed');
-      const deadline = Date.now() + 20000;
-      for (;;) {
-        const current = loadedGenerations(relayProc.pid);
-        if (current.size > 0 && ![...current].every((g) => generations.has(g))) {
-          generations = current;
-          break;
-        }
-        if (Date.now() > deadline) throw new Error('host did not load a new module generation');
-        await sleep(100);
+  await withRelay(0, async () => {
+    // withRelay won't work here since we're connecting to an external relay
+    // Just use Conn directly
+    const conn = await Conn.open(uri, 10000);
+    try {
+      // Handle AUTH
+      const first = await conn.next(5000);
+      if (first && first[0] === 'AUTH') {
+        conn.sendJson(['AUTH', authEvent(randomSecretKey(), uri, first[1])]);
+        const ok = await conn.waitFor((m) => m[0] === 'OK', 5000, 'OK');
+        assert(ok[2] === true, `AUTH must succeed, got ${JSON.stringify(ok)}`);
+      } else if (first) {
+        conn.queue.unshift(first);
       }
-      const subId = `after-${i}`;
-      conn.sendJson(['REQ', subId, FILTER]);
-      await waitForEose(conn, subId);
+
+      conn.sendJson(['REQ', 'before', FILTER]);
+      await waitForEose(conn, 'before');
+      for (let i = 0; i < 2; i++) {
+        const r = spawnSync(path.join(BUILD, 'nob_configed'), ['-module-only'], {
+          cwd: ROOT,
+          stdio: 'ignore',
+        });
+        if (r.status !== 0) throw new Error('module-only rebuild failed');
+        const deadline = Date.now() + 20000;
+        for (;;) {
+          const current = loadedGenerations(relayProc.pid);
+          if (current.size > 0 && ![...current].every((g) => generations.has(g))) {
+            generations = current;
+            break;
+          }
+          if (Date.now() > deadline) throw new Error('host did not load a new module generation');
+          await sleep(100);
+        }
+        const subId = `after-${i}`;
+        conn.sendJson(['REQ', subId, FILTER]);
+        await waitForEose(conn, subId);
+      }
+      console.log('PASS: two module publications preserved the WebSocket and query path');
+    } finally {
+      await conn.close();
     }
-    console.log('PASS: two module publications preserved the WebSocket and query path');
-  } finally {
-    await conn.close();
-  }
+  });
 }
 
 async function main() {

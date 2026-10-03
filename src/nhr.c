@@ -419,7 +419,6 @@ bool nhr_runtime_init(Nhr_Runtime *runtime, storage_context_t *storage,
     runtime->services.storage_get_event_copy = host_storage_get_event;
     runtime->services.storage_delete_by_id_and_pubkey = host_storage_delete_id;
     runtime->services.storage_delete_by_kind_and_pubkey = host_storage_delete_kind;
-    /* storage_delete_matching removed (legacy predicate API deleted). */
     runtime->services.storage_find_events = host_storage_find_events;
     runtime->services.storage_count_events = host_storage_count_events;
     runtime->services.storage_delete_events = host_storage_delete_events;
@@ -487,11 +486,11 @@ bool nhr_runtime_activate_candidate(Nhr_Runtime *runtime,
     Nhr_Library old;
     Nhr_State state;
     char candidate_source_path[sizeof(candidate->loaded_path)];
-    char old_loaded_path[sizeof(runtime->loaded_path)];
+    char old_published_path[sizeof(runtime->published_path)];
     if (!runtime || !candidate || !candidate->handle || !runtime->library.handle) return false;
     snprintf(candidate_source_path, sizeof(candidate_source_path), "%s",
              candidate->source_path);
-    snprintf(old_loaded_path, sizeof(old_loaded_path), "%s", runtime->loaded_path);
+    snprintf(old_published_path, sizeof(old_published_path), "%s", runtime->published_path);
     /* PRE_RELOAD -> SHUTDOWN -> UNLOAD -> fresh LOAD/ABI VALIDATION ->
      * POST_RELOAD -> RUN. No module callback can be running here: this is
      * invoked synchronously from the host event-loop timer. */
@@ -523,13 +522,13 @@ bool nhr_runtime_activate_candidate(Nhr_Runtime *runtime,
         }
         Nhr_Library fallback;
         memset(&fallback, 0, sizeof(fallback));
-        if (nhr_runtime_load_generation(runtime, old_loaded_path, &fallback) &&
+        if (nhr_runtime_load_generation(runtime, old_published_path, &fallback) &&
             fallback.api.post_reload(&runtime->services, &runtime->config,
                                      &runtime->module_storage, state)) {
             runtime->library = fallback;
             runtime->active = fallback.api;
             runtime->generation++;
-            snprintf(runtime->published_path, sizeof(runtime->published_path), "%s", old_loaded_path);
+            snprintf(runtime->published_path, sizeof(runtime->published_path), "%s", old_published_path);
             snprintf(runtime->loaded_path, sizeof(runtime->loaded_path), "%s", fallback.loaded_path);
         } else {
             if (fallback.handle) fallback.api.shutdown();

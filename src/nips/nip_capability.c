@@ -38,6 +38,7 @@ void nip_registry_destroy(nip_registry_t *registry) {
     nip_capability_t *cap = registry->capabilities;
     while (cap) {
         nip_capability_t *next = cap->next;
+        free((void *)cap->name);
         free(cap);
         cap = next;
     }
@@ -45,13 +46,17 @@ void nip_registry_destroy(nip_registry_t *registry) {
 }
 
 void nip_registry_register(nip_registry_t *registry, const nip_capability_t *capability) {
-    if (!registry || !capability) return;
+    if (!registry || !capability || !capability->name) return;
     
     nip_capability_t *node = malloc(sizeof(*node));
     if (!node) return;
     
     *node = *capability;
     node->name = strdup(capability->name);
+    if (!node->name) {
+        free(node);
+        return;
+    }
     node->next = registry->capabilities;
     registry->capabilities = node;
     registry->count++;
@@ -149,14 +154,20 @@ nip_kind_composition_result_t nip_composition_process_kind(nip_registry_t *regis
                 if (!r.accepted) {
                     result.result.accepted = false;
                     saw_reject = true;
-                    strncpy(result.result.response_msg, r.response_msg, sizeof(result.result.response_msg) - 1);
+                    snprintf(result.result.response_msg, sizeof(result.result.response_msg), "%s", r.response_msg);
                 } else if (!saw_reject && !result.result.accepted) {
                     result.result.accepted = true;
                 }
-                if (r.should_broadcast) result.result.should_broadcast = true;
-                if (r.should_store) result.result.should_store = true;
+                /* Broadcast/store are OR-composed only from accepted handlers.
+                 * The relay gates on accepted && should_broadcast, but keeping
+                 * rejected handlers from setting these avoids misleading
+                 * composition results. */
+                if (r.accepted) {
+                    if (r.should_broadcast) result.result.should_broadcast = true;
+                    if (r.should_store) result.result.should_store = true;
+                }
                 if (r.response_msg[0] && result.result.response_msg[0] == '\0') {
-                    strncpy(result.result.response_msg, r.response_msg, sizeof(result.result.response_msg) - 1);
+                    snprintf(result.result.response_msg, sizeof(result.result.response_msg), "%s", r.response_msg);
                 }
             }
         }
@@ -256,4 +267,66 @@ void nip_composition_send_auth_challenge(nip_registry_t *registry,
             cap->caps.protocol_response.send_auth_challenge(connection_id, cap->ctx);
         }
     }
+}
+
+/* Lifecycle: run all init/shutdown hooks */
+void nip_composition_run_init(nip_registry_t *registry, const relay_config_t *config) {
+    if (!registry) return;
+    for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
+        if (cap->type == NIP_CAP_LIFECYCLE && cap->caps.lifecycle.init) {
+            cap->caps.lifecycle.init(config, cap->ctx);
+        }
+    }
+}
+
+void nip_composition_run_shutdown(nip_registry_t *registry) {
+    if (!registry) return;
+    for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
+        if (cap->type == NIP_CAP_LIFECYCLE && cap->caps.lifecycle.shutdown) {
+            cap->caps.lifecycle.shutdown(cap->ctx);
+        }
+    }
+}
+
+/* Connection: notify all connection caps */
+void nip_composition_notify_connect(nip_registry_t *registry, uintptr_t connection_id) {
+    if (!registry) return;
+    for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
+        if (cap->type == NIP_CAP_CONNECTION && cap->caps.connection.on_connect) {
+            cap->caps.connection.on_connect(connection_id, cap->ctx);
+        }
+    }
+}
+
+void nip_composition_notify_disconnect(nip_registry_t *registry, uintptr_t connection_id) {
+    if (!registry) return;
+    for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
+        if (cap->type == NIP_CAP_CONNECTION && cap->caps.connection.on_disconnect) {
+            cap->caps.connection.on_disconnect(connection_id, cap->ctx);
+        }
+    }
+}
+
+/* Message intercept: first true wins */
+bool nip_composition_on_message(nip_registry_t *registry, uintptr_t connection_id,
+                                 const protocol_message_t *msg) {
+    if (!registry) return false;
+    for (nip_capability_t *cap = registry->capabilities; cap; cap = cap->next) {
+        if (cap->type == NIP_CAP_MESSAGE_INTERCEPT && cap->caps.message_intercept.on_message) {
+            if (cap->caps.message_intercept.on_message(connection_id, msg, cap->ctx)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void nip_capability_clear_providers(void) {
+    nip_provider_node_t *n = providers;
+    while (n) {
+        nip_provider_node_t *next = n->next;
+        free(n);
+        n = next;
+    }
+    providers = NULL;
 }

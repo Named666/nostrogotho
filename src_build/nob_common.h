@@ -28,8 +28,7 @@ static bool nob_add_nip_sources(Cmd *cmd) {
         const char *name = path_name(nips.items[i]);
         size_t len = strlen(name);
         if (len < 3 || strcmp(name + len - 2, ".c") != 0 ||
-            strcmp(name, "nip_template.c") == 0 ||
-            strcmp(name, "nip_composition_policy.c") == 0) continue;
+            strcmp(name, "nip_template.c") == 0) continue;
         nob_cmd_append(cmd, nob_temp_sprintf("%s%s", nips_dir, name));
     }
     free(nips.items);
@@ -181,8 +180,7 @@ static void nob_handle_stop_signal(int signal_number) {
     SRC_FOLDER"protocol/filter_builder.h", SRC_FOLDER"protocol/filter_builder.c", \
     SRC_FOLDER"protocol/tag_iter.h", SRC_FOLDER"protocol/tag_iter.c", \
     SRC_FOLDER"protocol/event_tags.h", SRC_FOLDER"protocol/event_tags.c", \
-    SRC_FOLDER"nips/nip_capability.h", SRC_FOLDER"nips/nip_capability.c", \
-    SRC_FOLDER"nips/nip_macros.h"
+    SRC_FOLDER"nips/nip_capability.h", SRC_FOLDER"nips/nip_capability.c"
 
 /* Build the reloadable module under a staging name, then atomically publish.
  * A failed compile never touches the last good artifact. */
@@ -233,13 +231,11 @@ static bool nob_build_host(bool dynamic_module) {
     nob_cc_inputs(&cmd, NOB_HOST_SOURCES, SRC_FOLDER"nhr.c", NOB_OS_NHR_SRC,
                   NOB_THIRD_PARTY_SOURCES);
     if (dynamic_module) {
-        /* Hot-reload host: link registry + infrastructure explicitly.
+        /* Hot-reload host: link registry explicitly.
          * NIP implementations live in the DLL, so we don't glob them. */
-        nob_cmd_append(&cmd, SRC_FOLDER"nips/nip_capability.c",
-                       SRC_FOLDER"nips/nip_composition_policy.c");
+        nob_cmd_append(&cmd, SRC_FOLDER"nips/nip_capability.c");
     } else {
-        /* Monolithic host: glob all NIP sources including infrastructure. */
-        nob_cmd_append(&cmd, SRC_FOLDER"nips/nip_composition_policy.c");
+        /* Monolithic host: glob all NIP sources. */
         if (!nob_add_nip_sources(&cmd)) return false;
     }
     nob_cmd_append(&cmd, NOB_OS_LIBS);
@@ -271,7 +267,6 @@ static bool nob_build_asan(void) {
     nob_cc_output(&cmd, BUILD_FOLDER"main_asan");
     nob_cc_inputs(&cmd, NOB_HOST_SOURCES, SRC_FOLDER"nhr.c", NOB_OS_NHR_SRC,
                   NOB_THIRD_PARTY_SOURCES);
-    nob_cmd_append(&cmd, SRC_FOLDER"nips/nip_composition_policy.c");
     if (!nob_add_nip_sources(&cmd)) return false;
     nob_cmd_append(&cmd, NOB_OS_LIBS);
     return cmd_run(&cmd);
@@ -708,7 +703,6 @@ static int nob_build_and_run_tests(void) {
         NOB_TEST_NHR_PLATFORM,
         SRC_FOLDER"nips/nip26.c",
         SRC_FOLDER"nips/nip_capability.c",
-        SRC_FOLDER"nips/nip_composition_policy.c",
         THIRD_PARTY_FOLDER"mongoose/mongoose.c",
         THIRD_PARTY_FOLDER"sqlite3.c",
     };

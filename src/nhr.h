@@ -30,12 +30,15 @@ typedef struct connection_snapshot connection_snapshot_t;
 #define NHR_EXPORT __attribute__((visibility("default")))
 #endif
 
-/* v5 removed storage_delete_matching (predicate callback across the hot
- * reload boundary). v4 changes relay_config_t layout (owned string buffers,
+/* v7 removed modify_results from nip_query_policy_capability_t (never dispatched).
+ * v6 removed composition.* and nip42.* toggles from relay_config_t
+ * (auth is always required; combinators are hardcoded). v5 removed
+ * storage_delete_matching (predicate callback across the hot reload
+ * boundary). v4 changed relay_config_t layout (owned string buffers,
  * verbosity enum replacing bool debug_logging, nip42/hot_reload sections).
  * v3 added the multi-pubkey session services. Rebuild host and module
  * together on version change. */
-#define NHR_ABI_VERSION 5u
+#define NHR_ABI_VERSION 7u
 #define NHR_STATE_VERSION 1u
 
 typedef struct {

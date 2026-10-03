@@ -2,6 +2,10 @@
  * Fuzz tests for src/json_util.c: json_array_parse + json_parse_event
  * (+ json_parse_filter as a bonus target — same harness).
  *
+ * NIPs: NIP-01 (REQ, EVENT, AUTH, COUNT message format), NIP-42 (AUTH), NIP-45 (COUNT)
+ * Spec sections: NIP-01 § "Communication", NIP-42 § "Authentication Flow", NIP-45 § "COUNT"
+ * PLAN.md sections: §1.5 (Protocol/Transport Boundary), §1.6 (Composable REQ filter -> SQL)
+ *
  * Deterministic structured fuzzing: a fixed-seed xorshift64* PRNG mutates a
  * corpus of real protocol frames. No sanitizer is available in this
  * toolchain, so the harness leans on checkable invariants instead:

@@ -1,3 +1,14 @@
+/* ============================================================================
+ * Security regression tests for src/json_util.c
+ *
+ * NIPs: NIP-01 (REQ filter parsing, event serialization), NIP-45 (COUNT filter)
+ * Spec sections: NIP-01 § "Communication" (REQ, EVENT, COUNT message format)
+ *                NIP-45 § "COUNT"
+ * PLAN.md sections: §1.5 (Protocol/Transport Boundary), §1.6 (Composable REQ filter -> SQL)
+ *
+ * Tests cover fixed buffer overflows, parser limits, and serialization bounds.
+ * ============================================================================ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

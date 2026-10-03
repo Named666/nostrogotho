@@ -335,3 +335,49 @@ export class Relay {
 export function assert(cond, message) {
   if (!cond) throw new Error(`assert: ${message}`);
 }
+
+/**
+ * Run a test function with a relay that is guaranteed to be cleaned up.
+ * Handles cleanup even if the test throws or the relay fails to start.
+ *
+ * @param {number} port - Port for the relay
+ * @param {Function} fn - Async function receiving the relay instance
+ * @param {string[]} extraArgs - Extra arguments to pass to the relay
+ * @param {Object} envOverrides - Environment variable overrides
+ * @returns {Promise<any>} Return value of fn
+ */
+export async function withRelay(port, fn, extraArgs = [], envOverrides = {}) {
+  const relay = new Relay(port);
+  try {
+    await relay.start(extraArgs, envOverrides);
+    return await fn(relay);
+  } finally {
+    await relay.stop();
+  }
+}
+
+/**
+ * Run a test with a relay and an authenticated connection.
+ * Guarantees cleanup of both relay and connection.
+ *
+ * @param {number} port - Port for the relay
+ * @param {Function} fn - Async function receiving { relay, conn, ok }
+ * @param {Uint8Array} sk - Secret key to authenticate with (default: testSecretKey)
+ * @param {string[]} extraArgs - Extra arguments to pass to the relay
+ * @param {Object} envOverrides - Environment variable overrides
+ * @returns {Promise<any>} Return value of fn
+ */
+export async function withAuthConn(port, fn, sk = testSecretKey(), extraArgs = [], envOverrides = {}) {
+  const relay = new Relay(port);
+  try {
+    await relay.start(extraArgs, envOverrides);
+    const { conn, ok } = await relay.connectAndAuth(sk);
+    try {
+      return await fn({ relay, conn, ok });
+    } finally {
+      await conn.close();
+    }
+  } finally {
+    await relay.stop();
+  }
+}

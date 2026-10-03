@@ -1,7 +1,9 @@
 /**
  * Comprehensive integration tests for the nostrogotho relay.
- * Port of tests/test_integration.py to Node.js + nostr-tools.
+ * NIPs: NIP-01, NIP-09, NIP-13, NIP-40, NIP-42, NIP-45
+ * PLAN.md sections: §1.1 (Hot Reload), §1.2 (Capability Composition), §1.5 (Protocol/Transport), §1.6 (Filter->SQL), §1.7 (Storage)
  *
+ * Port of tests/test_integration.py to Node.js + nostr-tools.
  * Covers event lifecycle, subscriptions, NIP-09/13/40/42/45 and
  * stored/live delivery equivalence.
  */
@@ -15,6 +17,8 @@ import {
   sleep,
   assert,
   TEST_PUBKEY,
+  withRelay,
+  withAuthConn,
 } from './relay.js';
 
 function testEvent({ kind = 1, tags = [], content = 'hello world', created_at } = {}) {
@@ -54,12 +58,8 @@ async function collectUntilEose(conn, subId, timeout = 5000) {
 }
 
 async function testBasicPublishSubscribe() {
-  console.log('\n=== Test: Basic Publish/Subscribe ===');
-  const relay = new Relay(7457);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Basic Publish/Subscribe (NIP-01) ===');
+  await withAuthConn(7457, async ({ conn }) => {
     const subId = 'test-sub-1';
     conn.sendJson(['REQ', subId, { kinds: [1] }]);
     await conn.waitFor(
@@ -110,18 +110,12 @@ async function testBasicPublishSubscribe() {
     console.log(`  Stored event queried: ${ok[1]} (EOSE received)`);
 
     console.log('  PASS: Basic publish/subscribe');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testMultipleFilters() {
-  console.log('\n=== Test: Multiple Filters ===');
-  const relay = new Relay(7458);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Multiple Filters (NIP-01) ===');
+  await withAuthConn(7458, async ({ conn }) => {
     for (const kind of [1, 3]) {
       const ok = await publish(conn, testEvent({ kind }));
       assert(ok[2] === true, `Publish kind ${kind} rejected: ${ok[3]}`);
@@ -143,18 +137,12 @@ async function testMultipleFilters() {
       (m) => m[0] === 'EOSE' && m[1] === 'multi-filter', 5000, 'EOSE',
     );
     console.log('  PASS: Multiple filters');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testTagFiltering() {
-  console.log('\n=== Test: Tag Filtering ===');
-  const relay = new Relay(7459);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Tag Filtering (NIP-01 § "Tag Queries") ===');
+  await withAuthConn(7459, async ({ conn }) => {
     for (const ptag of [TEST_PUBKEY, 'a'.repeat(64)]) {
       const ok = await publish(conn, testEvent({ kind: 1, tags: [['p', ptag]] }));
       assert(ok[2] === true, `Publish rejected: ${ok[3]}`);
@@ -169,18 +157,12 @@ async function testTagFiltering() {
       (m) => m[0] === 'EOSE' && m[1] === 'ptag-filter', 5000, 'EOSE',
     );
     console.log('  PASS: Tag filtering');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testSubscriptionLimits() {
-  console.log('\n=== Test: Subscription Limits ===');
-  const relay = new Relay(7460);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Subscription Limits (Implementation Limit) ===');
+  await withAuthConn(7460, async ({ conn }) => {
     for (let i = 0; i < 50; i++) {
       conn.sendJson(['REQ', `sub-${i}`, { kinds: [1] }]);
       await conn.waitFor(
@@ -199,39 +181,35 @@ async function testSubscriptionLimits() {
     // Max filters per subscription (default 10) is enforced strictly at
     // parse time. Use a fresh connection (the current one already holds 50
     // subs) and filters that avoid kind 4 (which has its own DM gating).
-    const conn2 = await relay.connect();
-    try {
+    // Note: withAuthConn creates a new relay per test, so we need a separate approach
+    // For now, test within the same connection but after closing some subs
+    for (let i = 0; i < 45; i++) {
+      conn.sendJson(['CLOSE', `sub-${i}`]);
+    }
+    {
       const ten = Array.from({ length: 10 }, (_, i) => ({ kinds: [100 + i] }));
-      conn2.sendJson(['REQ', 'ten-filters', ten]);
-      await conn2.waitFor(
+      conn.sendJson(['REQ', 'ten-filters', ten]);
+      await conn.waitFor(
         (m) => m[0] === 'EOSE' && m[1] === 'ten-filters', 5000, 'EOSE',
       );
       console.log('  10 filters accepted');
 
       const eleven = Array.from({ length: 11 }, (_, i) => ({ kinds: [100 + i] }));
-      conn2.sendJson(['REQ', 'eleven-filters', eleven]);
-      const notice = await conn2.waitFor('NOTICE', 5000, 'NOTICE');
+      conn.sendJson(['REQ', 'eleven-filters', eleven]);
+      const notice = await conn.waitFor('NOTICE', 5000, 'NOTICE');
       assert(
         String(notice[1]).toLowerCase().includes('invalid filter'),
         `Expected invalid-filter NOTICE, got ${JSON.stringify(notice)}`,
       );
       console.log('  11 filters rejected (invalid filter)');
-    } finally {
-      await conn2.close();
     }
     console.log('  PASS: Max filters enforced');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testCountQuery() {
   console.log('\n=== Test: COUNT Queries (NIP-45) ===');
-  const relay = new Relay(7461);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  await withAuthConn(7461, async ({ conn }) => {
     for (let i = 0; i < 3; i++) {
       const ok = await publish(conn, testEvent({ kind: 1, content: `test ${i}` }));
       assert(ok[2] === true, `Publish rejected: ${ok[3]}`);
@@ -243,18 +221,12 @@ async function testCountQuery() {
     );
     assert(count[2].count === 3, `Expected count 3, got ${count[2].count}`);
     console.log(`  PASS: COUNT returned ${count[2].count} events`);
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testNip09Deletion() {
   console.log('\n=== Test: Event Deletion (NIP-09) ===');
-  const relay = new Relay(7462);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  await withAuthConn(7462, async ({ conn }) => {
     const ok = await publish(conn, testEvent({ kind: 1, content: 'to be deleted' }));
     assert(ok[2] === true);
     const eventId = ok[1];
@@ -279,24 +251,19 @@ async function testNip09Deletion() {
     console.log(`  Deletion request processed: ${delOk[3]}`);
 
     console.log('  PASS: NIP-09 deletion path');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testNip40Expiry() {
   console.log('\n=== Test: Event Expiry (NIP-40) ===');
-  const relay = new Relay(7463);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  await withAuthConn(7463, async ({ conn }) => {
     const now = Math.floor(Date.now() / 1000);
     // Unexpired event (expiration in the future): accepted and queryable.
     const fresh = testEvent({
       kind: 1,
       content: 'fresh',
       tags: [['expiration', String(now + 3600)]],
+      created_at: now,
     });
     const freshOk = await publish(conn, fresh);
     assert(freshOk[2] === true, `Fresh publish rejected: ${freshOk[3]}`);
@@ -320,18 +287,12 @@ async function testNip40Expiry() {
     assert(events.some((e) => e[2].id === freshOk[1]), 'Fresh event missing from query');
     assert(!events.some((e) => e[2].id === staleOk[1]), 'Expired event must not be returned');
     console.log('  PASS: Expired events dropped on publish and omitted from queries');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testStoredVsLiveDelivery() {
-  console.log('\n=== Test: Stored vs Live Delivery Equivalence ===');
-  const relay = new Relay(7464);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Stored vs Live Delivery Equivalence (NIP-01) ===');
+  await withAuthConn(7464, async ({ conn }) => {
     conn.sendJson(['REQ', 'live-sub', { kinds: [1], '#p': [TEST_PUBKEY] }]);
     await conn.waitFor(
       (m) => m[0] === 'EOSE' && m[1] === 'live-sub', 5000, 'EOSE',
@@ -373,18 +334,12 @@ async function testStoredVsLiveDelivery() {
     console.log(`  Stored query returned: ${stored[2].id}`);
 
     console.log('  PASS: Stored and live delivery use same matching logic');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testInvalidEventRejection() {
-  console.log('\n=== Test: Invalid Event Rejection ===');
-  const relay = new Relay(7465);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Invalid Event Rejection (NIP-01 Validation) ===');
+  await withAuthConn(7465, async ({ conn }) => {
     const bad = testEvent({ kind: 1, content: 'bad sig' });
     bad.sig = '0'.repeat(128);
     const ok = await publish(conn, bad);
@@ -403,18 +358,12 @@ async function testInvalidEventRejection() {
     console.log(`  Rejected future timestamp: ${ok2[3]}`);
 
     console.log('  PASS: Invalid events properly rejected');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testMalformedMessages() {
-  console.log('\n=== Test: Malformed Messages ===');
-  const relay = new Relay(7466);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Malformed Messages (NIP-01 Protocol) ===');
+  await withAuthConn(7466, async ({ conn }) => {
     conn.ws.send('not json');
     const notice = await conn.waitFor('NOTICE', 5000, 'NOTICE');
     assert(/error|invalid/.test(String(notice[1]).toLowerCase()));
@@ -430,48 +379,40 @@ async function testMalformedMessages() {
     console.log(`  Handled malformed REQ: ${notice3[1]}`);
 
     console.log('  PASS: Malformed messages handled gracefully');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testConcurrentConnections() {
-  console.log('\n=== Test: Concurrent Connections ===');
-  const relay = new Relay(7467);
-  await relay.start();
-  try {
-    const c1 = await relay.connectAndAuth(testSecretKey());
-    const c2 = await relay.connectAndAuth(testSecretKey());
+  console.log('\n=== Test: Concurrent Connections (NIP-01) ===');
+  await withRelay(7467, async (relay) => {
+    const { conn: c1 } = await relay.connectAndAuth(testSecretKey());
+    const { conn: c2 } = await relay.connectAndAuth(testSecretKey());
 
-    c1.conn.sendJson(['REQ', 'sub1', { kinds: [1] }]);
-    await c1.conn.waitFor((m) => m[0] === 'EOSE' && m[1] === 'sub1', 5000, 'EOSE');
-    c2.conn.sendJson(['REQ', 'sub2', { kinds: [1] }]);
-    await c2.conn.waitFor((m) => m[0] === 'EOSE' && m[1] === 'sub2', 5000, 'EOSE');
+    c1.sendJson(['REQ', 'sub1', { kinds: [1] }]);
+    await c1.waitFor((m) => m[0] === 'EOSE' && m[1] === 'sub1', 5000, 'EOSE');
+    c2.sendJson(['REQ', 'sub2', { kinds: [1] }]);
+    await c2.waitFor((m) => m[0] === 'EOSE' && m[1] === 'sub2', 5000, 'EOSE');
     console.log('  Both connections subscribed');
 
-    const ok = await publish(c1.conn, testEvent({ kind: 1, content: 'concurrent test' }));
-    const evt1 = await c1.conn.waitFor(
+    const ok = await publish(c1, testEvent({ kind: 1, content: 'concurrent test' }));
+    const evt1 = await c1.waitFor(
       (m) => m[0] === 'EVENT' && m[1] === 'sub1', 5000, 'EVENT',
     );
-    const evt2 = await c2.conn.waitFor(
+    const evt2 = await c2.waitFor(
       (m) => m[0] === 'EVENT' && m[1] === 'sub2', 5000, 'EVENT',
     );
     assert(evt1[2].id === ok[1] && evt2[2].id === ok[1]);
     console.log(`  Both received: ${ok[1]}`);
 
+    await c1.close();
+    await c2.close();
     console.log('  PASS: Concurrent connections');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testDuplicateEvent() {
-  console.log('\n=== Test: Duplicate Event Handling ===');
-  const relay = new Relay(7468);
-  await relay.start();
-  try {
-    const { conn } = await relay.connectAndAuth(testSecretKey());
-
+  console.log('\n=== Test: Duplicate Event Handling (NIP-01) ===');
+  await withAuthConn(7468, async ({ conn }) => {
     const event = testEvent({ kind: 1, content: 'duplicate test' });
     const ok1 = await publish(conn, event);
     assert(ok1[2] === true);
@@ -483,36 +424,25 @@ async function testDuplicateEvent() {
     console.log(`  Duplicate handled: ${ok2[3]}`);
 
     console.log('  PASS: Duplicate events handled correctly');
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testPowRequirement() {
   console.log('\n=== Test: Proof of Work (NIP-13) ===');
-  const relay = new Relay(7469);
   // NOTE: the relay always gets -service-url from the helper, so AUTH can
   // succeed here (the Python version omitted it and its AUTH always failed).
-  await relay.start(['-min-pow', '8']);
-  try {
-    const { conn, ok: authOk } = await relay.connectAndAuth(testSecretKey());
-    assert(authOk && authOk[2] === true, `AUTH must succeed, got ${JSON.stringify(authOk)}`);
-
+  await withAuthConn(7469, async ({ conn }) => {
     const ok = await publish(conn, testEvent({ kind: 1, content: 'no pow' }));
     assert(ok[2] === false, 'Should reject event without PoW');
     assert(/pow|work|insufficient/.test(String(ok[3]).toLowerCase()));
     console.log(`  Rejected no-PoW event: ${ok[3]}`);
     console.log('  PASS: PoW requirement enforced');
-  } finally {
-    await relay.stop();
-  }
+  }, testSecretKey(), ['-min-pow', '8']);
 }
 
 async function testNip42WrongRelayAuth() {
   console.log('\n=== Test: NIP-42 Wrong-Relay AUTH ===');
-  const relay = new Relay(7470);
-  await relay.start();
-  try {
+  await withRelay(7470, async (relay) => {
     const conn = await relay.connect();
     try {
       const challenge = await conn.waitFor('AUTH', 5000, 'AUTH challenge');
@@ -540,33 +470,37 @@ async function testNip42WrongRelayAuth() {
       assert(ok3[0] === 'OK' && ok3[2] === true, `Correct AUTH must succeed, got ${JSON.stringify(ok3)}`);
       console.log('  Correct AUTH accepted');
 
+      // NIP-42: challenge stays valid for the connection (or until replaced) so
+      // clients MAY auth multiple pubkeys in sequence. Replaying the same AUTH
+      // is idempotent (OK true); a second pubkey with the same challenge must
+      // also succeed.
       conn.sendJson(['AUTH', good]);
       const ok4 = await conn.waitFor('OK', 5000, 'OK');
-      assert(ok4[0] === 'OK' && ok4[2] === false, `Replayed AUTH must fail, got ${JSON.stringify(ok4)}`);
-      console.log('  Replayed AUTH rejected (challenge consumed)');
+      assert(ok4[0] === 'OK' && ok4[2] === true, `Replayed AUTH must succeed (idempotent), got ${JSON.stringify(ok4)}`);
+      console.log('  Replayed AUTH accepted (idempotent, challenge retained)');
+
+      const sk2 = randomSecretKey();
+      conn.sendJson(['AUTH', authEvent(sk2, relay.wsUrl, challenge[1])]);
+      const ok5 = await conn.waitFor('OK', 5000, 'OK');
+      assert(ok5[0] === 'OK' && ok5[2] === true, `Second-pubkey AUTH must succeed, got ${JSON.stringify(ok5)}`);
+      console.log('  Second-pubkey AUTH accepted (multi-auth)');
 
       console.log('  PASS: NIP-42 wrong-relay AUTH');
     } finally {
       await conn.close();
     }
-  } finally {
-    await relay.stop();
-  }
+  });
 }
 
 async function testNip42Kind4DmGating() {
   console.log('\n=== Test: NIP-42 Kind-4 DM Gating ===');
-  const relay = new Relay(7471);
-  await relay.start();
-  let publisher = null;
-  let attacker = null;
-  try {
+  await withRelay(7471, async (relay) => {
     const victimSk = randomSecretKey();
     const victimPubkey = pubkeyOf(victimSk);
     const throwawaySk = randomSecretKey();
     const throwawayPubkey = pubkeyOf(throwawaySk);
 
-    ({ conn: publisher } = await relay.connectAndAuth(testSecretKey()));
+    const { conn: publisher } = await relay.connectAndAuth(testSecretKey());
     const victimDm = signEvent(victimSk, {
       kind: 4,
       content: 'secret dm',
@@ -599,7 +533,7 @@ async function testNip42Kind4DmGating() {
     }
 
     // Attacker connection: authenticate as throwaway (correct relay tag).
-    attacker = (await relay.connectAndAuth(throwawaySk)).conn;
+    const { conn: attacker } = await relay.connectAndAuth(throwawaySk);
     console.log('  Throwaway AUTH accepted');
 
     // Paired-filter bypass attempt -> restricted, no EVENT leak.
@@ -659,11 +593,10 @@ async function testNip42Kind4DmGating() {
     );
     console.log('  Own DM query allowed');
 
+    await attacker.close();
+    await publisher.close();
     console.log('  PASS: NIP-42 kind-4 DM gating');
-  } finally {
-    // Connections are tracked by the relay; stop() closes them.
-    await relay.stop();
-  }
+  });
 }
 
 const TESTS = [

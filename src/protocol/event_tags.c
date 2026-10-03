@@ -180,7 +180,10 @@ char *event_tag_value(const event_t *event, const char *name) {
  * Existence / Counting
  * ============================================================================ */
 bool event_tag_has(const event_t *event, const char *name) {
-    return event_tag_value(event, name) != NULL;
+    char *v = event_tag_value(event, name);
+    bool found = v != NULL;
+    free(v);
+    return found;
 }
 
 bool event_tag_has_value(const event_t *event, const char *name, const char *value) {

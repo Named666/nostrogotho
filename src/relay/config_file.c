@@ -240,11 +240,8 @@ static const char *known_keys[] = {
     "max_subscription_id_length", "max_query_limit",
     "max_event_content_length", "max_event_tags", "max_ws_message_length",
     "min_pow_difficulty", "created_at_lower_limit", "created_at_upper_limit",
-    "limits", "nip42", "hot_reload", "enabled", "auth_required_for_write",
+    "limits", "hot_reload", "enabled",
     "module_path",
-    "composition", "publication", "delivery", "kind", "query",
-    "protocol_response", "metadata", "auth_hint", "auth_challenge", "maintenance",
-    "mode",
 };
 
 static bool is_known_key(const char *key, size_t len) {
@@ -303,8 +300,8 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
     char *doc = NULL;
     size_t len = 0;
     const char *end;
-    const char *limits_b, *limits_e, *nip42_b, *nip42_e, *hr_b, *hr_e;
-    bool has_limits, has_nip42, has_hr;
+    const char *limits_b, *limits_e, *hr_b, *hr_e;
+    bool has_limits, has_hr;
     int tmp;
     bool lower_present, upper_present;
     if (!path || !config || !err || errsz == 0) return false;
@@ -386,21 +383,6 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
         }
     }
 
-    /* nip42.* scope ("enabled" disambiguated by span). */
-    has_nip42 = find_object_span(doc, end, "nip42", &nip42_b, &nip42_e);
-    if (!has_nip42 && find_key(doc, end, "nip42")) {
-        snprintf(err, errsz, "nip42: expected object");
-        free(doc);
-        return false;
-    }
-    if (has_nip42) {
-        if (!apply_bool(nip42_b, nip42_e, "enabled", &config->nip42_enabled,
-                        err, errsz)) goto fail;
-        if (!apply_bool(nip42_b, nip42_e, "auth_required_for_write",
-                        &config->nip42_auth_required_for_write, err,
-                        errsz)) goto fail;
-    }
-
     /* hot_reload.* scope. */
     has_hr = find_object_span(doc, end, "hot_reload", &hr_b, &hr_e);
     if (!has_hr && find_key(doc, end, "hot_reload")) {
@@ -415,80 +397,6 @@ bool relay_config_load(const char *path, relay_config_t *config, char *err,
                           config->hot_reload_module_path,
                           sizeof(config->hot_reload_module_path), err,
                           errsz)) goto fail;
-    }
-
-    /* composition.* scope. */
-    const char *comp_b, *comp_e;
-    bool has_comp = find_object_span(doc, end, "composition", &comp_b, &comp_e);
-    if (!has_comp && find_key(doc, end, "composition")) {
-        snprintf(err, errsz, "composition: expected object");
-        free(doc);
-        return false;
-    }
-    if (has_comp) {
-        if (!apply_string(comp_b, comp_e, "publication_mode",
-                          config->composition.publication_mode,
-                          sizeof(config->composition.publication_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "publication_enabled",
-                        &config->composition.publication_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "delivery_mode",
-                          config->composition.delivery_mode,
-                          sizeof(config->composition.delivery_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "delivery_enabled",
-                        &config->composition.delivery_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "kind_mode",
-                          config->composition.kind_mode,
-                          sizeof(config->composition.kind_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "kind_enabled",
-                        &config->composition.kind_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "query_mode",
-                          config->composition.query_mode,
-                          sizeof(config->composition.query_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "query_enabled",
-                        &config->composition.query_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "protocol_response_mode",
-                          config->composition.protocol_response_mode,
-                          sizeof(config->composition.protocol_response_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "protocol_response_enabled",
-                        &config->composition.protocol_response_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "metadata_mode",
-                          config->composition.metadata_mode,
-                          sizeof(config->composition.metadata_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "metadata_enabled",
-                        &config->composition.metadata_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "auth_hint_mode",
-                          config->composition.auth_hint_mode,
-                          sizeof(config->composition.auth_hint_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "auth_hint_enabled",
-                        &config->composition.auth_hint_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "auth_challenge_mode",
-                          config->composition.auth_challenge_mode,
-                          sizeof(config->composition.auth_challenge_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "auth_challenge_enabled",
-                        &config->composition.auth_challenge_enabled, err,
-                        errsz)) goto fail;
-        if (!apply_string(comp_b, comp_e, "maintenance_mode",
-                          config->composition.maintenance_mode,
-                          sizeof(config->composition.maintenance_mode), err,
-                          errsz)) goto fail;
-        if (!apply_bool(comp_b, comp_e, "maintenance_enabled",
-                        &config->composition.maintenance_enabled, err,
-                        errsz)) goto fail;
     }
 
     free(doc);
@@ -523,10 +431,6 @@ bool relay_config_write_defaults(const char *path) {
             "    \"created_at_lower_limit\": 0,\n"
             "    \"created_at_upper_limit\": 900\n"
             "  },\n"
-            "  \"nip42\": {\n"
-            "    \"enabled\": true,\n"
-            "    \"auth_required_for_write\": false\n"
-            "  },\n"
             "  \"hot_reload\": {\n"
             "    \"enabled\": false,\n"
 #ifdef _WIN32
@@ -534,26 +438,6 @@ bool relay_config_write_defaults(const char *path) {
 #else
             "    \"module_path\": \"build/nostrogotho.so\"\n"
 #endif
-            "  },\n"
-            "  \"composition\": {\n"
-            "    \"publication_mode\": \"and\",\n"
-            "    \"publication_enabled\": true,\n"
-            "    \"delivery_mode\": \"or\",\n"
-            "    \"delivery_enabled\": true,\n"
-            "    \"kind_mode\": \"all\",\n"
-            "    \"kind_enabled\": true,\n"
-            "    \"query_mode\": \"and\",\n"
-            "    \"query_enabled\": true,\n"
-            "    \"protocol_response_mode\": \"first\",\n"
-            "    \"protocol_response_enabled\": true,\n"
-            "    \"metadata_mode\": \"first\",\n"
-            "    \"metadata_enabled\": true,\n"
-            "    \"auth_hint_mode\": \"or\",\n"
-            "    \"auth_hint_enabled\": true,\n"
-            "    \"auth_challenge_mode\": \"all\",\n"
-            "    \"auth_challenge_enabled\": true,\n"
-            "    \"maintenance_mode\": \"all\",\n"
-            "    \"maintenance_enabled\": true\n"
             "  }\n"
             "}\n");
     if (fclose(f) != 0) return false;

@@ -1220,3 +1220,16 @@ void json_serialize_event(const event_t *event, json_builder_t *builder) {
     json_builder_object_key_string(builder, "sig", event->sig);
     json_builder_end_object(builder);
 }
+
+
+char *json_builder_dup(json_builder_t *builder) {
+    const char *tmp = json_builder_finish(builder);
+    char *dup;
+    size_t len;
+    if (!tmp) return NULL;
+    len = strlen(tmp);
+    dup = (char *)malloc(len + 1);
+    if (!dup) return NULL;
+    memcpy(dup, tmp, len + 1);
+    return dup;
+}

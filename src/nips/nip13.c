@@ -7,7 +7,7 @@
  * ============================================================================ */
 
 #include "nip_capability.h"
-#include "crypto.h"
+#include "nips/nip_env.h"
 #include "protocol/tag_iter.h"
 #include <stdlib.h>
 #include <string.h>
@@ -63,9 +63,9 @@ static int nip13_committed_target(const event_t *event) {
     int target = 0;
 
     while (tag_iter_next(&it, &key, &tag)) {
-        char *name = tag_iter_element(&it, 0);
+        tag_iter_t sub; tag_iter_init_tag(&sub, tag); char *name = tag_iter_element(&sub, 0);
         if (name && strcmp(name, "nonce") == 0) {
-            char *value = tag_iter_element(&it, 2);
+            char *value = tag_iter_element(&sub, 2);
             free(name);
             if (value) {
                 char *end = NULL;
@@ -88,9 +88,8 @@ static int nip13_committed_target(const event_t *event) {
 
 static void nip13_lifecycle_init(const relay_config_t *config, void *ctx) {
     nip13_ctx_t *cap_ctx = (nip13_ctx_t *)ctx;
-    if (cap_ctx) {
-        cap_ctx->min_difficulty = config->min_pow_difficulty;
-    }
+    if (!cap_ctx || !config) return;
+    cap_ctx->min_difficulty = config->min_pow_difficulty < 0 ? 0 : config->min_pow_difficulty;
 }
 
 /* ============================================================================
@@ -109,10 +108,14 @@ static bool nip13_publication_policy_accept_publish(
 
     int committed = nip13_committed_target(event);
     int required = committed > min_difficulty ? committed : min_difficulty;
-    int bits = count_leading_zero_bits(event->id);
+    if (!event) {
+        if (reason && reason_size > 0) snprintf(reason, reason_size, "pow: invalid event");
+        return false;
+    }
+    int bits = nip_env_count_leading_zero_bits(event->id);
     if (bits >= required) return true;
 
-    snprintf(reason, reason_size, "pow: difficulty %d>=%d", bits, required);
+    if (reason && reason_size > 0) snprintf(reason, reason_size, "pow: difficulty %d is less than required %d", bits, required);
     return false;
 }
 

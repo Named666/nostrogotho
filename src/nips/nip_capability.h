@@ -122,10 +122,6 @@ typedef struct {
      * Returns true to allow, false to reject. On reject, fills reason buffer. */
     bool (*authorize_query)(uintptr_t connection_id, filter_t *filters, size_t count,
                             char *reason, size_t reason_size, void *ctx);
-    
-    /* Called after query - can modify results or add hints */
-    bool (*modify_results)(uintptr_t connection_id, const filter_t *filters, size_t count,
-                           bool has_more, int total_count, void *ctx);
 } nip_query_policy_capability_t;
 
 /* Maintenance capability */
@@ -266,6 +262,18 @@ bool nip_composition_needs_auth_hint(nip_registry_t *registry,
 void nip_composition_send_auth_challenge(nip_registry_t *registry,
                                           uintptr_t connection_id);
 
+/* Lifecycle: run all init/shutdown hooks */
+void nip_composition_run_init(nip_registry_t *registry, const relay_config_t *config);
+void nip_composition_run_shutdown(nip_registry_t *registry);
+
+/* Connection: notify all connection caps */
+void nip_composition_notify_connect(nip_registry_t *registry, uintptr_t connection_id);
+void nip_composition_notify_disconnect(nip_registry_t *registry, uintptr_t connection_id);
+
+/* Message intercept: first true wins */
+bool nip_composition_on_message(nip_registry_t *registry, uintptr_t connection_id,
+                                 const protocol_message_t *msg);
+
 /* ============================================================================
  * Capability Providers (self-registration)
  * ============================================================================ */
@@ -281,6 +289,9 @@ void nip_capability_add_provider(nip_capability_provider_fn provider);
 
 /* Register every provider linked into this image (monolithic or module). */
 void nip_registry_register_providers(nip_registry_t *registry);
+
+/* Clear the provider list (for tests / shutdown). */
+void nip_capability_clear_providers(void);
 
 /* ============================================================================
  * Registration Boilerplate Macro

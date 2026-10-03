@@ -74,6 +74,19 @@ static const char *c_cyan(void)  { return use_color() ? "\033[1;36m" : ""; }
 static const char *c_dim(void)   { return use_color() ? "\033[2m" : ""; }
 static const char *c_reset(void) { return use_color() ? "\033[0m" : ""; }
 
+/* Last resort: runs with a trashed heap/stack, so only write() --
+ * no formatting, no allocation. Tells the dev the handler itself died
+ * instead of leaving a bare exit 127 with no output. */
+static void nested_fault_note(void) {
+    static const char msg[] =
+        "CRASH: nested fault inside crash handler; trace unavailable (exit 127)\n";
+#ifdef _WIN32
+    write(2, msg, (unsigned)(sizeof(msg) - 1));
+#else
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+}
+
 static void strip_nl(char *s) {
     size_t n;
     if (!s) return;
@@ -385,6 +398,27 @@ static const char *sig_name(int sig) {
     return "SIGNAL";
 }
 
+/* One pending group for collapsing runs of identical frames. */
+typedef struct {
+    char func[512], loc[1024], mod[1024];
+    unsigned long long q, raw;
+    int first, n, ok, sys, locok;
+} frame_group_t;
+
+static void flush_group(frame_group_t *g, int *shown,
+                        int *app_n, int *app_ok, int *app_loc) {
+    if (g->n <= 0) return;
+    print_group(g->first, g->n, g->mod[0] ? g->mod : NULL,
+                g->q, g->raw, g->func, g->loc, g->ok);
+    *shown += g->n;
+    if (!g->sys) {
+        *app_n += g->n;
+        if (g->ok) *app_ok += g->n;
+        if (g->locok) *app_loc += g->n;
+    }
+    g->n = 0;
+}
+
 static void print_collapsed(const char *names) {
     fprintf(stderr, "  %s#-%s  [system] %s %s(CRASH_VERBOSE=1 shows all)%s\n",
             c_dim(), c_reset(), names, c_dim(), c_reset());
@@ -393,17 +427,25 @@ static void print_collapsed(const char *names) {
 static void print_trace(uintptr_t *frames, int nframes, int sig,
                         uintptr_t fault, const char *fault_op) {
     int i, shown = 0, sys_run = 0, verbose = is_verbose();
+    int app_n = 0, app_ok = 0, app_loc = 0;
     char sys_names[512] = {0};
-    fprintf(stderr, "\n%sCRASH: %s%s", c_red(), sig_name(sig), c_reset());
+    frame_group_t g = {0};
+    if (sig)
+        fprintf(stderr, "\n%sCRASH: %s%s", c_red(), sig_name(sig), c_reset());
+    else
+        fprintf(stderr, "\n%sTRACE:%s", c_dim(), c_reset());
     if (fault)
         fprintf(stderr, " %s 0x%llx", fault_op ? fault_op : "at",
                 (unsigned long long)fault);
+    if ((sig == SIGSEGV
+#ifdef SIGBUS
+         || sig == SIGBUS
+#endif
+        ) && fault < 4096)
+        fprintf(stderr, " %s(likely null deref)%s", c_dim(), c_reset());
     fprintf(stderr, "\n");
     {
         /* Pending group for collapsing runs of identical frames. */
-        char p_func[512] = {0}, p_loc[1024] = {0}, p_mod[1024] = {0};
-        unsigned long long p_q = 0, p_raw = 0;
-        int p_first = 0, p_n = 0, p_ok = 0;
         for (i = 0; i <= nframes; i++) {
             int end = (i == nframes);
             uintptr_t raw = end ? 0 : frames[i];
@@ -415,21 +457,16 @@ static void print_trace(uintptr_t *frames, int nframes, int sig,
             if (!end) {
                 /* Fast path: identical raw address = same call site
                  * (recursion). Skip module resolve + addr2line entirely. */
-                if (p_n > 0 && sys_run == 0 &&
-                    (unsigned long long)raw == p_raw) {
-                    p_n++;
+                if (g.n > 0 && sys_run == 0 &&
+                    (unsigned long long)raw == g.raw) {
+                    g.n++;
                     continue;
                 }
                 have_mod = resolve_module(eff, mod_path, sizeof(mod_path),
                                           &qaddr, &is_sys);
                 if (is_sys && !verbose) {
                     const char *bn = have_mod ? file_name(mod_path) : "?";
-                    if (p_n > 0) {
-                        print_group(p_first, p_n, p_mod[0] ? p_mod : NULL,
-                                    p_q, p_raw, p_func, p_loc, p_ok);
-                        shown += p_n;
-                        p_n = 0;
-                    }
+                    flush_group(&g, &shown, &app_n, &app_ok, &app_loc);
                     if (sys_run == 0) snprintf(sys_names, sizeof(sys_names), "%s", bn);
                     else if (strlen(sys_names) + 2 + strlen(bn) < sizeof(sys_names))
                         snprintf(sys_names + strlen(sys_names),
@@ -446,35 +483,39 @@ static void print_trace(uintptr_t *frames, int nframes, int sig,
                                    (unsigned long long)raw,
                                    func, sizeof(func), loc, sizeof(loc));
             }
-            if (!end && p_n > 0 && sys_run == 0 && ok && p_ok &&
-                strcmp(func, p_func) == 0 && strcmp(loc, p_loc) == 0) {
-                p_n++; /* same frame repeats (recursion): just count */
+            if (!end && g.n > 0 && sys_run == 0 && ok && g.ok &&
+                g.sys == is_sys &&
+                strcmp(func, g.func) == 0 && strcmp(loc, g.loc) == 0) {
+                g.n++; /* same frame repeats (recursion): just count */
                 continue;
             }
-            if (p_n > 0) {
-                print_group(p_first, p_n, p_mod[0] ? p_mod : NULL,
-                            p_q, p_raw, p_func, p_loc, p_ok);
-                shown += p_n;
-                p_n = 0;
-            }
+            flush_group(&g, &shown, &app_n, &app_ok, &app_loc);
             if (end) break;
-            p_first = shown;
-            p_n = 1;
-            p_ok = ok;
-            p_q = qaddr;
-            p_raw = (unsigned long long)raw;
+            g.first = shown;
+            g.n = 1;
+            g.ok = ok;
+            g.sys = is_sys;
+            g.locok = ok && loc[0] && loc[0] != '?';
+            g.q = qaddr;
+            g.raw = (unsigned long long)raw;
             if (ok) {
-                snprintf(p_func, sizeof(p_func), "%s", func);
-                snprintf(p_loc, sizeof(p_loc), "%s", loc);
+                snprintf(g.func, sizeof(g.func), "%s", func);
+                snprintf(g.loc, sizeof(g.loc), "%s", loc);
             } else {
-                p_func[0] = '\0';
-                p_loc[0] = '\0';
+                g.func[0] = '\0';
+                g.loc[0] = '\0';
             }
-            if (have_mod) snprintf(p_mod, sizeof(p_mod), "%s", mod_path);
-            else p_mod[0] = '\0';
+            if (have_mod) snprintf(g.mod, sizeof(g.mod), "%s", mod_path);
+            else g.mod[0] = '\0';
         }
         if (sys_run > 0) print_collapsed(sys_names);
     }
+    if (app_n > 0 && app_ok == 0)
+        fprintf(stderr, "  %sNote: no symbols resolved -- is addr2line on PATH? Rebuild with -g -Og -fno-omit-frame-pointer.%s\n",
+                c_dim(), c_reset());
+    else if (app_n > 0 && app_loc == 0)
+        fprintf(stderr, "  %sNote: functions resolved but no line info -- rebuild with -g.%s\n",
+                c_dim(), c_reset());
     fflush(stderr);
 }
 
@@ -533,7 +574,7 @@ static void linux_handler(int sig, siginfo_t *info, void *uctx) {
     uintptr_t fault = 0, ip = 0, fp = 0;
     uintptr_t frames[CRASH_MAX_FRAMES];
     int n = 0;
-    if (crash_in_handler) _exit(127);
+    if (crash_in_handler) { nested_fault_note(); _exit(127); }
     crash_in_handler = 1;
     if (info && info->si_code != SI_USER) fault = (uintptr_t)info->si_addr;
     if (uctx) {
@@ -561,7 +602,7 @@ static LONG WINAPI seh_filter(EXCEPTION_POINTERS *info) {
     const char *op = "at";
     uintptr_t frames[CRASH_MAX_FRAMES];
     int n = 0, sig = SIGSEGV;
-    if (crash_in_handler) _exit(127);
+    if (crash_in_handler) { nested_fault_note(); _exit(127); }
     crash_in_handler = 1;
     if (info && info->ExceptionRecord) {
         code = info->ExceptionRecord->ExceptionCode;
@@ -593,7 +634,7 @@ static LONG WINAPI seh_filter(EXCEPTION_POINTERS *info) {
 static void win_abort_handler(int sig) {
     uintptr_t frames[CRASH_MAX_FRAMES];
     int n;
-    if (crash_in_handler) _exit(127);
+    if (crash_in_handler) { nested_fault_note(); _exit(127); }
     crash_in_handler = 1;
     n = capture_current(frames, CRASH_MAX_FRAMES);
     fatal_trace(sig, 0, NULL, frames, n, 1);

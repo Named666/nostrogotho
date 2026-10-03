@@ -138,20 +138,9 @@ protocol_collect_filters(json_value_t *values, size_t count, filter_t **out,
  */
 static char*
 prv_builder_dup(const json_builder_t *builder) {
-    const char *tmp = NULL;
-    char *dup = NULL;
-    if (builder == NULL) {
-        return NULL;
-    }
-    /* json_builder_finish takes non-const in header; buffer is read-only here */
-    tmp = json_builder_finish((json_builder_t *)builder);
-    if (tmp == NULL) {
-        return NULL;
-    }
-    dup = malloc(strlen(tmp) + 1);
-    if (!dup) return NULL;
-    strcpy(dup, tmp);
-    return dup;
+    /* Shared helper owns the malloc+copy; keep single impl in json_util. */
+    if (builder == NULL) return NULL;
+    return json_builder_dup((json_builder_t *)builder);
 }
 
 /**
@@ -201,17 +190,16 @@ protocol_serialize_event(const char *subscription_id, const event_t *event) {
 char*
 protocol_serialize_eose(const char *subscription_id, bool has_more, bool auth_hint) {
     json_builder_t builder;
-    const char *status = "finish";
-    if (auth_hint) {
-        status = "auth";
-    } else if (has_more) {
-        status = "more";
-    }
     json_builder_start(&builder);
     json_builder_append_string(&builder, "EOSE");
     json_builder_append_string(&builder, subscription_id != NULL ? subscription_id : "");
+    /* NIP-67: ["EOSE", sub, ["auth", "finish"/"more"]] or ["EOSE", sub, ["finish"/"more"]].
+     * Preserve both hints; the old fallback dropped finish/more when auth was set. */
     json_builder_start_array(&builder);
-    json_builder_append_string(&builder, status);
+    if (auth_hint) {
+        json_builder_append_string(&builder, "auth");
+    }
+    json_builder_append_string(&builder, has_more ? "more" : "finish");
     json_builder_end_array(&builder);
     return prv_builder_dup(&builder);
 }

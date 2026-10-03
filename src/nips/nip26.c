@@ -43,8 +43,9 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
                             const char *conditions, const char *delegation_sig) {
     if (!ev || !delegator_pubkey) return false;
     
-    /* Check delegation conditions */
+    /* Check delegation conditions (strict: unknown fields/ops or malformed integers reject). */
     if (conditions && strlen(conditions) > 0) {
+        if (strlen(conditions) >= 512) return false;
         bool has_kind_condition = false;
         bool kind_matched = false;
         int allowed_kinds[32];
@@ -76,25 +77,36 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
                 op_str = gt_pos + 1;
             }
             
-            if (op_char) {
+            if (!op_char) return false;
+            {
                 size_t key_len = (op_char == '=') ? (eq_pos - condition) :
                                  (op_char == '<') ? (lt_pos - condition) :
                                  (gt_pos - condition);
                 
                 if (key_len == 4 && strncmp(condition, "kind", 4) == 0 && op_char == '=') {
+                    char *kend = NULL;
+                    long kval = strtol(op_str, &kend, 10);
+                    if (!kend || *kend != '\0' || kval < 0 || kval > 1000000000) return false;
                     has_kind_condition = true;
-                    int kind_val = (int)strtol(op_str, NULL, 10);
-                    if (kind_val >= 0 && allowed_kinds_count < 32) {
-                        allowed_kinds[allowed_kinds_count++] = kind_val;
+                    if (allowed_kinds_count < 32) {
+                        allowed_kinds[allowed_kinds_count++] = (int)kval;
+                    } else {
+                        return false;
                     }
                 } else if (key_len == 10 && strncmp(condition, "created_at", 10) == 0) {
-                    time_t timestamp = (time_t)strtol(op_str, NULL, 10);
-                    
-                    if (op_char == '<' && ev->created_at >= timestamp) {
+                    char *tend = NULL;
+                    long tval = strtol(op_str, &tend, 10);
+                    if (!tend || *tend != '\0') return false;
+                    if (op_char != '<' && op_char != '>') return false;
+                    if (op_char == '<' && ev->created_at >= (time_t)tval) {
                         return false;
-                    } else if (op_char == '>' && ev->created_at <= timestamp) {
+                    } else if (op_char == '>' && ev->created_at <= (time_t)tval) {
                         return false;
                     }
+                } else if (op_char) {
+                    return false;
+                } else {
+                    return false;
                 }
             }
             
@@ -150,9 +162,11 @@ bool nip26_extract_index_tags(const event_t *event,
     
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *name = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        tag_iter_init_tag(&sub, tag);
+        char *name = tag_iter_element(&sub, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = tag_iter_element(&it, 1);
+            char *delegator = tag_iter_element(&sub, 1);
             if (delegator) {
                 storage_tag_match_t *grown = (storage_tag_match_t *)realloc(
                     *matches, (*count + 1) * sizeof(**matches));
@@ -237,32 +251,34 @@ static bool nip26_accept_publish(uintptr_t connection_id, const event_t *event,
     
     struct mg_str key, tag;
     while (tag_iter_next(&it, &key, &tag)) {
-        char *name = tag_iter_element(&it, 0);
+        tag_iter_t sub;
+        char *name;
+        tag_iter_init_tag(&sub, tag);
+        name = tag_iter_element(&sub, 0);
         if (name && strcmp(name, "delegation") == 0) {
-            char *delegator = tag_iter_element(&it, 1);
-            char *conditions = tag_iter_element(&it, 2);
-            char *sig = tag_iter_element(&it, 3);
-
-            bool ok = true;
-            if (delegator && sig) {
-                if (!nip26_check_delegation(event, delegator, conditions, sig)) {
-                    snprintf(reason, reason_size, "invalid delegation");
-                    ok = false;
-                }
+            char *delegator = tag_iter_element(&sub, 1);
+            char *conditions = tag_iter_element(&sub, 2);
+            char *sig = tag_iter_element(&sub, 3);
+            /* NIP-26 requires 4 elements. Malformed delegation tags are rejected, not ignored. */
+            bool malformed = !delegator || !delegator[0] || !conditions || !sig || !sig[0];
+            bool ok = false;
+            if (!malformed) {
+                ok = nip26_check_delegation(event, delegator, conditions, sig);
             }
-
             free(name);
             free(delegator);
             free(conditions);
             free(sig);
-
-            if (!ok) return false;
-            return true; /* Found delegation tag, verified it */
+            if (!ok) {
+                if (reason && reason_size > 0) snprintf(reason, reason_size, "invalid: invalid delegation");
+                return false;
+            }
+            continue;
         }
         free(name);
     }
 
-    return true; /* No delegation tag, allowed */
+    return true; /* No delegation tag, or all delegation tags valid */
 }
 
 /* Single capability table. The hook ignores ctx, so .ctx is NULL (no

@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <time.h>
 
-static char information_document[1024];
+static char information_document[4096];
 
 /* NIPs implemented and wired into the request path:
  *   01 basic protocol, 09 deletion, 11 this document, 13 PoW,
@@ -68,7 +68,6 @@ static const char *nip11_information_document(void) {
     struct { const char *key; int value; bool enabled; } int_fields[] = {
         {"max_message_length", nip11_config.max_message_length, nip11_config.max_message_length > 0},
         {"max_subscriptions", nip11_config.max_subscriptions, nip11_config.max_subscriptions > 0},
-        {"max_filters", nip11_config.max_filters, nip11_config.max_filters > 0},
         {"max_subid_length", nip11_config.max_subid_length, nip11_config.max_subid_length > 0},
         {"max_event_tags", nip11_config.max_event_tags, nip11_config.max_event_tags > 0},
         {"max_content_length", nip11_config.max_content_length, nip11_config.max_content_length > 0},
@@ -100,9 +99,9 @@ static const char *nip11_information_document(void) {
         offset += (size_t) written;
         first = false;
     }
-    /* The relay has no authenticated-only mode; always advertise false. */
+    /* Writes require NIP-42 auth (see nip42_publication_policy_fn); advertise it. */
     written = snprintf(information_document + offset, capacity - offset,
-                       "%s\"auth_required\":false}", first ? "" : ",");
+                       "%s\"auth_required\":true,\"restricted_writes\":true}", first ? "" : ",");
     if (written < 0 || offset + (size_t) written >= capacity) return "{}";
     offset += (size_t) written;
 

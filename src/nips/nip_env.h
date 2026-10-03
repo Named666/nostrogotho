@@ -48,4 +48,7 @@ size_t nip_env_session_snapshot(connection_snapshot_t *out, size_t capacity);
  * mirroring host check_event().) */
 bool nip_env_accepts_event(const event_t *event);
 
+/* Count leading zero bits in a hex string (for NIP-13 PoW). */
+unsigned nip_env_count_leading_zero_bits(const char *hex);
+
 #endif /* NIP_ENV_H_ */

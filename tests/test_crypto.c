@@ -3,6 +3,12 @@
  * computation (against OS-independent vectors), Schnorr verification,
  * full event validation (incl. NIP-26 delegation), and NIP-13 difficulty.
  *
+ * NIPs: NIP-01 (event ID, signature), NIP-13 (PoW difficulty), NIP-26 (delegation)
+ * Spec sections: NIP-01 § "Event Format", § "Signature Verification"
+ *                NIP-13 § "Difficulty Calculation"
+ *                NIP-26 § "Delegation"
+ * PLAN.md sections: §1.3 (Host Services as ABI Boundary - crypto via Nhr_Host)
+ *
  * Signing is done in-test through libsecp256k1 directly (fixed keys, fixed
  * aux randomness => deterministic), while verification goes through
  * crypto.c -- so sign/verify form a differential pair, not a tautology.

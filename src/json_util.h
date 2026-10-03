@@ -228,6 +228,10 @@ void json_builder_end_object(json_builder_t *builder);
  */
 const char *json_builder_finish(json_builder_t *builder);
 
+/* Duplicate finished builder output onto the heap (caller frees).
+ * Shared by NIP-45/NIP-67/protocol to avoid triplicated malloc+strcpy. */
+char *json_builder_dup(json_builder_t *builder);
+
 /* ============================================================================
  * Filter Parsing
  * 

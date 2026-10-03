@@ -30,5 +30,7 @@ bool nhr_module_send_json(uintptr_t connection_id, const char *json, size_t leng
 /* Full event validation bridge (ID + signature + NIP-26 delegation,
  * mirroring host check_event()). Plain internal function, not an ABI export. */
 bool nhr_module_accepts_event(const event_t *event);
+/* Count leading zero bits (for NIP-13 PoW). */
+unsigned nhr_module_count_leading_zero_bits(const char *hex);
 
 #endif /* NHR_MODULE_H_ */

@@ -1,16 +1,22 @@
 /* ============================================================================
  * Integration tests for src/nips/nip_capability.c composition rules.
  *
+ * NIPs: NIP-01 (publication/delivery/kind handlers), NIP-09 (deletion), 
+ *       NIP-26 (delegation), NIP-40 (expiry), NIP-42 (auth), NIP-45 (COUNT)
+ * Spec sections: NIP-01 § "Communication", NIP-26 § "Delegation"
+ *                NIP-42 § "Authentication", NIP-45 § "COUNT"
+ * PLAN.md sections: §1.2 (Capability-Based Composition), §1.3 (Host Services as ABI Boundary)
+ *
  * A mock registry holding two CONFLICTING policies per type proves the
  * documented composition semantics:
- *   publication : AND  (any deny wins, order-independent)
- *   delivery    : veto (any veto wins, order-independent)
- *   kind handler: AND  (any reject wins, order-independent)
- *   query       : AND  (any deny wins, order-independent)
- *   maintenance : ALL run
+ *   publication : AND  (any deny wins, order-independent)  -- NIP-01, NIP-26, NIP-40, NIP-42
+ *   delivery    : veto (any veto wins, order-independent)  -- NIP-01, NIP-42
+ *   kind handler: AND  (any reject wins, order-independent) -- NIP-01, NIP-09, NIP-25, NIP-45
+ *   query       : AND  (any deny wins, order-independent)  -- NIP-01, NIP-42, NIP-45
+ *   maintenance : ALL run                                  -- NIP-01
  *   eose/count/metadata: FIRST non-NULL wins (last registered = head)
- *   auth hint   : OR   (any true wins)
- *   challenge   : ALL hooks fire
+ *   auth hint   : OR   (any true wins)                     -- NIP-42
+ *   challenge   : ALL hooks fire                           -- NIP-42
  * plus registry lifecycle (clear/re-register = hot-reload swap pattern)
  * and NULL-safety of every composition entry point.
  *
@@ -432,7 +438,6 @@ static void test_query_conflict(void) {
         cap.name = "allow";
         cap.type = NIP_CAP_QUERY_POLICY;
         cap.caps.query_policy.authorize_query = query_allow;
-        cap.caps.query_policy.modify_results = NULL;
         nip_registry_register(reg, &cap);
         cap.name = "deny";
         cap.caps.query_policy.authorize_query = query_deny;

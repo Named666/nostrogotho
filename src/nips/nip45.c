@@ -6,12 +6,14 @@
  * removes it. No header, no registration list.
  *
  * Format: ["COUNT", <subscription_id>, {"count": <integer>}]
+ * Subset: exact counts only (no NIP-45 HLL/approximate). Advertised as 45; HLL tracked as future work.
  * The storage layer supplies the count; this NIP only formats the reply.
  * ============================================================================ */
 
 #include "nip_capability.h"
 #include "../json_util.h"
 #include <stdlib.h>
+#include <string.h>
 
 /* Build a COUNT response message. Returns malloc'd JSON (caller frees). */
 static char *nip45_build_count_response(const char *sub_id, unsigned long count) {
@@ -25,15 +27,7 @@ static char *nip45_build_count_response(const char *sub_id, unsigned long count)
     json_builder_object_key_number(&builder, "count", (long long)count);
     json_builder_end_object(&builder);
 
-    const char *result = json_builder_finish(&builder);
-    if (!result) return NULL;
-
-    /* json_builder_finish returns a pointer to internal buffer,
-     * so duplicate it for the caller to own. */
-    char *dup = malloc(strlen(result) + 1);
-    if (!dup) return NULL;
-    strcpy(dup, result);
-    return dup;
+    return json_builder_dup(&builder);
 }
 
 static char *nip45_protocol_response_build_count(const char *sub, unsigned long count, void *ctx) {
