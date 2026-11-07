@@ -9,6 +9,9 @@
  *                 delivery's latency goes in a histogram
  *   nostr-pub     publish pre-signed events from -f (one ["EVENT",..] per line),
  *                 -c connections, -P in flight each; counts OK replies
+ *   churn         -c concurrent slots: connect + WS handshake + RST close, repeat;
+ *                 msgs_s = completed handshakes/s, latency = connect->101
+ *   echo -R r     open loop: r msgs/s total spread over conns (latency at fixed load)
  *   nostr-fanout  -c subscribers send REQ {"kinds":[1],"limit":0}; -n
  *                 publishers send events from -f at -R events/s total; latency
  *                 per delivery (content must be the decimal event index)
@@ -41,7 +44,7 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { M_HOLD, M_ECHO, M_BCAST, M_NPUB, M_NFAN };
+enum { M_HOLD, M_ECHO, M_BCAST, M_NPUB, M_NFAN, M_CHURN };
 enum { C_CONNECTING, C_HANDSHAKE, C_OPEN, C_DEAD };
 enum { R_SUB, R_PUB };
 
@@ -91,6 +94,7 @@ typedef struct {
     uint64_t next_send_ns;
     size_t ev_lo, ev_hi, ev_pos;    /* nostr-pub slice */
     uint64_t sent[64]; unsigned sh, st;   /* nostr-pub: send times, OKs arrive in order */
+    int gi; uint64_t conn_start_ns;      /* churn */
 } conn_t;
 
 typedef struct {
@@ -164,7 +168,13 @@ static void send_frame(conn_t *c, int op, const uint8_t *p, size_t n) {
 }
 
 static uint8_t *echo_payload;
-static void send_echo(conn_t *c) { send_frame(c, 2, echo_payload, (size_t) msgsize); c->inflight++; }
+static void recycle(thr_t *t, conn_t *c);
+static __thread uint8_t *tl_echo;
+static void send_echo(conn_t *c) {
+    if (!tl_echo) { tl_echo = malloc((size_t) msgsize + 8); memcpy(tl_echo, echo_payload, (size_t) msgsize); }
+    if (msgsize >= 8) { uint64_t ts = now_ns(); memcpy(tl_echo, &ts, 8); }   /* latency stamp */
+    send_frame(c, 2, tl_echo, (size_t) msgsize); c->inflight++;
+}
 
 static void send_bcast(conn_t *c) {
     uint8_t buf[65536]; size_t n = (size_t) msgsize < 8 ? 8 : (size_t) msgsize;
@@ -193,7 +203,8 @@ static void on_open(thr_t *t, conn_t *c) {
 
 static void start_traffic(thr_t *t, conn_t *c) {
     if (c->state != C_OPEN) return;
-    if (mode == M_ECHO) for (int i = 0; i < pipel; i++) send_echo(c);
+    if (mode == M_CHURN) { recycle(t, c); return; }
+    if (mode == M_ECHO && rate <= 0) for (int i = 0; i < pipel; i++) send_echo(c);
     else if (mode == M_BCAST && c->role == R_PUB && rate <= 0) for (int i = 0; i < pipel; i++) send_bcast(c);
     else if (mode == M_NPUB) for (int i = 0; i < pipel; i++) if (!send_next_event(c, false)) break;
     do_write(t, c);
@@ -216,8 +227,11 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
     switch (mode) {
     case M_ECHO:
         c->inflight--;
-        if (m) { t->msgs++; t->bytes += n; }
-        if (atomic_load(&phase) == 1) send_echo(c);
+        if (m) {
+            t->msgs++; t->bytes += n;
+            if (n >= 8) { uint64_t ts; memcpy(&ts, p, 8); hadd(&t->hist, now_ns() - ts); }
+        }
+        if (atomic_load(&phase) == 1 && rate <= 0) send_echo(c);
         break;
     case M_BCAST:
         if (n >= 8) {
@@ -269,6 +283,11 @@ static void do_read(thr_t *t, conn_t *c) {
         if (c->rlen < 12 || memcmp(c->rb + 9, "101", 3) != 0) { kill_conn(t, c); return; }
         off = (size_t) (e + 4 - c->rb);
         on_open(t, c);
+        if (mode == M_CHURN && atomic_load(&phase) == 1) {
+            if (atomic_load_explicit(&measuring, memory_order_relaxed)) { t->msgs++; hadd(&t->hist, now_ns() - c->conn_start_ns); }
+            recycle(t, c);
+            return;
+        }
         if (atomic_load(&phase) == 1) start_traffic(t, c);
     }
     while (c->rlen - off >= 2) {
@@ -286,6 +305,18 @@ static void do_read(thr_t *t, conn_t *c) {
     if (c->wlen > c->woff) do_write(t, c);
 }
 
+static void start_connect(thr_t *t, conn_t *c, int global_idx);
+/* churn: abort (RST, so neither side accumulates TIME_WAIT) and reconnect */
+static void recycle(thr_t *t, conn_t *c) {
+    struct linger lg = { 1, 0 };
+    setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    epoll_ctl(t->ep, EPOLL_CTL_DEL, c->fd, NULL);
+    close(c->fd);
+    if (c->state == C_OPEN) { t->open--; atomic_fetch_sub(&total_open, 1); } else t->connecting--;
+    c->rlen = 0; c->wlen = c->woff = 0;
+    start_connect(t, c, c->gi);
+}
+
 static void start_connect(thr_t *t, conn_t *c, int global_idx) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
     if (fd < 0) { c->state = C_DEAD; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
@@ -299,7 +330,7 @@ static void start_connect(thr_t *t, conn_t *c, int global_idx) {
         src.sin_addr.s_addr = htonl(0x7F000002u + (uint32_t) (global_idx % nsrc));
         bind(fd, (struct sockaddr *) &src, sizeof(src));
     }
-    c->fd = fd; c->state = C_CONNECTING; t->connecting++;
+    c->fd = fd; c->state = C_CONNECTING; t->connecting++; c->gi = global_idx; c->conn_start_ns = now_ns();
     int r = connect(fd, (struct sockaddr *) &dst, sizeof(dst));
     if (r < 0 && errno != EINPROGRESS) { close(fd); c->state = C_DEAD; t->connecting--; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
     struct epoll_event e = { .events = EPOLLOUT | EPOLLIN, .data.ptr = c };
@@ -347,19 +378,19 @@ static void *thr_main(void *arg) {
             if (c->state != C_DEAD && (ev[i].events & EPOLLIN)) do_read(t, c);
         }
         /* rate-driven publishers */
-        if (ph == 1 && rate > 0 && (mode == M_BCAST || mode == M_NFAN)) {
+        if (ph == 1 && rate > 0 && (mode == M_BCAST || mode == M_NFAN || mode == M_ECHO)) {
             uint64_t now = now_ns();
             if (now - last_tick >= 200000) {
                 last_tick = now;
                 for (int i = 0; i < t->n; i++) {
                     conn_t *c = &t->c[i];
-                    if (c->role != R_PUB || c->state != C_OPEN) continue;
-                    double per = rate / npubs;
+                    if ((mode != M_ECHO && c->role != R_PUB) || c->state != C_OPEN) continue;
+                    double per = mode == M_ECHO ? rate / nconns : rate / npubs;
                     uint64_t gap = (uint64_t) (1e9 / per);
                     if (!c->next_send_ns) c->next_send_ns = now;
                     int burst = 0;
                     while (c->next_send_ns <= now && burst < 1000) {
-                        if (mode == M_BCAST) send_bcast(c); else if (!send_next_event(c, true)) { c->next_send_ns = UINT64_MAX; break; }
+                        if (mode == M_ECHO) send_echo(c); else if (mode == M_BCAST) send_bcast(c); else if (!send_next_event(c, true)) { c->next_send_ns = UINT64_MAX; break; }
                         c->next_send_ns += gap; burst++;
                     }
                     if (burst) do_write(t, c);
@@ -423,7 +454,7 @@ int main(int argc, char **argv) {
     if (optind >= argc) { fprintf(stderr, "mode required\n"); return 2; }
     const char *ms = argv[optind];
     mode = !strcmp(ms, "hold") ? M_HOLD : !strcmp(ms, "echo") ? M_ECHO : !strcmp(ms, "bcast") ? M_BCAST :
-           !strcmp(ms, "nostr-pub") ? M_NPUB : !strcmp(ms, "nostr-fanout") ? M_NFAN : -1;
+           !strcmp(ms, "nostr-pub") ? M_NPUB : !strcmp(ms, "nostr-fanout") ? M_NFAN : !strcmp(ms, "churn") ? M_CHURN : -1;
     if (mode < 0) { fprintf(stderr, "bad mode\n"); return 2; }
     if (mode == M_NPUB && pipel > 64) { fprintf(stderr, "nostr-pub: -P max 64\n"); return 2; }
     if ((mode == M_NPUB || mode == M_NFAN) && !evfile) { fprintf(stderr, "-f events file required\n"); return 2; }

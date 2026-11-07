@@ -62,6 +62,7 @@ typedef struct {
     unsigned handshake_timeout;  /* seconds (default 12) */
     size_t user_size;            /* bytes of per-socket user data */
     void *user;                  /* opaque, see ngws_server_user() */
+    int skip_utf8_check;        /* 1: don't validate TEXT payloads as UTF-8 (RFC 6455 8.1 requires it) */
 } ngws_config_t;
 
 ngws_server_t *ngws_server_create(const ngws_config_t *cfg);

@@ -1,3 +1,9 @@
+#if defined(__AVX2__) || defined(__SSE2__)
+#include <immintrin.h>
+#elif defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+#include <stdbool.h>
 #include "ws_proto.h"
 #include <string.h>
 
@@ -99,6 +105,65 @@ void ws_unmask(unsigned char *p, size_t n, const unsigned char m[4]) {
     size_t i = 0;
     unsigned char m8[8] = { m[0], m[1], m[2], m[3], m[0], m[1], m[2], m[3] };
     uint64_t m64; memcpy(&m64, m8, 8);
+#if defined(__AVX2__)
+    if (n >= 32) {
+        uint32_t m32; memcpy(&m32, m, 4);
+        __m256i vm = _mm256_set1_epi32((int) m32);
+        for (; i + 32 <= n; i += 32) {
+            __m256i v = _mm256_loadu_si256((const __m256i *) (p + i));
+            _mm256_storeu_si256((__m256i *) (p + i), _mm256_xor_si256(v, vm));
+        }
+    }
+#elif defined(__SSE2__)
+    if (n >= 16) {
+        uint32_t m32; memcpy(&m32, m, 4);
+        __m128i vm = _mm_set1_epi32((int) m32);
+        for (; i + 16 <= n; i += 16) {
+            __m128i v = _mm_loadu_si128((const __m128i *) (p + i));
+            _mm_storeu_si128((__m128i *) (p + i), _mm_xor_si128(v, vm));
+        }
+    }
+#elif defined(__ARM_NEON)
+    if (n >= 16) {
+        uint8x16_t vm = vreinterpretq_u8_u32(vdupq_n_u32((uint32_t) m[0] | (uint32_t) m[1] << 8 | (uint32_t) m[2] << 16 | (uint32_t) m[3] << 24));
+        for (; i + 16 <= n; i += 16) vst1q_u8(p + i, veorq_u8(vld1q_u8(p + i), vm));
+    }
+#endif
     for (; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); v ^= m64; memcpy(p + i, &v, 8); }
     for (; i < n; i++) p[i] ^= m[i & 3];
+}
+
+/* RFC 3629 UTF-8 validation (rejects overlongs, surrogates, > U+10FFFF).
+ * ASCII runs are skipped 16 bytes at a time (SIMD where available). */
+bool ws_utf8_valid(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+#if defined(__AVX2__)
+        while (i + 32 <= n && !_mm256_movemask_epi8(_mm256_loadu_si256((const __m256i *) (s + i)))) i += 32;
+#endif
+#if defined(__SSE2__)
+        while (i + 16 <= n && !_mm_movemask_epi8(_mm_loadu_si128((const __m128i *) (s + i)))) i += 16;
+#else
+        while (i + 8 <= n) { uint64_t v; memcpy(&v, s + i, 8); if (v & 0x8080808080808080ull) break; i += 8; }
+#endif
+        if (i >= n) break;
+        unsigned c = s[i];
+        if (c < 0x80) { i++; continue; }
+        size_t need; unsigned lo = 0x80, hi = 0xBF;
+        if (c >= 0xC2 && c <= 0xDF) need = 1;
+        else if (c == 0xE0) { need = 2; lo = 0xA0; }
+        else if (c >= 0xE1 && c <= 0xEC) need = 2;
+        else if (c == 0xED) { need = 2; hi = 0x9F; }
+        else if (c >= 0xEE && c <= 0xEF) need = 2;
+        else if (c == 0xF0) { need = 3; lo = 0x90; }
+        else if (c >= 0xF1 && c <= 0xF3) need = 3;
+        else if (c == 0xF4) { need = 3; hi = 0x8F; }
+        else return false;
+        if (i + need >= n) return false;          /* truncated sequence */
+        unsigned c1 = s[i + 1];
+        if (c1 < lo || c1 > hi) return false;
+        for (size_t k = 2; k <= need; k++) if ((s[i + k] & 0xC0) != 0x80) return false;
+        i += need + 1;
+    }
+    return true;
 }

@@ -28,5 +28,7 @@ typedef struct {
 /* Parse a frame header from buf. Returns 1 when a complete header is present
  * (fills f), 0 if more bytes are needed, -1 on protocol error. */
 int ws_parse_header(const unsigned char *buf, size_t n, ws_frame_t *f);
+#include <stdbool.h>
+bool ws_utf8_valid(const unsigned char *s, size_t n);
 void ws_unmask(unsigned char *p, size_t n, const unsigned char mask[4]);
 #endif

@@ -491,12 +491,21 @@ static long handle_http(sockx_t *x, const char *b, size_t n) {
 static void deliver(sockx_t *x, char *data, size_t len, int op) {
     ngws_server_t *srv = SRV(x);
     if (op == NGWS_OP_TEXT || op == NGWS_OP_BINARY) {
+        if (op == NGWS_OP_TEXT && !srv->cfg.skip_utf8_check &&
+            !ws_utf8_valid((const unsigned char *) data, len)) { ws_fail(x, 1007); return; }
         if (srv->cfg.on_message) srv->cfg.on_message((ngws_socket_t *) x->s, data, len, op);
     } else if (op == NGWS_OP_PING) {
         queue_frame(x, NGWS_OP_PONG, data, len);
     } else if (op == NGWS_OP_CLOSE) {
         unsigned char code[2] = { 0x03, 0xE8 };
-        if (len >= 2) { code[0] = (unsigned char) data[0]; code[1] = (unsigned char) data[1]; }
+        if (len == 1) { ws_fail(x, 1002); return; }
+        if (len >= 2) {
+            unsigned c = (unsigned) (unsigned char) data[0] << 8 | (unsigned char) data[1];
+            bool ok = (c >= 1000 && c <= 1003) || (c >= 1007 && c <= 1011) || (c >= 3000 && c <= 4999);
+            if (!ok) { ws_fail(x, 1002); return; }
+            if (!ws_utf8_valid((const unsigned char *) data + 2, len - 2)) { ws_fail(x, 1007); return; }
+            code[0] = (unsigned char) data[0]; code[1] = (unsigned char) data[1];
+        }
         queue_frame(x, NGWS_OP_CLOSE, code, 2);
         close_after_flush(x);
     }
@@ -570,12 +579,25 @@ static long ws_frame(sockx_t *x, unsigned char *b, size_t blen) {
     }
     return (long) (f.header_len + n);
 }
+/* Bytes needed to hold the whole frame starting at b (header + payload),
+ * or 4096 when the header itself is still incomplete. Sizing the partial-
+ * frame buffer once avoids realloc/copy cascades for large messages. */
+static size_t frame_need(sockx_t *x, const unsigned char *b, size_t n) {
+    ws_frame_t f;
+    if (ws_parse_header(b, n, &f) <= 0) return 4096;
+    if (f.len > SRV(x)->cfg.max_payload) return 4096;   /* rejected anyway; never trust it */
+    uint64_t t = f.header_len + f.len;
+    return t < 4096 ? 4096 : (size_t) t;
+}
+
 static void ws_feed(sockx_t *x, unsigned char *data, size_t len) {
     unsigned char *b = data; size_t n = len;
     bool owned = false;
     if (x->rlen) {                        /* append to partial frame */
         if (x->rlen + len > x->rcap) {
             size_t nc = x->rcap ? x->rcap : 4096; while (nc < x->rlen + len) nc *= 2;
+            size_t fn = frame_need(x, x->rbuf, x->rlen);
+            if (fn >= x->rlen + len && fn > x->rcap) nc = fn;
             unsigned char *nb = (unsigned char *) realloc(x->rbuf, nc);
             if (!nb) { ngws_terminate((ngws_socket_t *) x->s); return; }
             x->rbuf = nb; x->rcap = nc;
@@ -594,7 +616,13 @@ static void ws_feed(sockx_t *x, unsigned char *data, size_t len) {
     if (!rest) { x->rlen = 0; if (x->rbuf && x->rcap > 65536) { free(x->rbuf); x->rbuf = NULL; x->rcap = 0; } return; }
     if (owned) { memmove(x->rbuf, x->rbuf + off, rest); x->rlen = rest; }
     else {
-        if (rest > x->rcap) { unsigned char *nb = (unsigned char *) realloc(x->rbuf, rest < 4096 ? 4096 : rest); if (!nb) { ngws_terminate((ngws_socket_t *) x->s); return; } x->rbuf = nb; x->rcap = rest < 4096 ? 4096 : rest; }
+        size_t need = frame_need(x, b + off, rest);
+        if (need < rest) need = rest;
+        if (need > x->rcap) {
+            unsigned char *nb = (unsigned char *) realloc(x->rbuf, need);
+            if (!nb) { ngws_terminate((ngws_socket_t *) x->s); return; }
+            x->rbuf = nb; x->rcap = need;
+        }
         memcpy(x->rbuf, b + off, rest); x->rlen = rest;
     }
 }
@@ -639,7 +667,7 @@ static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length
     x->in_data = 1;
     if (x->state == ST_HTTP) {
         const char *b = data; size_t n = (size_t) length;
-        if (x->rlen || 1) {
+        {
             if (x->rlen + n > x->rcap) {
                 size_t nc = x->rcap ? x->rcap : 1024; while (nc < x->rlen + n) nc *= 2;
                 unsigned char *nb = (unsigned char *) realloc(x->rbuf, nc);
