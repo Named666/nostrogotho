@@ -7,3 +7,5 @@ for a in "-c 100 -P 8 -m 64 echo" "-c 100 -P 8 -m 512 echo" "-c 100 -P 1 -m 16 e
 done
 taskset -c 0-1 $1 9001 1 broadcast >/dev/null 2>&1 & P=$!; sleep 0.3
 taskset -c 2-7 $L -t 6 -q -d 2 -c 1000 -n 1 -P 4 -m 64 bcast >/dev/null; kill $P; wait $P 2>/dev/null
+# Full flow (from repo root):
+#   tools/bench/pgo_build.sh  (gen build, this training, use build)

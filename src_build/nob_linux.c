@@ -70,6 +70,22 @@ static void common_flags(Cmd *cmd, const char *std)
                    "-I"THIRD_PARTY_FOLDER"secp256k1/src");
 }
 
+/* NG_PGO=gen|use: profile-guided build of the ngws benchmark server.
+ * gen: instrumented binary writes profiles to build/pgo (train with
+ * tools/bench/pgo_train.sh build/ngws_bench_server); use: rebuild with them. */
+static void pgo_flags(Cmd *cmd)
+{
+    const char *pgo = getenv("NG_PGO");
+    if (!pgo || !*pgo) return;
+    if (strcmp(pgo, "gen") == 0)
+        nob_cmd_append(cmd, "-fprofile-generate", "-fprofile-update=atomic",
+                       "-fprofile-dir="BUILD_FOLDER"pgo",
+                       "-Wl,-u,__gcov_dump");   /* weak ref in the bench server: pull it from libgcov */
+    else if (strcmp(pgo, "use") == 0)
+        nob_cmd_append(cmd, "-fprofile-use", "-fprofile-partial-training",
+                       "-fprofile-dir="BUILD_FOLDER"pgo", "-Wno-missing-profile");
+}
+
 #define US THIRD_PARTY_FOLDER"usockets/src/"
 #define NGWS_SOURCES \
     SRC_FOLDER"ngws/ngws.c", SRC_FOLDER"ws_proto.c", \
@@ -90,16 +106,21 @@ int main(void)
     const char *san = getenv("NG_SAN");
     const char *suffix = san && *san ? nob_temp_sprintf("_%s", san) : "";
 
-    /* build/main: the relay (ngws on uSockets, pure C, no TLS). */
+    /* build/main: the relay (ngws on uSockets, pure C, no TLS).
+     * NG_TOOLS_ONLY=1 skips it (fast rebuilds of the bench tools). */
+    const char *tools_only = getenv("NG_TOOLS_ONLY");
+    if (!(tools_only && strcmp(tools_only, "1") == 0)) {
     common_flags(&cmd, "-std=gnu11");
     nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"main%s", suffix));
     nob_cc_inputs(&cmd, CORE_SOURCES, NGWS_SOURCES);
     if (!append_nips(&cmd)) return 1;
     nob_cmd_append(&cmd, "-lpthread", "-lm", "-ldl");
     if (!cmd_run(&cmd)) return 1;
+    }
 
     /* tools: ngws benchmark server and the ngload load generator */
     common_flags(&cmd, "-std=gnu11");
+    pgo_flags(&cmd);
     nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"ngws_bench_server%s", suffix));
     nob_cc_inputs(&cmd, "tools/ngws_bench_server.c", NGWS_SOURCES);
     nob_cmd_append(&cmd, "-lpthread");
