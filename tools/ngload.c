@@ -113,6 +113,7 @@ static thr_t *T;
 static atomic_int phase;          /* 0 connect, 1 run, 2 stop */
 static atomic_int total_open, total_failed;
 static atomic_bool measuring;
+static atomic_ullong npub_acked;     /* OKs counted while measuring (main's early stop) */
 static struct sockaddr_in dst;
 
 static void wb_append(conn_t *c, const void *p, size_t n) {
@@ -249,7 +250,8 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
             c->inflight--;
             bool ok = memmem(p, n, "\",true,", 7) != NULL;
             uint64_t sent_at = c->sh != c->st ? c->sent[c->sh++ & 63] : 0;
-            if (m) { if (ok) t->oks++; else t->fails++; t->msgs++; if (sent_at) hadd(&t->hist, now_ns() - sent_at); }
+            if (m) { if (ok) t->oks++; else t->fails++; t->msgs++; if (sent_at) hadd(&t->hist, now_ns() - sent_at);
+                    atomic_fetch_add_explicit(&npub_acked, 1, memory_order_relaxed); }
             if (atomic_load(&phase) == 1) send_next_event(c, false);
         }
         break;
@@ -398,6 +400,7 @@ static void *thr_main(void *arg) {
             }
         }
     }
+    free(tl_echo); tl_echo = NULL;
     return NULL;
 }
 
@@ -509,7 +512,7 @@ int main(int argc, char **argv) {
     for (int s = 0; s < duration * 10; s++) {
         usleep(100000);
         if (mode == M_NPUB) {     /* stop early when all events acked */
-            uint64_t m = 0; for (int k = 0; k < nthreads; k++) m += T[k].msgs;
+            uint64_t m = atomic_load_explicit(&npub_acked, memory_order_relaxed);
             if (m >= nevents - (nevents % (size_t) nconns)) break;
         }
         if (mode == M_NFAN && atomic_load(&ev_next) >= nevents) { usleep(300000); break; }
@@ -541,5 +544,7 @@ int main(int argc, char **argv) {
                rss2 / 1024.0, (sc1 - sc0) / secs * 100);
     }
     printf(" client_cpu_pct=%.0f\n", (cc1 - cc0) / secs * 100);
+    fflush(stdout);
+    free(h); free(cnt);
     return 0;
 }
