@@ -31,7 +31,7 @@
  * The core has ZERO knowledge of any specific NIP. Every NIP is a plugin in
  * src/nips/ (*.c) registering hooks via nip_plugin_t; the core walks the
  * registry and invokes the generic hooks (on_connect, on_disconnect,
- * on_message, accept_publish, can_deliver, eose_auth_hint, build_eose,
+ * on_message, accept_publish, can_deliver, eose_auth_hint,
  * build_count, timer, info_document).
  * ============================================================================ */
 
@@ -378,13 +378,12 @@ static void query_sender(const char *json, const event_t *event) {
 
 static void query_events(relay_conn_t *connection, const char *sub,
                          filter_t *filters, size_t count, bool do_count) {
-    bool has_more = false;
     int total_count = 0;
     query_connection = connection;
     query_filters = filters;
     query_filters_count = count;
     storage_ctx->send_records(query_sender, sub, filters, count, do_count,
-                              do_count ? NULL : &has_more, &total_count);
+                              &total_count);
     query_connection = NULL;
     query_filters = NULL;
     query_filters_count = 0;
@@ -405,17 +404,10 @@ static void query_events(relay_conn_t *connection, const char *sub,
             response = string_dup(json_builder_finish(&builder));
         }
     } else {
-        bool auth_hint = false;
-        for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->eose_auth_hint && plugin->eose_auth_hint(connection, filters, count, plugin->ctx)) {
-                auth_hint = true;
-                break;
-            }
-        }
-        for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->build_eose) { response = plugin->build_eose(sub, has_more, auth_hint, plugin->ctx); break; }
-        }
-        if (!response) {
+        /* Hook kept for its side effect (NIP-17 sends an AUTH challenge). */
+        for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next)
+            if (plugin->eose_auth_hint && plugin->eose_auth_hint(connection, filters, count, plugin->ctx)) break;
+        {
             json_builder_t builder;
             json_builder_start(&builder);
             json_builder_append_string(&builder, "EOSE");

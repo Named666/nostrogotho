@@ -81,7 +81,7 @@ async def t_concurrent(sk):
     check("concurrent: exactly one fresh OK, 49 duplicate:", len(fresh) == 1 and len(dups) == 49, f"{len(fresh)}/{len(dups)}")
     got = await asyncio.gather(*(collect(s, 1.0, lambda m: m[0] == "EVENT") for s in subs))
     check("concurrent: each subscriber got it exactly once", [len(g) for g in got] == [1, 1, 1], str([len(g) for g in got]))
-    check("concurrent: exactly one row", rows("SELECT count(*) FROM event WHERE id=?", ev["id"])[0][0] == 1)
+    check("concurrent: exactly one row", rows("SELECT count(*) FROM event WHERE id=unhex(?)", ev["id"])[0][0] == 1)
     for p in pubs + subs: await p.close()
 
 async def t_same_batch(sk):
@@ -96,7 +96,7 @@ async def t_same_batch(sk):
           str([m[3][:9] for m in res][:4]))
     got = await asyncio.gather(*(collect(s, 1.0, lambda m: m[0] == "EVENT") for s in subs))
     check("same batch: one broadcast per subscriber", [len(g) for g in got] == [1, 1])
-    check("same batch: one row", rows("SELECT count(*) FROM event WHERE id=?", ev["id"])[0][0] == 1)
+    check("same batch: one row", rows("SELECT count(*) FROM event WHERE id=unhex(?)", ev["id"])[0][0] == 1)
 
     # 3. duplicate after commit
     await p.send(json.dumps(["EVENT", ev]))
@@ -119,7 +119,7 @@ async def t_replaceable(sk, kind):
         await p.send(json.dumps(["EVENT", e]))
     res = await oks(p, 4)
     check(f"kind {kind} race: 4 OK true", len(res) == 4 and all(m[2] for m in res), str([(m[1][:6], m[3][:12]) for m in res]))
-    left = rows("SELECT id FROM event WHERE pubkey=? AND kind=?", pk, kind)
+    left = rows("SELECT lower(hex(id)) FROM event WHERE pubkey=unhex(?) AND kind=?", pk, kind)
     check(f"kind {kind} race: one row, newest + lowest id wins", left == [(winner["id"],)], str(left))
     got = await collect(subs[0], 1.0, lambda m: m[0] == "EVENT")
     ids = [m[2]["id"] for m in got]
@@ -141,7 +141,7 @@ async def t_addressable(sk):
     for e in (a2, b1, a1, n1, e1): await p.send(json.dumps(["EVENT", e]))
     res = await oks(p, 5)
     check("addressable: 5 OK true", len(res) == 5 and all(m[2] for m in res), str([m[3] for m in res]))
-    left = sorted(r[0] for r in rows("SELECT id FROM event WHERE pubkey=? AND kind=30000", pk))
+    left = sorted(r[0] for r in rows("SELECT lower(hex(id)) FROM event WHERE pubkey=unhex(?) AND kind=30000", pk))
     check("addressable: newest per d-tag (a2, b1, empty-d)", left == sorted([a2["id"], b1["id"], e1["id"]]), str(len(left)))
     await p.close()
 
@@ -152,14 +152,14 @@ async def t_deletion(sk):
     await p.send(json.dumps(["EVENT", ev])); await oks(p, 1)
     d = mk(sk, 5, "", [["e", ev["id"]], ["e", future["id"]]])
     await p.send(json.dumps(["EVENT", d])); await oks(p, 1)
-    check("deletion: target removed", rows("SELECT count(*) FROM event WHERE id=?", ev["id"])[0][0] == 0)
+    check("deletion: target removed", rows("SELECT count(*) FROM event WHERE id=unhex(?)", ev["id"])[0][0] == 0)
     await p.send(json.dumps(["EVENT", ev]))
     r = await oks(p, 1)
     check("deletion: re-insert refused", r and r[0][2] is False and r[0][3].startswith("blocked:"), str(r))
     await p.send(json.dumps(["EVENT", future]))
     r = await oks(p, 1)
     check("deletion: pre-deleted id refused", r and r[0][2] is False and r[0][3].startswith("blocked:"), str(r))
-    check("deletion: no rows", rows("SELECT count(*) FROM event WHERE id IN (?,?)", ev["id"], future["id"])[0][0] == 0)
+    check("deletion: no rows", rows("SELECT count(*) FROM event WHERE id IN (unhex(?),unhex(?))", ev["id"], future["id"])[0][0] == 0)
     await p.close()
 
 async def main():

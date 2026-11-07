@@ -31,11 +31,11 @@ static __thread sqlite3 *db_conn = NULL;
 enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_COUNT };
 static const char *const ps_sql[PS_COUNT] = {
     "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
-    "SELECT 1 FROM deleted_event WHERE id = ? AND pubkey = ?",
-    "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (?, ?)",
-    "SELECT id, created_at, tags FROM event WHERE pubkey = ? AND kind = ?",
-    "DELETE FROM event WHERE id = ?",
+    "VALUES (unhex(?), unhex(?), ?, ?, ?, ?, unhex(?)) ON CONFLICT(id) DO NOTHING",
+    "SELECT 1 FROM deleted_event WHERE id = unhex(?) AND pubkey = unhex(?)",
+    "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (unhex(?), unhex(?))",
+    "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = unhex(?) AND kind = ?",
+    "DELETE FROM event WHERE id = unhex(?)",
 };
 static __thread sqlite3_stmt *ps[PS_COUNT];
 
@@ -111,7 +111,7 @@ static void store_delegations(const event_t *ev) {
     if (!db_conn || !ev || !ev->tags_json || !ev->tags_json[0]) return;
 
     static const char *insert_sql =
-        "INSERT OR IGNORE INTO delegation (event_id, delegator) VALUES (?, ?)";
+        "INSERT OR IGNORE INTO delegation (event_id, delegator) VALUES (unhex(?), unhex(?))";
 
     jstr_t key, t, tags_str = jl_str(ev->tags_json);
     size_t offset = 0;
@@ -218,7 +218,7 @@ char *escape_like(const char *str, size_t len) {
 static event_t *get_event_by_id(const char *id) {
     if (!db_conn || !id) return NULL;
     
-    const char *sql = "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event WHERE id = ?";
+    const char *sql = "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, content, lower(hex(sig)) FROM event WHERE id = unhex(?)";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -402,7 +402,7 @@ static int replaceable_admit(const event_t *ev, const char *dtag) {
 static int delete_record_by_id_and_pubkey(const char *id, const char *pubkey) {
     if (!db_conn || !id || !pubkey) return -1;
     
-    const char *sql = "DELETE FROM event WHERE id = ? AND pubkey = ?";
+    const char *sql = "DELETE FROM event WHERE id = unhex(?) AND pubkey = unhex(?)";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -427,7 +427,7 @@ static int delete_record_by_id_and_pubkey(const char *id, const char *pubkey) {
 static int delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t created_at) {
     if (!db_conn || !pubkey) return -1;
     
-    const char *sql = "DELETE FROM event WHERE kind = ? AND pubkey = ? AND created_at < ?";
+    const char *sql = "DELETE FROM event WHERE kind = ? AND pubkey = unhex(?) AND created_at < ?";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -455,7 +455,7 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
     if (!db_conn || !pubkey || !tag) return -1;
     
     /* First, select candidate events by kind, pubkey, and created_at */
-    const char *sql = "SELECT id, tags FROM event WHERE kind = ? AND pubkey = ? AND created_at < ?";
+    const char *sql = "SELECT lower(hex(id)), tags FROM event WHERE kind = ? AND pubkey = unhex(?) AND created_at < ?";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -525,7 +525,7 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
      * matching row), so size the SQL buffer dynamically instead of a fixed
      * "... IN (?,..." placeholder list that could overflow the stack. */
     size_t delete_sql_len = strlen("DELETE FROM event WHERE id IN (") +
-                            ids_count * 2 + 2;
+                            ids_count * 9 + 2;
     char *delete_sql = (char *) malloc(delete_sql_len);
     if (!delete_sql) {
         for (size_t i = 0; i < ids_count; i++) free(ids[i]);
@@ -534,7 +534,7 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
     }
     snprintf(delete_sql, delete_sql_len, "DELETE FROM event WHERE id IN (");
     for (size_t i = 0; i < ids_count; i++) {
-        strcat(delete_sql, "?");
+        strcat(delete_sql, "unhex(?)");
         if (i < ids_count - 1) strcat(delete_sql, ",");
     }
     strcat(delete_sql, ")");
@@ -577,7 +577,7 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
     if (!db_conn || !id || !tag) return -1;
     
     /* First, select candidate event by ID and kind */
-    const char *sql = "SELECT id, tags FROM event WHERE id = ? AND kind = ?";
+    const char *sql = "SELECT lower(hex(id)), tags FROM event WHERE id = unhex(?) AND kind = ?";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -629,7 +629,7 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
      * matching row), so size the SQL buffer dynamically instead of a fixed
      * "... IN (?,..." placeholder list that could overflow the stack. */
     size_t delete_sql_len = strlen("DELETE FROM event WHERE id IN (") +
-                            ids_count * 2 + 2;
+                            ids_count * 9 + 2;
     char *delete_sql = (char *) malloc(delete_sql_len);
     if (!delete_sql) {
         for (size_t i = 0; i < ids_count; i++) free(ids[i]);
@@ -638,7 +638,7 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
     }
     snprintf(delete_sql, delete_sql_len, "DELETE FROM event WHERE id IN (");
     for (size_t i = 0; i < ids_count; i++) {
-        strcat(delete_sql, "?");
+        strcat(delete_sql, "unhex(?)");
         if (i < ids_count - 1) strcat(delete_sql, ",");
     }
     strcat(delete_sql, ")");
@@ -683,8 +683,8 @@ static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at,
     if (!db_conn || !pubkey) return -1;
     
     const char *sql = exclude_kind
-        ? "DELETE FROM event WHERE pubkey = ? AND created_at <= ? AND kind != ?"
-        : "DELETE FROM event WHERE pubkey = ? AND created_at <= ?";
+        ? "DELETE FROM event WHERE pubkey = unhex(?) AND created_at <= ? AND kind != ?"
+        : "DELETE FROM event WHERE pubkey = unhex(?) AND created_at <= ?";
     sqlite3_stmt *stmt = NULL;
     
     if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -735,7 +735,7 @@ static int purge_expired_sqlite3(time_t now) {
 
     sqlite3_stmt *select;
     const char *find_sql =
-        "SELECT id FROM event WHERE tags LIKE '%\"expiration\"%' AND created_at <= ?";
+        "SELECT lower(hex(id)) FROM event WHERE tags LIKE '%\"expiration\"%' AND created_at <= ?";
     int deleted = 0;
 
     if (sqlite3_prepare_v2(db_conn, find_sql, -1, &select, NULL) != SQLITE_OK) {
@@ -850,12 +850,10 @@ static bool append_tag_like_condition(char *conditions, size_t conditions_size,
  *   filters - array of filter structures
  *   filters_count - number of filters
  *   do_count - if true, count events instead of streaming
- *   has_more - if not NULL, set to true if more events exist
  * 
  * Returns: true on success, false on database error
  * 
  * Features:
- *   - Fetches limit+1 events to determine has_more (NIP-67)
  *   - Filters can contain:
  *     - ids: event IDs (full or prefix match)
  *     - authors: pubkeys (full or prefix match)
@@ -876,9 +874,8 @@ static bool append_tag_like_condition(char *conditions, size_t conditions_size,
  */
 static bool send_records(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more, int *out_count) {
+                        bool do_count, int *out_count) {
     if (!db_conn || !sender) return false;
-    if (has_more) *has_more = false;
     if (do_count && out_count) *out_count = 0;
     
     /* Validate input sizes to prevent buffer overflows */
@@ -919,7 +916,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         if (do_count) {
             strcpy(sql, "SELECT COUNT(id) FROM event");
         } else {
-            strcpy(sql, "SELECT id, pubkey, created_at, kind, tags, content, sig FROM event");
+            strcpy(sql, "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, content, lower(hex(sig)) FROM event");
         }
         
         int limit = 500;
@@ -943,7 +940,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
             first = false;
 
             if (filter->ids_count == 1) {
-                if (!conditions_append(conditions, sizeof(conditions), "id = ?")) ids_ok = false;
+                if (!conditions_append(conditions, sizeof(conditions), "id = unhex(?)")) ids_ok = false;
                 if (param_count >= 256) ids_ok = false;
                 if (ids_ok) {
                     params[param_count].type = PARAM_TYPE_STRING;
@@ -954,7 +951,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 if (!conditions_append(conditions, sizeof(conditions), "id IN (")) ids_ok = false;
                 for (size_t i = 0; ids_ok && i < filter->ids_count; i++) {
                     if (!conditions_append(conditions, sizeof(conditions),
-                                           i < filter->ids_count - 1 ? "?," : "?")) {
+                                           i < filter->ids_count - 1 ? "unhex(?)," : "unhex(?)")) {
                         ids_ok = false;
                         break;
                     }
@@ -987,7 +984,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 !conditions_append(conditions, sizeof(conditions), "(pubkey IN (")) authors_ok = false;
             for (size_t i = 0; authors_ok && i < filter->authors_count; i++) {
                 if (!conditions_append(conditions, sizeof(conditions),
-                                       i < filter->authors_count - 1 ? "?," : "?")) {
+                                       i < filter->authors_count - 1 ? "unhex(?)," : "unhex(?)")) {
                     authors_ok = false;
                     break;
                 }
@@ -1007,7 +1004,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
              * the subquery adds no full-table scans. */
             for (size_t i = 0; authors_ok && i < filter->authors_count; i++) {
                 if (!conditions_append(conditions, sizeof(conditions),
-                                       i < filter->authors_count - 1 ? "?," : "?")) {
+                                       i < filter->authors_count - 1 ? "unhex(?)," : "unhex(?)")) {
                     authors_ok = false;
                     break;
                 }
@@ -1172,7 +1169,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 return false;
             }
             params[param_count].type = PARAM_TYPE_NUMBER;
-            params[param_count].value.number = limit + 1;  /* Fetch one extra */
+            params[param_count].value.number = limit;
             param_count++;
         }
         
@@ -1207,10 +1204,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 fetched++;
                 
-                if (fetched > limit) {
-                    if (has_more) *has_more = true;
-                    break;
-                }
+                if (fetched > limit) break;
                 
                 event_t event = {0};
                 json_builder_t builder;
@@ -1337,32 +1331,32 @@ static bool storage_init_sqlite3(const char *dsn) {
     /* Create tables and indexes */
     const char *schema_sql = 
         "CREATE TABLE IF NOT EXISTS event ("
-        "    id TEXT NOT NULL,"
-        "    pubkey TEXT NOT NULL,"
+        /* ids, pubkeys and sigs are stored binary (32/32/64 bytes); SQL
+         * converts at the boundary with unhex(?) / lower(hex(col)). */
+        "    id BLOB NOT NULL CHECK (length(id) = 32),"
+        "    pubkey BLOB NOT NULL CHECK (length(pubkey) = 32),"
         "    created_at INTEGER NOT NULL,"
         "    kind INTEGER NOT NULL,"
         "    tags TEXT NOT NULL,"
         "    content TEXT NOT NULL,"
-        "    sig TEXT NOT NULL"
+        "    sig BLOB NOT NULL"
         ");"
         "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event(id);"
         /* (pubkey,kind) serves authors filters (prefix) and the replaceable
          * lookup; kindidx was a redundant prefix of kindtimeidx. */
-        "DROP INDEX IF EXISTS pubkeyprefix;"
-        "DROP INDEX IF EXISTS kindidx;"
         "CREATE INDEX IF NOT EXISTS pubkindidx ON event(pubkey,kind);"
         "CREATE INDEX IF NOT EXISTS timeidx ON event(created_at DESC);"
         "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);"
         /* NIP-09 tombstones: (id, deleting author). */
         "CREATE TABLE IF NOT EXISTS deleted_event ("
-        "    id TEXT NOT NULL, pubkey TEXT NOT NULL, PRIMARY KEY (id, pubkey)"
+        "    id BLOB NOT NULL, pubkey BLOB NOT NULL, PRIMARY KEY (id, pubkey)"
         ") WITHOUT ROWID;"
         /* NIP-26 delegation side table: one row per (event, delegator).
          * ON DELETE CASCADE keeps it in sync with event deletions because
          * PRAGMA foreign_keys is enabled above. */
         "CREATE TABLE IF NOT EXISTS delegation ("
-        "    event_id TEXT NOT NULL REFERENCES event(id) ON DELETE CASCADE,"
-        "    delegator TEXT NOT NULL,"
+        "    event_id BLOB NOT NULL REFERENCES event(id) ON DELETE CASCADE,"
+        "    delegator BLOB NOT NULL,"
         "    PRIMARY KEY (event_id, delegator)"
         ");"
         "CREATE INDEX IF NOT EXISTS delegation_delegator_idx "
@@ -1377,69 +1371,6 @@ static bool storage_init_sqlite3(const char *dsn) {
         return false;
     }
 
-    /* One-time backfill: existing databases created before the delegation
-     * table have no indexed delegators. The backfilled_delegation table
-     * tracks whether the migration already ran, so the (potentially long)
-     * LIKE-based scan happens at most once per database, at startup, and
-     * never again during request handling. */
-    const char *backfill_sql =
-        "CREATE TABLE IF NOT EXISTS backfilled_delegation (done INTEGER NOT NULL);"
-        "INSERT OR IGNORE INTO backfilled_delegation (done) SELECT 0 "
-        "WHERE NOT EXISTS (SELECT 1 FROM backfilled_delegation);";
-    errmsg = NULL;
-    if (sqlite3_exec(db_conn, backfill_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", errmsg);
-        sqlite3_free(errmsg);
-        sqlite3_close_v2(db_conn);
-        db_conn = NULL;
-        return false;
-    }
-    {
-        sqlite3_stmt *check = NULL;
-        bool needs_backfill = false;
-        if (sqlite3_prepare_v2(db_conn,
-                               "SELECT done FROM backfilled_delegation LIMIT 1",
-                               -1, &check, NULL) == SQLITE_OK &&
-            sqlite3_step(check) == SQLITE_ROW &&
-            sqlite3_column_int(check, 0) == 0) {
-            needs_backfill = true;
-        }
-        sqlite3_finalize(check);
-
-        if (needs_backfill) {
-            fprintf(stderr, "Migrating: indexing NIP-26 delegation tags (one-time)...\n");
-            /* Walk every event that carries a delegation tag anywhere in its
-             * tags JSON, parse it exactly in C, and index true delegators. */
-            sqlite3_stmt *scan = NULL;
-            if (sqlite3_prepare_v2(db_conn,
-                                   "SELECT id, tags FROM event "
-                                   "WHERE tags LIKE '%\"delegation\"%'",
-                                   -1, &scan, NULL) != SQLITE_OK) {
-                fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-            } else {
-                event_t ev = {0};
-                while (sqlite3_step(scan) == SQLITE_ROW) {
-                    const char *id = (const char *) sqlite3_column_text(scan, 0);
-                    const char *tags_json = (const char *) sqlite3_column_text(scan, 1);
-                    if (!id || !tags_json) continue;
-                    snprintf(ev.id, sizeof(ev.id), "%s", id);
-                    ev.tags_json = (char *) tags_json;
-                    store_delegations(&ev);
-                    ev.tags_json = NULL;
-                }
-                sqlite3_finalize(scan);
-            }
-            errmsg = NULL;
-            if (sqlite3_exec(db_conn,
-                             "UPDATE backfilled_delegation SET done = 1",
-                             NULL, NULL, &errmsg) != SQLITE_OK) {
-                fprintf(stderr, "SQL error: %s\n", errmsg);
-                sqlite3_free(errmsg);
-            } else {
-                fprintf(stderr, "Migration complete.\n");
-            }
-        }
-    }
     
     return true;
 }

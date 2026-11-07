@@ -199,7 +199,6 @@ typedef struct {
      *              When counting, the sender is NOT invoked; the total is
      *              returned via out_count (NIP-45) and the caller builds the
      *              COUNT response.
-     *   has_more - if not NULL, set to true if more events exist beyond limit
      *   out_count - when do_count is true, receives the aggregated count.
      *               May be NULL when do_count is false.
      * 
@@ -210,11 +209,10 @@ typedef struct {
      *   - Within a filter, criteria are AND'd
      *   - If do_count is true, reports the count via out_count instead of
      *     emitting a COUNT response (NIP-45)
-     *   - Fetches limit+1 events to determine has_more flag (NIP-67)
      */
     bool (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
-                        bool do_count, bool *has_more, int *out_count);
+                        bool do_count, int *out_count);
 
     /* Multi-threaded backends: per-thread connection management and write
      * batching (BEGIN IMMEDIATE ... COMMIT). Only the single writer thread

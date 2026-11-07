@@ -139,17 +139,6 @@ static bool nip_xx_eose_auth_hint(relay_conn_t *connection,
     return false;
 }
 
-/* Build the ["EOSE", ...] / ["COUNT", ...] response (malloc'd, caller frees).
- * The first plugin providing the hook wins; otherwise the server falls back
- * to a bare protocol-default response. */
-static char *nip_xx_build_eose(const char *sub, bool has_more, bool auth_hint,
-                               void *ctx) {
-    (void) sub;
-    (void) has_more;
-    (void) auth_hint;
-    (void) ctx;
-    return NULL;
-}
 
 static char *nip_xx_build_count(const char *sub, unsigned long count, void *ctx) {
     (void) sub;
@@ -196,7 +185,6 @@ static nip_plugin_t nip_xx_plugin = {
     .accept_publish = nip_xx_accept_publish,
     .can_deliver = nip_xx_can_deliver,
     .eose_auth_hint = nip_xx_eose_auth_hint,
-    .build_eose = nip_xx_build_eose,
     .build_count = nip_xx_build_count,
     .timer = nip_xx_timer,
     .timer_interval_ms = 0,        /* 0 = no periodic timer */

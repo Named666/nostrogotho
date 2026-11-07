@@ -107,10 +107,7 @@ typedef struct nip_plugin {
     bool (*eose_auth_hint)(relay_conn_t *connection,
                            const filter_t *filters, size_t count, void *ctx);
 
-    /* Build the ["EOSE", ...] / ["COUNT", ...] response (malloc'd, caller
-     * frees). The first plugin providing the hook wins; otherwise the
-     * server falls back to a bare protocol-default response. */
-    char *(*build_eose)(const char *sub, bool has_more, bool auth_hint, void *ctx);
+    /* Build the ["COUNT", ...] response (malloc'd, caller frees). */
     char *(*build_count)(const char *sub, unsigned long count, void *ctx);
 
     /* Periodic maintenance, driven every timer_interval_ms inside the

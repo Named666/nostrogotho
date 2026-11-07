@@ -38,7 +38,7 @@
 | [42](thirdparty/nips/42.md) | Client Authentication | ✅ Complete | `22242` (auth) | ✅ |
 | [45](thirdparty/nips/45.md) | Event Counts | ✅ Complete | — | ✅ |
 | [62](thirdparty/nips/62.md) | Request to Vanish | ✅ Complete | `62` | ✅ |
-| [67](thirdparty/nips/67.md) | EOSE Completeness Hint | ✅ Complete | — | ✅ |
+| [67](thirdparty/nips/67.md) | EOSE Completeness Hint | ❌ Removed (EOSE is exactly `["EOSE",sub]`) | — | — |
 
 
 ---
@@ -50,7 +50,7 @@
 ### What is implemented ✅
 
 - **`name`** — `"nostrogotho"`.
-- **`supported_nips` advertisement** — `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62, 67]`,
+- **`supported_nips` advertisement** — `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62]`,
   matching the NIPs actually wired into the server.
 - **`limitation` block** — built from the real runtime constants passed in via
   `nip11_configure()` during `server_configure()`: `max_message_length` (5242880),
@@ -202,7 +202,7 @@
 Implemented (as advertised by `nip11.c`):
 
 ```
-[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62, 67]
+[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62]
 ```
 
 ### Shared theme: JSON escaping

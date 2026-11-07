@@ -43,7 +43,6 @@ nostrogotho/
     ├── nip42.c/h            Client Authentication
     ├── nip45.c/h            Event Counts
     ├── nip62.c/h            Request to Vanish
-    ├── nip67.c/h            EOSE Completeness Hint
     ├── nip_event.c/h        Shared event-tag inspection
     └── nip_plugin.c/h       Plugin registration architecture
 ```
@@ -103,9 +102,8 @@ The relay implements 13 NIPs. Status as of the 2026-09-03 audit:
 | 42 | Client Authentication | ✅ Complete | Yes |
 | 45 | Event Counts | ✅ Complete | Yes |
 | 62 | Request to Vanish | ✅ Complete | Yes |
-| 67 | EOSE Completeness Hint | ✅ Complete | Yes |
 
-**Target `supported_nips`:** `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62, 67]`
+**Target `supported_nips`:** `[1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62]`
 
 ## Limits And Operations
 
@@ -150,7 +148,6 @@ time ranges, and content search; stored events are delivered before EOSE.
 | 42 | Supported | Issues cryptographically random challenges and verifies signed client authentication events. |
 | 45 | Supported | Handles `COUNT` queries. |
 | 62 | Supported | Processes Request to Vanish events targeting this relay or `ALL_RELAYS`. |
-| 67 | Supported | Emits an EOSE completeness hint when a query exceeds its configured limit. |
 | AC | Supported | Handled WebRTC signaling for peer-to-peer communication. |
 
 ## Protocol Modules
@@ -160,7 +157,7 @@ event loops and WebSocket framing, `backend_ngws.c` the threading model, and
 `relay_core.c` the subscription index, lifecycle and dispatch;
 NIP modules own protocol-specific decisions. Every supported server-side NIP has
 its own implementation and header: `nip09`, `nip11`, `nip13`, `nip17`, `nip33`,
-`nip62`, and `nip40`/`nip45`/`nip67`. Shared event-tag inspection lives in
+`nip62`, and `nip40`/`nip45`. Shared event-tag inspection lives in
 `nip_event`. Add new NIP behavior in this directory and expose a small,
 documented interface rather than growing the transport loop.
 
