@@ -110,6 +110,10 @@ typedef struct {
 
 typedef struct { outtask_t *t; size_t cap; } outbox_t;
 
+#ifndef SMALL_EVENT_COPY
+#define SMALL_EVENT_COPY 2048   /* event bodies up to this size are copied per subscriber */
+#endif
+
 /* ---------------------------------------------------------------- state -- */
 static ngws_server_t *srv;
 static int n_loops;
@@ -148,9 +152,13 @@ static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
             else if (r->kind == R_CLOSE) ngws_close(ws, 1000, NULL);
             else if (r->kind == R_EVENT) {
                 /* d = frame header + ["EVENT",<sub>, ; then shared body, then ] */
-                ngws_send_shared(ws, d, r->len);
-                ngws_send_shared(ws, r->body->json, r->body->len);
-                ngws_send_shared(ws, "]", 1);
+                if (r->body->len <= SMALL_EVENT_COPY) {   /* one contiguous copy beats 3 iovecs */
+                    ngws_send_raw3(ws, d, r->len, r->body->json, r->body->len, "]", 1);
+                } else {
+                    ngws_send_shared(ws, d, r->len);
+                    ngws_send_shared(ws, r->body->json, r->body->len);
+                    ngws_send_shared(ws, "]", 1);
+                }
             }
         }
         if (r->kind == R_EVENT) ngws_loop_defer(loop, body_release_cb, r->body);

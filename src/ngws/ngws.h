@@ -78,6 +78,8 @@ ngws_loop_t *ngws_server_loop(ngws_server_t *srv, int idx);
 int  ngws_send(ngws_socket_t *ws, const void *data, size_t len, int opcode);
 /* Append an already-framed message (see ngws_frame_build). */
 int  ngws_send_raw(ngws_socket_t *ws, const void *frame, size_t len);
+/* Same, frame given as three consecutive pieces (copied into one region). */
+int  ngws_send_raw3(ngws_socket_t *ws, const void *a, size_t an, const void *b, size_t bn, const void *c, size_t cn);
 /* Zero-copy: queue caller memory holding a complete frame. It must stay valid
  * until the end of the current loop iteration (see ngws_loop_alloc/defer). */
 int  ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len);

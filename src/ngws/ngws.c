@@ -356,6 +356,16 @@ int ngws_send_raw(ngws_socket_t *ws, const void *frame, size_t len) {
     return send_status(x);
 }
 
+int ngws_send_raw3(ngws_socket_t *ws, const void *a, size_t an, const void *b, size_t bn, const void *c, size_t cn) {
+    struct us_socket_t *s = (struct us_socket_t *) ws;
+    sockx_t *x = X(s);
+    if (x->state != ST_WS) return NGWS_SEND_DROPPED;
+    char *p = out_reserve(x, an + bn + cn);
+    if (!p) return NGWS_SEND_DROPPED;
+    memcpy(p, a, an); memcpy(p + an, b, bn); memcpy(p + an + bn, c, cn);
+    return send_status(x);
+}
+
 int ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len) {
     struct us_socket_t *s = (struct us_socket_t *) ws;
     sockx_t *x = X(s);
