@@ -82,7 +82,7 @@ static void pgo_flags(Cmd *cmd)
                        "-fprofile-dir="BUILD_FOLDER"pgo",
                        "-Wl,-u,__gcov_dump");   /* weak ref in the bench server: pull it from libgcov */
     else if (strcmp(pgo, "use") == 0)
-        nob_cmd_append(cmd, "-fprofile-use", "-fprofile-partial-training",
+        nob_cmd_append(cmd, "-fprofile-use", "-fprofile-partial-training", "-fprofile-correction",
                        "-fprofile-dir="BUILD_FOLDER"pgo", "-Wno-missing-profile");
 }
 
