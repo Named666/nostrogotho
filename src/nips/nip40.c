@@ -26,11 +26,11 @@
 bool nip40_event_is_expired(const event_t *event) {
     if (!event || !event->tags_json) return false;
 
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    jstr_t key, tag, tags = jl_str(event->tags_json);
     size_t offset = 0;
     time_t now = time(NULL);
 
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
         char *name = nip_tag_element(tag, 0);
         if (name && strcmp(name, "expiration") == 0) {
             char *value = nip_tag_element(tag, 1);
@@ -88,7 +88,7 @@ static void nip40_plugin_init(const relay_config_t *config, void *ctx) {
 
 /* Publish policy: "Relays SHOULD drop any events that are published to them
  * if they are expired." */
-static bool nip40_accept_publish(struct mg_connection *connection,
+static bool nip40_accept_publish(relay_conn_t *connection,
                                  const event_t *event,
                                  char *reason, size_t reason_size,
                                  void *ctx) {
@@ -103,7 +103,7 @@ static bool nip40_accept_publish(struct mg_connection *connection,
 
 /* Delivery policy: "Relays SHOULD NOT send expired events to clients, even
  * if they are stored." */
-static bool nip40_can_deliver(const event_t *event, struct mg_connection *connection,
+static bool nip40_can_deliver(const event_t *event, relay_conn_t *connection,
                               void *ctx) {
     (void) connection;
     (void) ctx;

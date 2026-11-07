@@ -17,13 +17,18 @@
 #include "nip_plugin.h"
 
 typedef struct nip42_client {
-    struct mg_connection *connection;
     char challenge[17];
     char pubkey[MAX_PUBKEY_SIZE + 1];
-    struct nip42_client *next;
 } nip42_client_t;
 
-static nip42_client_t *clients;
+/* Per-connection auth state lives in a relay_conn slot: O(1) lookup and no
+ * shared list, so it is safe with connections spread across worker threads
+ * (each connection's state is only touched by its pinned worker). */
+static int nip42_slot = -1;
+
+__attribute__((constructor)) static void nip42_slot_init(void) {
+    nip42_slot = relay_conn_slot_alloc();
+}
 
 /* nip42_random_bytes - Fill a buffer with cryptographically-strong random
  * bytes. Uses BCryptGenRandom on Windows, getrandom(2) on Linux, and falls
@@ -55,44 +60,33 @@ static bool nip42_random_bytes(unsigned char *buf, size_t len) {
 #endif
 }
 
-static nip42_client_t *find_client(struct mg_connection *connection) {
-    for (nip42_client_t *client = clients; client; client = client->next) {
-        if (client->connection == connection) return client;
-    }
-    return NULL;
+static nip42_client_t *find_client(relay_conn_t *connection) {
+    return (nip42_client_t *) relay_conn_get_slot(connection, nip42_slot);
 }
 
-bool nip42_open(struct mg_connection *connection, char challenge[17]) {
+bool nip42_open(relay_conn_t *connection, char challenge[17]) {
     unsigned char random[8];
-    nip42_client_t *client = calloc(1, sizeof(*client));
+    nip42_client_t *client = find_client(connection);
+    bool fresh = client == NULL;
+    if (fresh) client = calloc(1, sizeof(*client));
     if (!client || !nip42_random_bytes(random, sizeof(random))) {
-        free(client);
+        if (fresh) free(client);
         return false;
     }
-    client->connection = connection;
     for (size_t index = 0; index < sizeof(random); index++) {
         snprintf(client->challenge + index * 2, 3, "%02x", random[index]);
     }
     memcpy(challenge, client->challenge, sizeof(client->challenge));
-    client->next = clients;
-    clients = client;
+    relay_conn_set_slot(connection, nip42_slot, client);
     return true;
 }
 
-void nip42_close(struct mg_connection *connection) {
-    nip42_client_t **link = &clients;
-    while (*link) {
-        if ((*link)->connection == connection) {
-            nip42_client_t *client = *link;
-            *link = client->next;
-            free(client);
-            return;
-        }
-        link = &(*link)->next;
-    }
+void nip42_close(relay_conn_t *connection) {
+    free(find_client(connection));
+    relay_conn_set_slot(connection, nip42_slot, NULL);
 }
 
-const char *nip42_authenticated_pubkey(struct mg_connection *connection) {
+const char *nip42_authenticated_pubkey(relay_conn_t *connection) {
     nip42_client_t *client = find_client(connection);
     return client && client->pubkey[0] ? client->pubkey : NULL;
 }
@@ -100,7 +94,7 @@ const char *nip42_authenticated_pubkey(struct mg_connection *connection) {
 /* nip42_open_challenge - Generate a fresh challenge for an existing client
  * (used before emitting a NIP-67 "auth" hint). Returns false when the
  * connection has no client record. */
-bool nip42_open_challenge(struct mg_connection *connection, char challenge[17]) {
+bool nip42_open_challenge(relay_conn_t *connection, char challenge[17]) {
     unsigned char random[8];
     nip42_client_t *client = find_client(connection);
     if (!client || !nip42_random_bytes(random, sizeof(random))) {
@@ -113,7 +107,7 @@ bool nip42_open_challenge(struct mg_connection *connection, char challenge[17]) 
     return true;
 }
 
-bool nip42_authenticate(struct mg_connection *connection, const event_t *event,
+bool nip42_authenticate(relay_conn_t *connection, const event_t *event,
                         const char *service_url, time_t now) {
     nip42_client_t *client = find_client(connection);
     if (!client || event->kind != 22242 || !check_event(event) ||
@@ -145,7 +139,7 @@ static void nip42_plugin_init(const relay_config_t *config, void *ctx) {
 
 /* "-" tag policy from NIP-42: an event tagged "-" requires an authenticated
  * connection whose pubkey matches the event author. */
-static bool nip42_plugin_accept_publish(struct mg_connection *connection,
+static bool nip42_plugin_accept_publish(relay_conn_t *connection,
                                         const event_t *event,
                                         char *reason, size_t reason_size,
                                         void *ctx) {
@@ -165,7 +159,7 @@ static bool nip42_plugin_accept_publish(struct mg_connection *connection,
     return true;
 }
 
-static bool nip42_plugin_on_message(struct mg_connection *connection,
+static bool nip42_plugin_on_message(relay_conn_t *connection,
                                     json_value_t *values, size_t count,
                                     void *ctx) {
     (void) ctx;
@@ -194,7 +188,7 @@ static bool nip42_plugin_on_message(struct mg_connection *connection,
     return true;
 }
 
-static void nip42_plugin_on_connect(struct mg_connection *connection, void *ctx) {
+static void nip42_plugin_on_connect(relay_conn_t *connection, void *ctx) {
     (void) ctx;
     char challenge[17];
     if (!nip42_open(connection, challenge)) return;
@@ -205,7 +199,7 @@ static void nip42_plugin_on_connect(struct mg_connection *connection, void *ctx)
     nip_plugin_send_json(connection, json_builder_finish(&builder));
 }
 
-static void nip42_plugin_on_disconnect(struct mg_connection *connection, void *ctx) {
+static void nip42_plugin_on_disconnect(relay_conn_t *connection, void *ctx) {
     (void) ctx;
     nip42_close(connection);
 }

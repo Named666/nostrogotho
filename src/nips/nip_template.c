@@ -55,7 +55,7 @@ static nip_xx_state_t nip_xx_state;
  */
 
 static nip01_process_result_t nip_xx_on_event(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
@@ -84,18 +84,18 @@ static void nip_xx_init(const relay_config_t *config, void *ctx) {
 }
 
 /* Connection opened / closed (e.g. NIP-42 sends its AUTH challenge here). */
-static void nip_xx_on_connect(struct mg_connection *connection, void *ctx) {
+static void nip_xx_on_connect(relay_conn_t *connection, void *ctx) {
     (void) connection;
     (void) ctx;
 }
 
-static void nip_xx_on_disconnect(struct mg_connection *connection, void *ctx) {
+static void nip_xx_on_disconnect(relay_conn_t *connection, void *ctx) {
     (void) connection;
     (void) ctx;
 }
 
 /* Return true if the plugin consumed the message (e.g. NIP-42 "AUTH"). */
-static bool nip_xx_on_message(struct mg_connection *connection,
+static bool nip_xx_on_message(relay_conn_t *connection,
                               json_value_t *values, size_t count, void *ctx) {
     (void) connection;
     (void) values;
@@ -106,7 +106,7 @@ static bool nip_xx_on_message(struct mg_connection *connection,
 
 /* Publish policy. Return false and fill `reason` to reject an EVENT before
  * kind dispatch (e.g. NIP-40 expiry, NIP-42 restricted tags). */
-static bool nip_xx_accept_publish(struct mg_connection *connection,
+static bool nip_xx_accept_publish(relay_conn_t *connection,
                                   const event_t *event,
                                   char *reason, size_t reason_size, void *ctx) {
     (void) connection;
@@ -120,7 +120,7 @@ static bool nip_xx_accept_publish(struct mg_connection *connection,
 /* Delivery policy. Return false to suppress an event for this connection on
  * both stored queries and broadcasts (NIP-40, NIP-17). */
 static bool nip_xx_can_deliver(const event_t *event,
-                               struct mg_connection *connection, void *ctx) {
+                               relay_conn_t *connection, void *ctx) {
     (void) event;
     (void) connection;
     (void) ctx;
@@ -129,7 +129,7 @@ static bool nip_xx_can_deliver(const event_t *event,
 
 /* Called when a REQ finishes. May emit its own protocol traffic and returns
  * true to make the EOSE carry the "auth" completeness hint (NIP-17/67). */
-static bool nip_xx_eose_auth_hint(struct mg_connection *connection,
+static bool nip_xx_eose_auth_hint(relay_conn_t *connection,
                                   const filter_t *filters, size_t count,
                                   void *ctx) {
     (void) connection;

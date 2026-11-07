@@ -36,7 +36,8 @@ int main(void)
     nob_cc_output(&cmd, output_path);
 
     /* Core sources that are always required. */
-    nob_cc_inputs(&cmd, SRC_FOLDER"main.c", SRC_FOLDER"server.c",
+    nob_cc_inputs(&cmd, SRC_FOLDER"main.c", SRC_FOLDER"backend_mongoose.c",
+                  SRC_FOLDER"relay_core.c", SRC_FOLDER"relay_conn.c", SRC_FOLDER"json_lite.c",
                   SRC_FOLDER"crypto.c",
                   SRC_FOLDER"storage.c", SRC_FOLDER"nostrogotho.c",
                   SRC_FOLDER"json_util.c", THIRD_PARTY_FOLDER"sqlite3.c",

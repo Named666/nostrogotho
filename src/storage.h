@@ -194,6 +194,14 @@ typedef struct {
     bool (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
                         bool do_count, bool *has_more, int *out_count);
+
+    /* Multi-threaded backends: per-thread connection management and write
+     * batching (BEGIN IMMEDIATE ... COMMIT). Only the single writer thread
+     * calls the write functions / begin_batch / commit_batch. */
+    bool (*thread_open)(bool readonly);
+    void (*thread_close)(void);
+    bool (*begin_batch)(void);
+    bool (*commit_batch)(void);
 } storage_context_t;
 
 /* ============================================================================

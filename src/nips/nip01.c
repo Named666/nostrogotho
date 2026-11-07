@@ -52,11 +52,10 @@ static bool plugin_listens_for(const nip_plugin_t *plugin, int kind) {
     return false;
 }
 
-nip01_process_result_t nip01_process_event(
-    struct mg_connection *connection,
+/* Stateless, CPU-bound checks (id/sig/delegation, size, timestamps). Safe to
+ * run on any worker thread; never touches storage. */
+nip01_process_result_t nip01_precheck_event(
     const event_t *event,
-    storage_context_t *storage,
-    const char *relay_url,
     size_t max_content_length,
     time_t created_at_lower_limit,
     time_t created_at_upper_limit,
@@ -109,14 +108,18 @@ nip01_process_result_t nip01_process_event(
                 "invalid: created_at is out of the acceptable range");
         return result;
     }
-    
-    /* Step 4: Proof-of-work (NIP-13) is enforced by the nip13 plugin's
-     * accept_publish hook, which the server runs before dispatching here. */
+    result.accepted = true;
+    return result;
+}
 
-    /* Step 4b: NIP-module publish policies (e.g. NIP-40 expiry, NIP-42
-     * auth-required tags) are enforced by the server before dispatch via
-     * plugin accept_publish() hooks, so this dispatcher stays NIP-agnostic. */
-
+/* Kind dispatch (may read/write storage). With the uSockets backend this runs
+ * only on the single DB writer thread. */
+nip01_process_result_t nip01_dispatch_event(
+    relay_conn_t *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url) {
+    nip01_process_result_t result = {0};
     /* Step 5: Call every plugin whose declared kind ranges cover this kind,
      * in registration order. The first listener to accept wins. */
     bool any_listener_matched = false;
@@ -149,6 +152,21 @@ nip01_process_result_t nip01_process_event(
     return nip_plugin_store_and_broadcast(storage, event);
 }
 
+nip01_process_result_t nip01_process_event(
+    relay_conn_t *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url,
+    size_t max_content_length,
+    time_t created_at_lower_limit,
+    time_t created_at_upper_limit,
+    int min_pow_difficulty) {
+    nip01_process_result_t result = nip01_precheck_event(event, max_content_length,
+        created_at_lower_limit, created_at_upper_limit, min_pow_difficulty);
+    if (!result.accepted) return result;
+    return nip01_dispatch_event(connection, event, storage, relay_url);
+}
+
 /* ============================================================================
  * NIP-16 (moved to NIP-01): Replaceable Events
  *
@@ -164,7 +182,7 @@ static bool nip01_replace_event(const event_t *event, storage_context_t *storage
 }
 
 static nip01_process_result_t nip01_replaceable_listener(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
@@ -193,10 +211,10 @@ static nip01_process_result_t nip01_replaceable_listener(
 
 static bool nip01_replace_addressable_event(const event_t *event,
                                             storage_context_t *storage) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    jstr_t key, tag, tags = jl_str(event->tags_json);
     size_t offset = 0;
     char *dvalue = NULL;
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
         char *name = nip_tag_element(tag, 0);
         bool is_d = name && strcmp(name, "d") == 0;
         free(name);
@@ -215,7 +233,7 @@ static bool nip01_replace_addressable_event(const event_t *event,
 }
 
 static nip01_process_result_t nip01_addressable_listener(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
@@ -245,7 +263,7 @@ static nip01_process_result_t nip01_addressable_listener(
 /* Single on_event entry that routes to the replaceable or addressable
  * handler based on the kind range (NIP-33 kinds are 30000-39999). */
 static nip01_process_result_t nip01_builtin_listener(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {

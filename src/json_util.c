@@ -1,10 +1,12 @@
+#include <limits.h>
 #include "json_util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-#include <mongoose.h>
+#include "json_lite.h"
+#include "relay_conn.h"
 
 /* ============================================================================
  * JSON Parsing Utilities
@@ -380,7 +382,7 @@ void json_builder_append_number(json_builder_t *builder, long long value) {
  * '/' is deliberately NOT escaped: it requires no escaping per RFC 8259,
  * the canonical NIP-01 serialization (JSON.stringify) leaves it literal,
  * and emitting "\/" breaks delivery because the bundled Mongoose
- * mg_json_get_str() returns NULL for strings containing that escape.
+ * jl_get_str() returns NULL for strings containing that escape.
  *
  * This is the single source of truth for string escaping so that every
  * serialized field (including event `content`) is emitted correctly
@@ -538,7 +540,7 @@ const char *json_builder_finish(json_builder_t *builder) {
  * Filter and Event Parsing
  * ============================================================================ */
 
-static char *json_raw_string(struct mg_str value) {
+static char *json_raw_string(jstr_t value) {
     char *wrapped;
     json_value_t parsed[1] = {{0}};
     size_t length = value.len;
@@ -615,15 +617,15 @@ static bool append_string(char ***items, size_t *count, size_t *capacity, const 
     return true;
 }
 
-static bool parse_string_array(struct mg_str raw, char ***items, size_t *count,
+static bool parse_string_array(jstr_t raw, char ***items, size_t *count,
                                size_t max_items, bool require_hex64) {
-    struct mg_str key, value;
+    jstr_t key, value;
     size_t offset = 0;
     size_t alloc_size = 16;
     *items = (char **) calloc(alloc_size, sizeof(**items));
     if (!*items) return false;
 
-    while ((offset = mg_json_next(raw, offset, &key, &value)) != 0) {
+    while ((offset = jl_next(raw, offset, &key, &value)) != 0) {
         char *string;
         if (*count >= max_items || key.buf != NULL) {
             /* Free previously allocated strings on error */
@@ -658,8 +660,8 @@ static bool parse_string_array(struct mg_str raw, char ***items, size_t *count,
 }
 
 static bool append_filter_tag(filter_t *filter, const char *name,
-                              struct mg_str raw) {
-    struct mg_str key, value;
+                              jstr_t raw) {
+    jstr_t key, value;
     tag_t *tag;
     tag_t *resized;
     size_t offset = 0;
@@ -674,7 +676,7 @@ static bool append_filter_tag(filter_t *filter, const char *name,
     }
     /* NIP-01: values in #e and #p filters must be exact 64-char lowercase hex */
     bool require_hex64 = (strcmp(name, "e") == 0 || strcmp(name, "p") == 0);
-    while ((offset = mg_json_next(raw, offset, &key, &value)) != 0) {
+    while ((offset = jl_next(raw, offset, &key, &value)) != 0) {
         char *string;
         if (key.buf != NULL || tag->count >= tag->capacity) {
             tag_free(tag);
@@ -704,13 +706,13 @@ static bool append_filter_tag(filter_t *filter, const char *name,
     return true;
 }
 
-static bool validate_event_tags(struct mg_str tags) {
-    struct mg_str key, tag;
+static bool validate_event_tags(jstr_t tags) {
+    jstr_t key, tag;
     size_t tag_offset = 0;
     size_t tag_count = 0;
     if (!tags.buf || tags.len < 2 || tags.buf[0] != '[') return false;
-    while ((tag_offset = mg_json_next(tags, tag_offset, &key, &tag)) != 0) {
-        struct mg_str element_key, element;
+    while ((tag_offset = jl_next(tags, tag_offset, &key, &tag)) != 0) {
+        jstr_t element_key, element;
         size_t element_offset = 0;
         size_t element_count = 0;
         if (key.buf != NULL || ++tag_count > 100 || tag.len < 2 || tag.buf[0] != '[') return false;
@@ -719,7 +721,7 @@ static bool validate_event_tags(struct mg_str tags) {
          * which used to silently skip delegation-tag verification while the
          * mongoose-based tag lookups still honored the tag. Keep both
          * parsers in lockstep so anything accepted here is fully scanned. */
-        while ((element_offset = mg_json_next(tag, element_offset, &element_key, &element)) != 0) {
+        while ((element_offset = jl_next(tag, element_offset, &element_key, &element)) != 0) {
             char *string;
             if (element_key.buf != NULL || ++element_count > MAX_TAG_ELEMENTS) return false;
             string = json_raw_string(element);
@@ -734,17 +736,17 @@ static bool validate_event_tags(struct mg_str tags) {
 }
 
 bool json_parse_filter(const char *json_str, filter_t *filter) {
-    struct mg_str object, key, value;
+    jstr_t object, key, value;
     size_t offset = 0;
     if (!json_str || !filter) return false;
 
     *filter = (filter_t) {0};
     filter->limit = 500;
-    object = mg_str(json_str);
+    object = jl_str(json_str);
     if (object.len < 2 || object.buf[0] != '{') return false;
 
     bool ok = true;
-    while (ok && (offset = mg_json_next(object, offset, &key, &value)) != 0) {
+    while (ok && (offset = jl_next(object, offset, &key, &value)) != 0) {
         char *field = json_raw_string(key);
         ok = field != NULL;
         if (!ok) break;
@@ -753,9 +755,9 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
         } else if (strcmp(field, "authors") == 0) {
             ok = parse_string_array(value, &filter->authors, &filter->authors_count, 256, true);
         } else if (strcmp(field, "kinds") == 0) {
-            struct mg_str array_key, array_value;
+            jstr_t array_key, array_value;
             size_t array_offset = 0;
-            while (ok && (array_offset = mg_json_next(value, array_offset,
+            while (ok && (array_offset = jl_next(value, array_offset,
                                                        &array_key, &array_value)) != 0) {
                 char *number_text, *end = NULL;
                 long kind;
@@ -798,25 +800,25 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
 }
 
 bool json_parse_event(const char *json_str, event_t *event) {
-    struct mg_str json;
-    struct mg_str tags;
+    jstr_t json;
+    jstr_t tags;
     char *id, *pubkey, *content, *sig;
     double created_at, kind;
     if (!json_str || !event) return false;
     memset(event, 0, sizeof(*event));
-    json = mg_str(json_str);
-    id = mg_json_get_str(json, "$.id");
-    pubkey = mg_json_get_str(json, "$.pubkey");
-    content = mg_json_get_str(json, "$.content");
-    sig = mg_json_get_str(json, "$.sig");
-    tags = mg_json_get_tok(json, "$.tags");
+    json = jl_str(json_str);
+    id = jl_get_str(json, "$.id");
+    pubkey = jl_get_str(json, "$.pubkey");
+    content = jl_get_str(json, "$.content");
+    sig = jl_get_str(json, "$.sig");
+    tags = jl_get_tok(json, "$.tags");
     if (!id || !pubkey || !content || !sig || !tags.buf ||
         strlen(id) != MAX_ID_SIZE || strlen(pubkey) != MAX_PUBKEY_SIZE ||
         strlen(sig) != MAX_SIG_SIZE || tags.len > MAX_TAGS_SIZE ||
         !is_lower_hex(id, MAX_ID_SIZE) || !is_lower_hex(pubkey, MAX_PUBKEY_SIZE) ||
         !is_lower_hex(sig, MAX_SIG_SIZE) ||
-        strlen(content) > MAX_CONTENT_SIZE || !mg_json_get_num(json, "$.created_at", &created_at) ||
-        !mg_json_get_num(json, "$.kind", &kind) || created_at != (double)(time_t)created_at || kind != (int) kind ||
+        strlen(content) > MAX_CONTENT_SIZE || !jl_get_num(json, "$.created_at", &created_at) ||
+        !jl_get_num(json, "$.kind", &kind) || created_at != (double)(time_t)created_at || kind != (int) kind ||
         !validate_event_tags(tags)) {
         free(id); free(pubkey); free(content); free(sig);
         return false;

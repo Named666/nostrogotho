@@ -17,7 +17,7 @@ bool nip17_can_deliver(const event_t *event, const char *authenticated_pubkey) {
  * NIP-67 "auth" completeness hint on EOSE.
  * ============================================================================ */
 
-static bool nip17_plugin_can_deliver(const event_t *event, struct mg_connection *connection,
+static bool nip17_plugin_can_deliver(const event_t *event, relay_conn_t *connection,
                                      void *ctx) {
     (void) ctx;
     return nip17_can_deliver(event, nip42_authenticated_pubkey(connection));
@@ -33,7 +33,7 @@ static bool nip17_filter_targets_gift_wraps(const filter_t *filter) {
 /* Before EOSE: when an unauthenticated client subscribes to gift-wrap kinds,
  * more results may exist behind NIP-42 auth. Send a fresh AUTH challenge and
  * ask the server to flag the EOSE with the "auth" hint. */
-static bool nip17_plugin_eose_auth_hint(struct mg_connection *connection,
+static bool nip17_plugin_eose_auth_hint(relay_conn_t *connection,
                                         const filter_t *filters, size_t count,
                                         void *ctx) {
     (void) ctx;

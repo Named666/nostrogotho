@@ -4,7 +4,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
-#include <mongoose.h>
+#include "json_lite.h"
+#include "relay_conn.h"
 #include "nostrogotho.h"
 #include "nip01.h"
 #include "../storage.h"
@@ -82,28 +83,28 @@ typedef struct nip_plugin {
     void (*init)(const relay_config_t *config, void *ctx);
 
     /* Connection lifecycle (e.g. NIP-42 sends its AUTH challenge here). */
-    void (*on_connect)(struct mg_connection *connection, void *ctx);
-    void (*on_disconnect)(struct mg_connection *connection, void *ctx);
+    void (*on_connect)(relay_conn_t *connection, void *ctx);
+    void (*on_disconnect)(relay_conn_t *connection, void *ctx);
 
     /* Return true if the plugin consumed the message (e.g. NIP-42 "AUTH"). */
-    bool (*on_message)(struct mg_connection *connection,
+    bool (*on_message)(relay_conn_t *connection,
                        json_value_t *values, size_t count, void *ctx);
 
     /* Publish policy. Return false and fill `reason` to reject an EVENT
      * before kind dispatch (e.g. NIP-40 expiry, NIP-42 restricted tags). */
-    bool (*accept_publish)(struct mg_connection *connection,
+    bool (*accept_publish)(relay_conn_t *connection,
                            const event_t *event,
                            char *reason, size_t reason_size, void *ctx);
 
     /* Delivery policy. Return false to suppress an event for this
      * connection on both stored queries and broadcasts (NIP-40, NIP-17). */
-    bool (*can_deliver)(const event_t *event, struct mg_connection *connection,
+    bool (*can_deliver)(const event_t *event, relay_conn_t *connection,
                         void *ctx);
 
     /* Called when a REQ finishes. May emit its own protocol traffic (e.g.
      * NIP-17 sends a fresh AUTH challenge for gift-wrap subscriptions) and
      * returns true to make the EOSE carry the "auth" completeness hint. */
-    bool (*eose_auth_hint)(struct mg_connection *connection,
+    bool (*eose_auth_hint)(relay_conn_t *connection,
                            const filter_t *filters, size_t count, void *ctx);
 
     /* Build the ["EOSE", ...] / ["COUNT", ...] response (malloc'd, caller
@@ -134,8 +135,8 @@ nip_plugin_t *nip_plugins(void);
 void nip_plugins_init(const relay_config_t *config);
 
 /* Convenience senders plugins may use instead of hand-rolling JSON. */
-void nip_plugin_send_json(struct mg_connection *connection, const char *json);
-void nip_plugin_send_status(struct mg_connection *connection, const char *type,
+void nip_plugin_send_json(relay_conn_t *connection, const char *json);
+void nip_plugin_send_status(relay_conn_t *connection, const char *type,
                             const char *id, bool ok, const char *message);
 
 /* ============================================================================

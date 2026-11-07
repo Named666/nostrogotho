@@ -21,7 +21,11 @@
  * ============================================================================ */
 
 /* Global SQLite3 connection (single instance) */
-static sqlite3 *db_conn = NULL;
+/* One SQLite connection per thread. The main/writer thread owns the
+ * read-write connection opened by init(); reader threads call
+ * thread_open(true) to get their own read-only WAL connection. */
+static __thread sqlite3 *db_conn = NULL;
+static char db_dsn[1024];
 
 /* Parameter types for bound SQL statements.
  * PARAM_TYPE_OWNED_STRING marks heap-allocated (string_dup'd) values that
@@ -79,12 +83,12 @@ static void store_delegations(const event_t *ev) {
     static const char *insert_sql =
         "INSERT OR IGNORE INTO delegation (event_id, delegator) VALUES (?, ?)";
 
-    struct mg_str key, t, tags_str = mg_str(ev->tags_json);
+    jstr_t key, t, tags_str = jl_str(ev->tags_json);
     size_t offset = 0;
     bool found_any = false;
     sqlite3_stmt *stmt = NULL;
 
-    while ((offset = mg_json_next(tags_str, offset, &key, &t)) != 0) {
+    while ((offset = jl_next(tags_str, offset, &key, &t)) != 0) {
         char *name = nip_tag_element(t, 0);
         if (!name || strcmp(name, "delegation") != 0) { free(name); continue; }
         free(name);
@@ -369,11 +373,11 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
         /* Validate exact "d" tag value using JSON iteration */
         bool d_matched = false;
         if (tags_json) {
-            struct mg_str key, t, tags_str = mg_str(tags_json);
+            jstr_t key, t, tags_str = jl_str(tags_json);
             size_t offset = 0;
             char *d_val = NULL;
             bool found_d = false;
-            while ((offset = mg_json_next(tags_str, offset, &key, &t)) != 0) {
+            while ((offset = jl_next(tags_str, offset, &key, &t)) != 0) {
                 char *name = nip_tag_element(t, 0);
                 if (name && strcmp(name, "d") == 0) {
                     found_d = true;
@@ -1181,6 +1185,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
  * Thread safety: NOT thread-safe; must be called during init
  */
 static bool storage_init_sqlite3(const char *dsn) {
+    snprintf(db_dsn, sizeof(db_dsn), "%s", dsn ? dsn : "");
     if (db_conn) {
         sqlite3_close_v2(db_conn);
     }
@@ -1357,6 +1362,41 @@ static void storage_deinit_sqlite3(void) {
  *   - delete_*: remove events (various criteria)
  *   - send_records: query and stream events
  */
+/* Open this thread's own connection to the database init() opened.
+ * readonly=true is used by REQ reader threads; the single writer thread
+ * opens read-write. Schema/migrations are only done by init(). */
+static bool storage_thread_open_sqlite3(bool readonly) {
+    if (db_conn) return true;
+    int flags = SQLITE_OPEN_URI | SQLITE_OPEN_NOMUTEX |
+                (readonly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE);
+    if (sqlite3_open_v2(db_dsn, &db_conn, flags, NULL) != SQLITE_OK) {
+        fprintf(stderr, "thread db open failed: %s\n", sqlite3_errmsg(db_conn));
+        sqlite3_close_v2(db_conn); db_conn = NULL;
+        return false;
+    }
+    sqlite3_exec(db_conn,
+                 "PRAGMA busy_timeout = 5000;"
+                 "PRAGMA cache_size = -65536;"
+                 "PRAGMA temp_store = memory;"
+                 "PRAGMA foreign_keys = true;", NULL, NULL, NULL);
+    return true;
+}
+
+static void storage_thread_close_sqlite3(void) {
+    if (db_conn) { sqlite3_close_v2(db_conn); db_conn = NULL; }
+}
+
+static bool storage_exec_sqlite3(const char *sql) {
+    char *err = NULL;
+    if (!db_conn || sqlite3_exec(db_conn, sql, NULL, NULL, &err) != SQLITE_OK) {
+        if (err) { fprintf(stderr, "SQL error: %s\n", err); sqlite3_free(err); }
+        return false;
+    }
+    return true;
+}
+static bool storage_begin_sqlite3(void) { return storage_exec_sqlite3("BEGIN IMMEDIATE"); }
+static bool storage_commit_sqlite3(void) { return storage_exec_sqlite3("COMMIT"); }
+
 void storage_context_init_sqlite3(storage_context_t *ctx) {
     if (!ctx) return;
     
@@ -1371,4 +1411,8 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->delete_all_events_by_pubkey = delete_all_events_by_pubkey;
     ctx->send_records = send_records;
     ctx->purge_expired = purge_expired_sqlite3;
+    ctx->thread_open = storage_thread_open_sqlite3;
+    ctx->thread_close = storage_thread_close_sqlite3;
+    ctx->begin_batch = storage_begin_sqlite3;
+    ctx->commit_batch = storage_commit_sqlite3;
 }

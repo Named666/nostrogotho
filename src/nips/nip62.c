@@ -12,7 +12,7 @@ bool nip62_should_vanish(const event_t *event, const char *service_url) {
 
 /* Listener for kind 62 (Request to Vanish) events. */
 static nip01_process_result_t nip62_listener(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {

@@ -1,3 +1,6 @@
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include "crypto.h"
 #include "nip13.h"
 #include "nip_event.h"
@@ -28,11 +31,11 @@ static int nip13_min_difficulty;
 /* nip13_committed_target - Return the nonce tag's committed target difficulty,
  * or 0 when the event does not commit to one. */
 static int nip13_committed_target(const event_t *event) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    jstr_t key, tag, tags = jl_str(event->tags_json);
     size_t offset = 0;
     int target = 0;
 
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
         char *name = nip_tag_element(tag, 0);
         if (name && strcmp(name, "nonce") == 0) {
             char *value = nip_tag_element(tag, 2);
@@ -74,7 +77,7 @@ static void nip13_plugin_init(const relay_config_t *config, void *ctx) {
     nip13_min_difficulty = config->min_pow_difficulty;
 }
 
-static bool nip13_accept_publish(struct mg_connection *connection,
+static bool nip13_accept_publish(relay_conn_t *connection,
                                  const event_t *event,
                                  char *reason, size_t reason_size,
                                  void *ctx) {

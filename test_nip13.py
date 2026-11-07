@@ -116,7 +116,7 @@ async def run_tests():
 
 
 def main():
-    exe = os.path.join("build", "main.exe" if os.name == "nt" else "main")
+    exe = os.environ.get("RELAY_BIN") or os.path.join("build", "main.exe" if os.name == "nt" else "main")
     if not os.path.exists(exe):
         print(f"Relay binary not found: {exe} — build it first (run .\\nob.exe)")
         sys.exit(1)

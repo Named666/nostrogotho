@@ -34,11 +34,11 @@ void nip_plugins_init(const relay_config_t *config) {
     }
 }
 
-void nip_plugin_send_json(struct mg_connection *connection, const char *json) {
-    if (connection && json) mg_ws_send(connection, json, strlen(json), WEBSOCKET_OP_TEXT);
+void nip_plugin_send_json(relay_conn_t *connection, const char *json) {
+    if (connection && json) relay_conn_send(connection, json, strlen(json));
 }
 
-void nip_plugin_send_status(struct mg_connection *connection, const char *type,
+void nip_plugin_send_status(relay_conn_t *connection, const char *type,
                             const char *id, bool ok, const char *message) {
     json_builder_t builder;
     json_builder_start(&builder);

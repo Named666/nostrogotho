@@ -3,7 +3,8 @@
 
 #include <stdbool.h>
 #include <time.h>
-#include <mongoose.h>
+#include "json_lite.h"
+#include "relay_conn.h"
 #include "nostrogotho.h"
 #include "../storage.h"
 
@@ -100,7 +101,7 @@ typedef struct {
  * nip_plugin_reject, nip_plugin_store_and_broadcast, ...).
  */
 typedef nip01_process_result_t (*nip01_event_listener_t)(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url
@@ -141,8 +142,21 @@ typedef nip01_process_result_t (*nip01_event_listener_t)(
  *       broadcast_event(&event);
  *   }
  */
+nip01_process_result_t nip01_precheck_event(
+    const event_t *event,
+    size_t max_content_length,
+    time_t created_at_lower_limit,
+    time_t created_at_upper_limit,
+    int min_pow_difficulty);
+
+nip01_process_result_t nip01_dispatch_event(
+    relay_conn_t *connection,
+    const event_t *event,
+    storage_context_t *storage,
+    const char *relay_url);
+
 nip01_process_result_t nip01_process_event(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url,

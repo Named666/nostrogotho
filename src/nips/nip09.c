@@ -1,4 +1,5 @@
-#include <mongoose.h>
+#include "json_lite.h"
+#include "relay_conn.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -22,11 +23,11 @@
 /* Return true if the deletion event has no "k" tags, or if `kind` is listed
  * among them. Lets the relay validate requested-vs-actual kind. */
 static bool kind_is_requested(const event_t *event, int kind) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    jstr_t key, tag, tags = jl_str(event->tags_json);
     size_t offset = 0;
     bool has_k = false;
 
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
         char *name = nip_tag_element(tag, 0);
         if (name && strcmp(name, "k") == 0) {
             has_k = true;
@@ -160,11 +161,11 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
 
 /* Apply the authorized targets in a NIP-09 deletion event. */
 bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
-    struct mg_str key, tag, tags = mg_str(event->tags_json);
+    jstr_t key, tag, tags = jl_str(event->tags_json);
     size_t offset = 0;
     bool failed = false;
 
-    while ((offset = mg_json_next(tags, offset, &key, &tag)) != 0) {
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
         char *name = nip_tag_element(tag, 0);
         if (!name) continue;
         if (strcmp(name, "e") == 0) {
@@ -189,7 +190,7 @@ bool nip09_delete_targets(const event_t *event, storage_context_t *storage) {
 
 /* Listener for kind 5 (Event Deletion) events. */
 static nip01_process_result_t nip09_listener(
-    struct mg_connection *connection,
+    relay_conn_t *connection,
     const event_t *event,
     storage_context_t *storage,
     const char *relay_url) {
