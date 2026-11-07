@@ -1,0 +1,2 @@
+connected 64 (failed 0) in 0.04s
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.04 connected=64 dropped=0 secs=15.03 msgs=245176 msgs_s=16311 MB_s=0.0 ok=245176 rejected=0 lat_us_p50=60817 p99=105906 p999=120586 max=148723 srv_rss_base_mb=61.7 srv_rss_conn_mb=61.7 bytes_per_conn=832 srv_rss_end_mb=177.5 srv_cpu_pct=271 client_cpu_pct=5

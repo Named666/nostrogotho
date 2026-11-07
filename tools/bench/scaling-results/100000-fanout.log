@@ -1,0 +1,2 @@
+connected 1001 (failed 0) in 0.10s
+mode=nostr-fanout conns=1001 open=1001 failed=0 threads=4 src_ips=1 connect_s=0.10 connected=1001 dropped=0 secs=12.01 msgs=37000 msgs_s=3081 MB_s=0.0 ok=37 rejected=0 lat_us_p50=3867 p99=6685 p999=7930 max=8419 srv_rss_base_mb=61.4 srv_rss_conn_mb=62.7 bytes_per_conn=1354 srv_rss_end_mb=64.3 srv_cpu_pct=2 client_cpu_pct=3

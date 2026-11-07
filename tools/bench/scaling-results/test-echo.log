@@ -1,0 +1,1 @@
+ngws bench server :19001 loops=2 mode=echo

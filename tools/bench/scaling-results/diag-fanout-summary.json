@@ -1,0 +1,79 @@
+{
+  "error": null,
+  "interval_s": 14.818327724002302,
+  "min_available_mib": 2511.52734375,
+  "threads": {
+    "244620": {
+      "name": "main_soak",
+      "cpu_pct": 0.0,
+      "wait_samples": {
+        "futex_wait_queue": 148
+      }
+    },
+    "244621": {
+      "name": "main_soak",
+      "cpu_pct": 1.9570359449552888,
+      "wait_samples": {
+        "futex_wait_queue": 131,
+        "0": 17
+      }
+    },
+    "244622": {
+      "name": "main_soak",
+      "cpu_pct": 4.791363865235362,
+      "wait_samples": {
+        "futex_wait_queue": 127,
+        "0": 21
+      }
+    },
+    "244623": {
+      "name": "main_soak",
+      "cpu_pct": 1.9570359449552892,
+      "wait_samples": {
+        "futex_wait_queue": 98,
+        "0": 50
+      }
+    },
+    "244624": {
+      "name": "main_soak",
+      "cpu_pct": 1.7545839506495693,
+      "wait_samples": {
+        "futex_wait_queue": 119,
+        "0": 29
+      }
+    },
+    "244625": {
+      "name": "main_soak",
+      "cpu_pct": 3.036779914585793,
+      "wait_samples": {
+        "0": 16,
+        "futex_wait_queue": 113,
+        "jbd2_log_wait_commit": 17,
+        "folio_wait_bit_common": 2
+      }
+    },
+    "244626": {
+      "name": "main_soak",
+      "cpu_pct": 0.13496799620381303,
+      "wait_samples": {
+        "hrtimer_nanosleep": 148
+      }
+    },
+    "244627": {
+      "name": "main_soak",
+      "cpu_pct": 48.925898623882226,
+      "wait_samples": {
+        "0": 83,
+        "ep_poll": 65
+      }
+    },
+    "244628": {
+      "name": "main_soak",
+      "cpu_pct": 53.24487450240424,
+      "wait_samples": {
+        "0": 92,
+        "ep_poll": 56
+      }
+    }
+  }
+}

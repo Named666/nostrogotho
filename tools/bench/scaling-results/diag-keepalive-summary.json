@@ -1,0 +1,74 @@
+{
+  "error": null,
+  "interval_s": 157.87528592300077,
+  "min_available_mib": 2590.0703125,
+  "threads": {
+    "244868": {
+      "name": "main_soak",
+      "cpu_pct": 0.0,
+      "wait_samples": {
+        "futex_wait_queue": 1567
+      }
+    },
+    "244869": {
+      "name": "main_soak",
+      "cpu_pct": 0.02533645450973807,
+      "wait_samples": {
+        "futex_wait_queue": 1566,
+        "0": 1
+      }
+    },
+    "244870": {
+      "name": "main_soak",
+      "cpu_pct": 0.02533645450973807,
+      "wait_samples": {
+        "futex_wait_queue": 1567
+      }
+    },
+    "244871": {
+      "name": "main_soak",
+      "cpu_pct": 0.02533645450973807,
+      "wait_samples": {
+        "futex_wait_queue": 1564,
+        "0": 3
+      }
+    },
+    "244872": {
+      "name": "main_soak",
+      "cpu_pct": 0.02533645450973807,
+      "wait_samples": {
+        "futex_wait_queue": 1567
+      }
+    },
+    "244873": {
+      "name": "main_soak",
+      "cpu_pct": 0.0,
+      "wait_samples": {
+        "futex_wait_queue": 1567
+      }
+    },
+    "244874": {
+      "name": "main_soak",
+      "cpu_pct": 0.006334113627434517,
+      "wait_samples": {
+        "hrtimer_nanosleep": 1567
+      }
+    },
+    "244875": {
+      "name": "main_soak",
+      "cpu_pct": 0.7030866126452313,
+      "wait_samples": {
+        "ep_poll": 1554,
+        "0": 13
+      }
+    },
+    "244876": {
+      "name": "main_soak",
+      "cpu_pct": 0.6840842717629279,
+      "wait_samples": {
+        "ep_poll": 1556,
+        "0": 11
+      }
+    }
+  }
+}

@@ -1,0 +1,2 @@
+connected 0 (failed 5) in 0.02s
+mode=hold conns=5 open=0 failed=5 threads=1 src_ips=1 connect_s=0.02 connected=0 dropped=0 errno_111=5 client_cpu_pct=0

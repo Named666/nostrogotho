@@ -1,0 +1,97 @@
+{
+  "error": null,
+  "interval_s": 14.711040089998278,
+  "min_available_mib": 2621.21875,
+  "threads": {
+    "246901": {
+      "name": "main",
+      "cpu_pct": 0.0,
+      "wait_samples": {
+        "futex_wait_queue": 147
+      },
+      "user_pct": 0.0,
+      "system_pct": 0.0
+    },
+    "246902": {
+      "name": "ng-worker-0",
+      "cpu_pct": 4.690354970000499,
+      "wait_samples": {
+        "0": 15,
+        "futex_wait_queue": 132
+      },
+      "user_pct": 4.41845033405844,
+      "system_pct": 0.2719046359420579
+    },
+    "246903": {
+      "name": "ng-worker-1",
+      "cpu_pct": 4.962259605942556,
+      "wait_samples": {
+        "futex_wait_queue": 142,
+        "0": 5
+      },
+      "user_pct": 4.826307287971527,
+      "system_pct": 0.13595231797102894
+    },
+    "246904": {
+      "name": "ng-worker-2",
+      "cpu_pct": 4.41845033405844,
+      "wait_samples": {
+        "futex_wait_queue": 140,
+        "0": 7
+      },
+      "user_pct": 4.350474175072925,
+      "system_pct": 0.06797615898551447
+    },
+    "246905": {
+      "name": "ng-worker-3",
+      "cpu_pct": 10.128447688841655,
+      "wait_samples": {
+        "0": 29,
+        "futex_wait_queue": 118
+      },
+      "user_pct": 9.312733781015481,
+      "system_pct": 0.8157139078261737
+    },
+    "246906": {
+      "name": "ng-writer",
+      "cpu_pct": 8.021186760290707,
+      "wait_samples": {
+        "futex_wait_queue": 69,
+        "jbd2_log_wait_commit": 24,
+        "folio_wait_bit_common": 4,
+        "0": 50
+      },
+      "user_pct": 1.9713086105799194,
+      "system_pct": 6.049878149710787
+    },
+    "246907": {
+      "name": "ng-checkpoint",
+      "cpu_pct": 0.2039284769565434,
+      "wait_samples": {
+        "hrtimer_nanosleep": 147
+      },
+      "user_pct": 0.0,
+      "system_pct": 0.2039284769565434
+    },
+    "246908": {
+      "name": "ng-io-0",
+      "cpu_pct": 96.73007423638707,
+      "wait_samples": {
+        "0": 140,
+        "ep_poll": 7
+      },
+      "user_pct": 5.506068877826672,
+      "system_pct": 91.22400535856042
+    },
+    "246909": {
+      "name": "ng-io-1",
+      "cpu_pct": 97.74971662116981,
+      "wait_samples": {
+        "0": 143,
+        "ep_poll": 4
+      },
+      "user_pct": 6.661663580580419,
+      "system_pct": 91.08805304058939
+    }
+  }
+}

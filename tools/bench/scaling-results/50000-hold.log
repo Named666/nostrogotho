@@ -1,0 +1,2 @@
+connected 50000 (failed 0) in 0.75s
+mode=hold conns=50000 open=50000 failed=0 threads=4 src_ips=5 connect_s=0.75 connected=50000 dropped=0 srv_rss_base_mb=5.8 srv_rss_conn_mb=33.9 bytes_per_conn=589 srv_rss_end_mb=146.7 srv_cpu_pct=24 client_cpu_pct=0

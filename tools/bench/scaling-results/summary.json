@@ -1,0 +1,379 @@
+[
+  {
+    "target": 10000,
+    "hold": {
+      "mode": "hold",
+      "conns": "10000",
+      "open": "10000",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "2",
+      "connect_s": "0.34",
+      "connected": "10000",
+      "dropped": "0",
+      "srv_rss_base_mb": "5.8",
+      "srv_rss_conn_mb": "11.8",
+      "bytes_per_conn": "635",
+      "srv_rss_end_mb": "144.7",
+      "srv_cpu_pct": "27",
+      "client_cpu_pct": "0"
+    },
+    "fanout": {
+      "mode": "nostr-fanout",
+      "conns": "101",
+      "open": "101",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "1",
+      "connect_s": "0.02",
+      "connected": "101",
+      "dropped": "0",
+      "secs": "12.01",
+      "msgs": "3700",
+      "msgs_s": "308",
+      "MB_s": "0.0",
+      "ok": "37",
+      "rejected": "0",
+      "lat_us_p50": "2425",
+      "p99": "4391",
+      "p999": "4456",
+      "max": "4502",
+      "srv_rss_base_mb": "11.8",
+      "srv_rss_conn_mb": "12.2",
+      "bytes_per_conn": "4096",
+      "srv_rss_end_mb": "13.6",
+      "srv_cpu_pct": "0",
+      "client_cpu_pct": "2"
+    },
+    "publish": {
+      "mode": "nostr-pub",
+      "conns": "64",
+      "open": "64",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "1",
+      "connect_s": "0.04",
+      "connected": "64",
+      "dropped": "0",
+      "secs": "8.01",
+      "msgs": "288626",
+      "msgs_s": "36049",
+      "MB_s": "0.0",
+      "ok": "288626",
+      "rejected": "0",
+      "lat_us_p50": "20972",
+      "p99": "101712",
+      "p999": "117441",
+      "max": "118315",
+      "srv_rss_base_mb": "13.6",
+      "srv_rss_conn_mb": "13.6",
+      "bytes_per_conn": "192",
+      "srv_rss_end_mb": "144.5",
+      "srv_cpu_pct": "209",
+      "client_cpu_pct": "7"
+    },
+    "host_bytes_per_conn": 9648.128,
+    "kernel_bytes_per_pair": 8334.1312,
+    "phases": {
+      "idle_end": {
+        "interval_s": 30.0014515010007,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 0.0,
+          "worker-1": 0.0,
+          "worker-2": 0.0,
+          "worker-3": 0.0,
+          "writer": 0.0,
+          "checkpoint": 0.0,
+          "io-0": 0.0,
+          "io-1": 0.03333172063247155
+        }
+      },
+      "fanout_end": {
+        "interval_s": 13.003636760000518,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 0.0,
+          "worker-1": 0.0,
+          "worker-2": 0.0769015636514873,
+          "worker-3": 0.0,
+          "writer": 0.0,
+          "checkpoint": 0.0,
+          "io-0": 0.15380312730297455,
+          "io-1": 0.07690156365148737
+        }
+      },
+      "publish_end": {
+        "interval_s": 9.217716942999687,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 31.678126135317793,
+          "worker-1": 31.135692468617144,
+          "worker-2": 31.027205735277022,
+          "worker-3": 30.918719001936886,
+          "writer": 51.53119833656148,
+          "checkpoint": 3.146115266863753,
+          "io-0": 1.410327533421683,
+          "io-1": 1.3018408000815531
+        }
+      }
+    },
+    "min_available_mib": 3140.69921875
+  },
+  {
+    "target": 50000,
+    "hold": {
+      "mode": "hold",
+      "conns": "50000",
+      "open": "50000",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "5",
+      "connect_s": "0.75",
+      "connected": "50000",
+      "dropped": "0",
+      "srv_rss_base_mb": "5.8",
+      "srv_rss_conn_mb": "33.9",
+      "bytes_per_conn": "589",
+      "srv_rss_end_mb": "146.7",
+      "srv_cpu_pct": "24",
+      "client_cpu_pct": "0"
+    },
+    "fanout": {
+      "mode": "nostr-fanout",
+      "conns": "501",
+      "open": "501",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "1",
+      "connect_s": "0.06",
+      "connected": "501",
+      "dropped": "0",
+      "secs": "12.01",
+      "msgs": "18500",
+      "msgs_s": "1541",
+      "MB_s": "0.0",
+      "ok": "37",
+      "rejected": "0",
+      "lat_us_p50": "3113",
+      "p99": "5112",
+      "p999": "5439",
+      "max": "5598",
+      "srv_rss_base_mb": "33.9",
+      "srv_rss_conn_mb": "34.6",
+      "bytes_per_conn": "1545",
+      "srv_rss_end_mb": "36.1",
+      "srv_cpu_pct": "1",
+      "client_cpu_pct": "3"
+    },
+    "publish": {
+      "mode": "nostr-pub",
+      "conns": "64",
+      "open": "64",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "1",
+      "connect_s": "0.04",
+      "connected": "64",
+      "dropped": "0",
+      "secs": "8.01",
+      "msgs": "234946",
+      "msgs_s": "29349",
+      "MB_s": "0.0",
+      "ok": "234946",
+      "rejected": "0",
+      "lat_us_p50": "28836",
+      "p99": "91226",
+      "p999": "95420",
+      "max": "97166",
+      "srv_rss_base_mb": "36.1",
+      "srv_rss_conn_mb": "36.1",
+      "bytes_per_conn": "320",
+      "srv_rss_end_mb": "146.6",
+      "srv_cpu_pct": "179",
+      "client_cpu_pct": "5"
+    },
+    "host_bytes_per_conn": 9441.60768,
+    "kernel_bytes_per_pair": 8193.96608,
+    "phases": {
+      "idle_end": {
+        "interval_s": 30.001721371001622,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 0.0,
+          "worker-1": 0.0,
+          "worker-2": 0.0,
+          "worker-3": 0.0,
+          "writer": 0.0,
+          "checkpoint": 0.0,
+          "io-0": 0.03333142080862594,
+          "io-1": 0.03333142080862594
+        }
+      },
+      "fanout_end": {
+        "interval_s": 13.004239727997629,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 0.07689799795423936,
+          "worker-1": 0.07689799795423936,
+          "worker-2": 0.07689799795423936,
+          "worker-3": 0.0,
+          "writer": 0.0,
+          "checkpoint": 0.0,
+          "io-0": 0.4613879877254358,
+          "io-1": 0.5382859856796752
+        }
+      },
+      "publish_end": {
+        "interval_s": 9.208204610000394,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 25.629317548362984,
+          "worker-1": 25.520718745191953,
+          "worker-2": 25.629317548362984,
+          "worker-3": 25.520718745191953,
+          "writer": 48.435066214279196,
+          "checkpoint": 3.2579640951308875,
+          "io-0": 1.1945868348813253,
+          "io-1": 0.9773892285392659
+        }
+      }
+    },
+    "min_available_mib": 2947.41015625
+  },
+  {
+    "target": 100000,
+    "hold": {
+      "mode": "hold",
+      "conns": "100000",
+      "open": "100000",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "8",
+      "connect_s": "1.10",
+      "connected": "100000",
+      "dropped": "0",
+      "srv_rss_base_mb": "5.8",
+      "srv_rss_conn_mb": "61.4",
+      "bytes_per_conn": "583",
+      "srv_rss_end_mb": "176.7",
+      "srv_cpu_pct": "24",
+      "client_cpu_pct": "0"
+    },
+    "fanout": {
+      "mode": "nostr-fanout",
+      "conns": "1001",
+      "open": "1001",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "1",
+      "connect_s": "0.10",
+      "connected": "1001",
+      "dropped": "0",
+      "secs": "12.01",
+      "msgs": "37000",
+      "msgs_s": "3081",
+      "MB_s": "0.0",
+      "ok": "37",
+      "rejected": "0",
+      "lat_us_p50": "3867",
+      "p99": "6685",
+      "p999": "7930",
+      "max": "8419",
+      "srv_rss_base_mb": "61.4",
+      "srv_rss_conn_mb": "62.7",
+      "bytes_per_conn": "1354",
+      "srv_rss_end_mb": "64.3",
+      "srv_cpu_pct": "2",
+      "client_cpu_pct": "3"
+    },
+    "publish": {
+      "mode": "nostr-pub",
+      "conns": "64",
+      "open": "64",
+      "failed": "0",
+      "threads": "4",
+      "src_ips": "1",
+      "connect_s": "0.02",
+      "connected": "64",
+      "dropped": "0",
+      "secs": "8.01",
+      "msgs": "240126",
+      "msgs_s": "29996",
+      "MB_s": "0.0",
+      "ok": "240126",
+      "rejected": "0",
+      "lat_us_p50": "23331",
+      "p99": "95420",
+      "p999": "122683",
+      "max": "123648",
+      "srv_rss_base_mb": "64.3",
+      "srv_rss_conn_mb": "64.3",
+      "bytes_per_conn": "128",
+      "srv_rss_end_mb": "176.5",
+      "srv_cpu_pct": "181",
+      "client_cpu_pct": "6"
+    },
+    "host_bytes_per_conn": 9367.01952,
+    "kernel_bytes_per_pair": 8133.09952,
+    "phases": {
+      "idle_end": {
+        "interval_s": 30.001781759998266,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 0.0,
+          "worker-1": 0.0,
+          "worker-2": 0.0,
+          "worker-3": 0.0,
+          "writer": 0.0,
+          "checkpoint": 0.0,
+          "io-0": 0.03333135371757529,
+          "io-1": 0.06666270743515058
+        }
+      },
+      "fanout_end": {
+        "interval_s": 13.004835089999688,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 0.07689447756003988,
+          "worker-1": 0.07689447756003988,
+          "worker-2": 0.0,
+          "worker-3": 0.07689447756003988,
+          "writer": 0.0,
+          "checkpoint": 0.0,
+          "io-0": 1.0765226858405583,
+          "io-1": 1.0765226858405572
+        }
+      },
+      "publish_end": {
+        "interval_s": 9.201762147000409,
+        "cpu_pct": {
+          "main": 0.0,
+          "worker-0": 26.299310516180558,
+          "worker-1": 26.516660189868,
+          "worker-2": 26.08196084249311,
+          "worker-3": 26.516660189867995,
+          "writer": 47.490903700706205,
+          "checkpoint": 3.260245105311639,
+          "io-0": 0.9780735315934924,
+          "io-1": 1.3040980421246566
+        }
+      }
+    },
+    "min_available_mib": 2411.421875
+  },
+  {
+    "target": 250000,
+    "skipped": "projected memory exceeds 2 GiB headroom",
+    "available_bytes": 3618545664,
+    "projected_bytes": 2693018112.0
+  },
+  {
+    "target": 500000,
+    "skipped": "not attempted after memory preflight stopped the ramp at 250000"
+  },
+  {
+    "target": 1000000,
+    "skipped": "not attempted: memory stop, plus 524288 per-process FD hard limit"
+  }
+]
