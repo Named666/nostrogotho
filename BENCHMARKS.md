@@ -9,7 +9,92 @@ built with clang (zig cc) `-O3 -march=native` — only used for benchmarking.
 Client: `build/ngload` (pure C, epoll, multithreaded, multiple source IPs).
 Scripts: `tools/bench/*.sh`; events from `tools/bench/genev.py`.
 
-## Raw WebSocket: ngws vs uWebSockets (4 server threads)
+## Final head-to-head: ngws (PGO) vs uWebSockets (Nov 7 2026)
+
+`tools/bench/h2h.sh 3 ngws=<pgo bench server> uws=<uws_ref>`, summarized with
+`tools/bench/h2h_summ.py`. Server pinned to CPUs 0-1 (2 loop threads; CPU 0
+for 1-thread cases), `ngload` 6 threads on CPUs 2-7, 4 s per run, 3 reps,
+runs interleaved ngws/uWS. ngws: `tools/bench/pgo_build.sh` (gcc -O3
+-march=native -flto + PGO). uWS: `tools/bench/uws_ref.cpp` (clang -O3
+-march=native). Median [min-max]; CPU = server CPU% (200 = both cores busy);
+latency in µs.
+
+| Case | ngws msg/s | uWS msg/s | ngws CPU | uWS CPU | ngws p50 / p99 | uWS p50 / p99 |
+|---|---|---|---|---|---|---|
+| echo 16 B, 100 conns, P8 | **3.42M** [3.34-3.45M] | 3.20M [3.16-3.23M] | 200 | 200 | 227 / 479 | 242 / 471 |
+| echo 64 B | **3.36M** [3.32-3.44M] | 3.12M [3.12-3.12M] | 200 | 200 | 240 / 422 | 254 / 455 |
+| echo 512 B | **2.98M** [2.96-3.00M] | 2.86M [2.85-2.89M] | 200 | 200 | 262 / 549 | 279 / 598 |
+| echo 4 KB | **1.60M** [1.57-1.61M] | 1.24M [1.24-1.26M] | 200 | 199 | 463 / 1032 | 573 / 1311 |
+| echo 64 KB | 46.7k [39.4-48.8k] | 48.3k [48.1-49.6k] | 83 | 83 | 15.3 ms / 36.7 ms | 15.3 ms / 32.5 ms |
+| echo 1 MB | 4.2k [4.2-4.4k] | 4.3k [4.2-4.4k] | 199 | 199 | 176 ms / 449 ms | 172 ms / 487 ms |
+| echo 64 B, 1 server thread | **1.72M** [1.70-1.75M] | 1.60M [1.59-1.67M] | 100 | 100 | 459 / 512 | 496 / 557 |
+| broadcast 1k subs, closed loop P4, 64 B (deliveries/s) | **940k** [934-944k] | 917k [916-921k] | 100 | 100 | 6357 / 8389 | **5046 / 7274** |
+| broadcast 1k subs @2000 msg/s, 64 B | 2.00M | 2.00M | 100 | 100 | **4063 / 7209** | 4522 / 8651 |
+| broadcast 10k subs @200 msg/s, 64 B | 2.01M | 2.00M | 96 | 96 | **48.8 ms / 99.6 ms** | 53.0 ms / 103.8 ms |
+| broadcast 10k subs @100 msg/s, 512 B | 1.00M | 1.00M | 96 | 96 | **51.4 ms / 103.8 ms** | 57.7 ms / 113.2 ms |
+| churn, 200 concurrent (connect+upgrade+echo+close /s) | **168k** [168-172k] | 165k [164-166k] | 196 | 197 | 1180 / 2458 | 1196 / 2785 |
+| fixed 100k msg/s, 2k conns, 64 B | 100k | 100k | 46 | 47 | 1458 / **3047** | **1327** / 3277 |
+| fixed 300k msg/s, 2k conns, 64 B | 300k | 300k | 146 [139-160] | 146 [138-161] | 1540 / 3768 | **1409 / 3277** |
+| idle 100k conns, bytes/conn | 244 | **240** | 0 | 0 | - | - |
+
+ngws leads on small/medium echo (+4% to +29%), single-thread echo (+7%),
+closed-loop broadcast throughput (+2.5%), broadcast latency at fixed rate
+(-6..-17% p99), and churn (+2%). uWS still leads on: 64 KB echo (+3% median;
+ngws had one low run), 1 MB echo by ~2% (within noise), closed-loop broadcast
+latency (p50 -21%: ngws coalesces more per write, trading latency for
+throughput at saturation), fixed-load echo p50 (-9%) and p99 at 300k/s, and
+idle memory (4 B/conn less).
+
+### Relay publish (BLOB ids, PGO not used for the relay)
+
+`tools/bench/pub.sh build/main <conns> 16`, ev1500k pre-signed unique kind-1
+events, fresh DB, 3 reps. Latency = EVENT sent → OK (after COMMIT).
+
+| Load | EVENT/s | OK p50 / p99 / p999 | server CPU (4 cores) | previous (5c7b709, hex ids) |
+|---|---|---|---|---|
+| 64 conns × 16 in flight | **57.0k** [52.5-57.8k] | 16.5 / 33.6 / 106 ms | 328% | 43-48k |
+| 256 conns × 16 in flight | **66.2k** [64.4-66.3k] | 57.1 / 167.8 / 180 ms | 357% | 50-52k |
+
+0 rejected in every run.
+
+### Optimization changelog (from commit history)
+
+| Commit | Change | Measured effect |
+|---|---|---|
+| c379096 | ngws on uSockets, pure-C RFC 6455 layer; ngload | replaces mongoose |
+| 00ec72f | relay on ngws; shared broadcast bodies, subscription index | fanout 1k subs: fell behind → 1.99M deliv/s kept up |
+| e328b0e | strict duplicate guards (batch set, in-flight/recent set, UNIQUE, replaceable admission) | 23/23 dedupe checks |
+| 5c7b709 | writer: 4 KiB pages, sync=NORMAL, off-thread checkpoints, persistent stmts, batch 4096 | publish 21-24k → 43-52k ev/s |
+| 2b3870b | ids/pubkeys/sigs as 32/32/64-byte BLOBs, no compat code | publish → 57k / 66k ev/s (this run) |
+| ab4cb5d | SIMD unmask (AVX2/SSE2/NEON), SIMD UTF-8 validation, RFC 6455 close checks | conformance 80/80 |
+| b8c0e7b | coalesce a socket's consecutive frames into one iovec; mallopt for large frames | 512 B echo gap 5% → 1.3%; 1 MB echo +40% |
+| 5deb8cc | PGO build (NG_PGO=gen/use, pgo_build.sh) | small echo +2-5% |
+| 301630b | flush a socket's replies at the end of its own on_data | p99 at fixed load -20..35% |
+| afb575d | frames ≥ 64 KiB sent straight from caller buffer | 1 MB echo -16% server CPU |
+| 704a208 | plain send() when one iovec is queued | small echo +3-7% |
+| 7732693 | send_shared extends a contiguous tail iovec | broadcast closed loop +5%, p50 -25% |
+| 638f9ba | relay: event bodies ≤ 2 KiB copied into one contiguous frame per subscriber | fanout 1k subs p99 11.9-17.6 → 10.1-11.1 ms; 5k subs p99 69-84 → 51-55 ms |
+| da8ef95 | PGO use: -fprofile-correction | fixes PGO build failure (inconsistent threaded value profiles) |
+
+### Caveats
+
+- One shared 8-core VM, loopback, client and server on the same host: treat
+  numbers as relative. Run-to-run noise is ~2-5%; differences inside that
+  (64 KB, 1 MB, fixed-load p50) are not significant.
+- 64 KB echo is client-bound (server ~83% of 200%), so it compares little.
+- 1 MB echo at 100 conns × P8 keeps ~800 MB in flight; latencies are queueing.
+- uWS is built with clang, ngws with gcc + PGO; uWS has no PGO here.
+- Relay publish is bound by Schnorr verification and the single SQLite
+  writer, not the transport; synchronous=NORMAL on the writer (OK after
+  COMMIT; power loss can drop the last batches; NG_SYNC=FULL for strict).
+- Sanitizers (Nov 7): TSan and ASan builds pass test_core, test_ws, test_ws2,
+  dedupe (both modes), nip13, RFC 6455 80/80, ws_split_fuzz, relay
+  fanout+publish, ngload echo (512 B, 70 KB) and broadcast: 0 reports. An
+  ngload-only race (early-stop counter) and exit leaks were fixed in 2f19b6c.
+
+## Earlier results
+
+### Raw WebSocket: ngws vs uWebSockets (4 server threads, before b8c0e7b)
 
 | Case | ngws + wslay codec | ngws + native codec (shipped) | uWS |
 |---|---|---|---|
