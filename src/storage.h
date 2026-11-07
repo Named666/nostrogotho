@@ -244,6 +244,9 @@ typedef struct {
  *   storage_context_init_sqlite3(&ctx);
  *   ctx.init("file:nostrogotho.sqlite");
  */
+/* Startup-only setting, before init/threads; accepts full or normal. */
+bool storage_set_db_sync(const char *mode);
+
 void storage_context_init_sqlite3(storage_context_t *ctx);
 
 /* ============================================================================

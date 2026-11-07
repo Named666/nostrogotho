@@ -86,7 +86,9 @@ events, fresh DB, 3 reps. Latency = EVENT sent → OK (after COMMIT).
 - uWS is built with clang, ngws with gcc + PGO; uWS has no PGO here.
 - Relay publish is bound by Schnorr verification and the single SQLite
   writer, not the transport; synchronous=NORMAL on the writer (OK after
-  COMMIT; power loss can drop the last batches; NG_SYNC=FULL for strict).
+  COMMIT; power loss can drop the last batches). These historical results
+  used NORMAL; the current default is FULL (`db_sync=normal` in
+  `nostrogotho.conf` opts into the benchmark durability mode).
 - Sanitizers (Nov 7): TSan and ASan builds pass test_core, test_ws, test_ws2,
   dedupe (both modes), nip13, RFC 6455 80/80, ws_split_fuzz, relay
   fanout+publish, ngload echo (512 B, 70 KB) and broadcast: 0 reports. An
@@ -155,7 +157,8 @@ kind-1 events, fresh DB on the root disk (virtio), server CPUs 0-3, client
 Writer CPU before: ~82% busy, of which COMMIT was the largest part (WAL
 autocheckpoint with fsync inside COMMIT, 1 MiB pages). What changed:
 - page_size 1 MiB → 4 KiB (new DBs; each insert rewrites whole dirty pages);
-- writer connection `synchronous=NORMAL` (was the per-connection default
+- historical writer connection `synchronous=NORMAL` (current default is FULL;
+  set `db_sync=normal` in the runtime config to reproduce; was the per-connection default
   FULL), `wal_autocheckpoint=0`, WAL checkpoints on a separate thread
   (PASSIVE every 250 ms; RESTART only past 1 GiB of WAL);
 - prepared statements reused (`sqlite3_prepare_v3 PERSISTENT` + reset);
@@ -174,3 +177,28 @@ grow without bound under non-stop writes.
 
 Duplicate guards: `tools/run_dedupe_tests.sh` (23 checks, with and without
 the in-flight/recent set), clean under TSan and ASan.
+
+
+## Configurable durable writer default (Nov 7, 2026, CST)
+
+The writer now defaults to `synchronous=FULL`. Set `db_sync=full` (default)
+or `db_sync=normal` in `nostrogotho.conf`, or select a file with
+`--config path`. `NG_SYNC` no longer overrides the file. The startup connection
+also uses FULL. Publish OK remains after COMMIT and duplicate guards are unchanged.
+
+Quick durability comparison: same local shared 8-core host, release `./nob`
+build (GCC `-O3 -march=native -flto=auto`, no PGO), fresh databases on the
+root disk for each run. Server pinned to CPUs 0–3, client to 4–7; 64 publishing
+connections, pipeline 16, 4 client threads, 6 seconds per run, pre-signed events
+from `ev1500k.txt`. Order: FULL, NORMAL, FULL, NORMAL. These are short exploratory
+runs, not production capacity claims.
+
+| Writer mode | Run 1 events/s | Run 2 events/s | Mean events/s |
+|---|---:|---:|---:|
+| FULL (default) | 48,989 | 53,057 | 51,023 |
+| NORMAL (opt-in) | 66,599 | 66,282 | 66,441 |
+
+All four runs had zero rejections. Build, `test_core.py`, `test_ws.py`,
+`test_ws2.py`, `test_nip13.py`, and `tools/run_dedupe_tests.sh` (both dedupe
+modes) passed with the FULL default. `tests/test_config.py` passed all 11 startup
+cases (defaults, both valid settings, comments/whitespace, invalid/missing files).

@@ -56,6 +56,14 @@ static void ps_finalize_all(void) {
     for (int i = 0; i < PS_COUNT; i++) { if (ps[i]) sqlite3_finalize(ps[i]); ps[i] = NULL; }
 }
 static char db_dsn[1024];
+static const char *db_sync = "FULL";
+
+bool storage_set_db_sync(const char *mode) {
+    if (strcmp(mode, "full") == 0) db_sync = "FULL";
+    else if (strcmp(mode, "normal") == 0) db_sync = "NORMAL";
+    else return false;
+    return true;
+}
 
 /* Parameter types for bound SQL statements.
  * PARAM_TYPE_OWNED_STRING marks heap-allocated (string_dup'd) values that
@@ -1261,7 +1269,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
  *   - NOMUTEX flag (caller handles synchronization)
  *   - WAL mode for better concurrency and crash safety
  *   - 5 second busy timeout
- *   - NORMAL synchronous mode (balance speed/safety)
+ *   - FULL synchronous mode (durable commits by default)
  *   - 256MB cache for performance
  * 
  * Indexes Created:
@@ -1313,7 +1321,7 @@ static bool storage_init_sqlite3(const char *dsn) {
     }
     const char *pragmas_sql =
         "PRAGMA journal_mode = WAL;"
-        "PRAGMA synchronous = NORMAL;"
+        "PRAGMA synchronous = FULL;"
         "PRAGMA busy_timeout = 5000;"
         "PRAGMA cache_size = -262144;"
         "PRAGMA foreign_keys = true;"
@@ -1433,18 +1441,19 @@ static bool storage_thread_open_sqlite3(bool readonly) {
                  "PRAGMA mmap_size = 268435456;"
                  "PRAGMA foreign_keys = true;", NULL, NULL, NULL);
     if (!readonly) {
-        /* synchronous is per connection: WAL + NORMAL keeps every committed
-         * batch safe against process crashes (the OK is sent after COMMIT);
-         * only a power loss / kernel crash can drop the last few batches.
-         * NG_SYNC=FULL fsyncs the WAL on every batch commit instead. */
-        const char *sync = getenv("NG_SYNC");
+        /* FULL syncs every committed batch by default. The runtime config
+         * can opt into NORMAL (process-crash safe, not power-loss durable). */
         char sql[160];
         snprintf(sql, sizeof(sql),
                  "PRAGMA synchronous = %s; PRAGMA cache_size = -262144;"
                  "PRAGMA wal_autocheckpoint = %d;",
-                 sync && strcmp(sync, "FULL") == 0 ? "FULL" : "NORMAL",
+                 db_sync,
                  getenv("NG_WAL_CKPT") ? atoi(getenv("NG_WAL_CKPT")) : 0);
-        sqlite3_exec(db_conn, sql, NULL, NULL, NULL);
+        if (sqlite3_exec(db_conn, sql, NULL, NULL, NULL) != SQLITE_OK) {
+            fprintf(stderr, "writer db configuration failed: %s\n", sqlite3_errmsg(db_conn));
+            sqlite3_close_v2(db_conn); db_conn = NULL;
+            return false;
+        }
     }
     return true;
 }

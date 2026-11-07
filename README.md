@@ -190,3 +190,20 @@ NG_SAN=address ./nob                # build/main_address (ASan), or NG_SAN=threa
 
 All dependencies (SQLite 3.54.1 amalgamation, secp256k1, uSockets) are compiled
 from `thirdparty/`; nothing is linked from the system besides libc/pthread.
+
+### Database durability
+
+The writer defaults to SQLite `synchronous=FULL`; successful publish OKs are
+sent only after commit. Runtime settings are read from `./nostrogotho.conf`
+(if present), or `--config path` (required when explicitly selected):
+
+```ini
+# full (default): durable batch commits; normal: faster, weaker durability
+db_sync = full
+```
+
+`db_sync` accepts `full` or `normal`. With `normal`, a process crash preserves
+committed batches, but power loss or a kernel crash can lose recent commits.
+The old `NG_SYNC` environment override is removed: use the config file.
+Unknown keys/values and unreadable explicitly selected files fail at startup.
+No config file is required to get the safe `full` default.

@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <ctype.h>
+#include <errno.h>
 
 #include "crypto.h"
 #include "server.h"
@@ -18,6 +20,46 @@ static bool parse_int(const char *text, int *value) {
     if (*end || parsed < INT_MIN || parsed > INT_MAX) return false;
     *value = (int) parsed;
     return true;
+}
+
+/* Small key=value runtime config; loaded before opening any database. */
+static bool load_config(const char *path, bool required) {
+    FILE *file = fopen(path, "r");
+    if (!file) {
+        if (!required && errno == ENOENT) return true;
+        perror(path);
+        return false;
+    }
+    char line[256];
+    unsigned number = 0;
+    bool ok = true;
+    while (fgets(line, sizeof(line), file)) {
+        number++;
+        if (!strchr(line, '\n') && !feof(file)) { ok = false; break; }
+        char *comment = strchr(line, '#');
+        if (comment) *comment = '\0';
+        char *key = line;
+        while (isspace((unsigned char)*key)) key++;
+        if (!*key) continue;
+        char *eq = strchr(key, '=');
+        if (!eq) { ok = false; break; }
+        char *end = eq;
+        while (end > key && isspace((unsigned char)end[-1])) end--;
+        *end = '\0';
+        char *value = eq + 1;
+        while (isspace((unsigned char)*value)) value++;
+        end = value + strlen(value);
+        while (end > value && isspace((unsigned char)end[-1])) end--;
+        *end = '\0';
+        if (strcmp(key, "db_sync") != 0 || !storage_set_db_sync(value)) {
+            ok = false;
+            break;
+        }
+    }
+    if (ferror(file)) ok = false;
+    fclose(file);
+    if (!ok) fprintf(stderr, "%s:%u: invalid config (expected db_sync=full or normal)\n", path, number);
+    return ok;
 }
 
 static void sigint_handler(int sig) {
@@ -52,6 +94,8 @@ static void cleanup(void) {
 int main(int argc, const char **argv) {
     const char *db_path = getenv("DATABASE_URL");
     const char *service_url = getenv("SERVICE_URL");
+    const char *config_path = "nostrogotho.conf";
+    bool config_required = false;
     int port = 7447;
     int min_pow = 0;
     int lower_limit = 0;
@@ -84,11 +128,15 @@ int main(int argc, const char **argv) {
             if (!parse_int(argv[++i], &lower_limit) || lower_limit < 0) return 1;
         } else if (strcmp(argv[i], "-created-at-upper-limit") == 0 && i + 1 < argc) {
             if (!parse_int(argv[++i], &upper_limit) || upper_limit < 0) return 1;
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            config_path = argv[++i];
+            config_required = true;
         } else if (strcmp(argv[i], "--help") == 0) {
             printf("Usage: %s [-database path] [-port num] [-service-url url] [--debug] [--help]\n", argv[0]);
             printf("  -database path                 SQLite database (default: ./nostrogotho.sqlite)\n");
             printf("  -port num                      WebSocket port (default: 7447)\n");
             printf("  -service-url url               Public relay URL for NIP-42/NIP-62\n");
+            printf("  --config path                  Runtime config (default: ./nostrogotho.conf, optional)\n");
             printf("  --debug                        Print connects, disconnects and events to console\n");
             printf("  -min-pow bits                  Minimum NIP-13 difficulty\n");
             printf("  -created-at-lower-limit sec    Maximum accepted age, 0 disables\n");
@@ -100,6 +148,8 @@ int main(int argc, const char **argv) {
             return 1;
         }
     }
+
+    if (!load_config(config_path, config_required)) return 1;
 
     if (!init_storage(db_path)) {
         return 1;
