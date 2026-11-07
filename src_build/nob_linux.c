@@ -106,7 +106,7 @@ int main(void)
     if (!cmd_run(&cmd)) return 1;
 
     common_flags(&cmd, "-std=gnu11");
-    nob_cc_output(&cmd, BUILD_FOLDER"ngload");
+    nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"ngload%s", suffix));
     nob_cc_inputs(&cmd, "tools/ngload.c");
     nob_cmd_append(&cmd, "-lpthread", "-lm");
     if (!cmd_run(&cmd)) return 1;
