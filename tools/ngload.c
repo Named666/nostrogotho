@@ -112,6 +112,7 @@ typedef struct {
 static thr_t *T;
 static atomic_int phase;          /* 0 connect, 1 run, 2 stop */
 static atomic_int total_open, total_failed;
+static atomic_uint connect_errno[256];
 static atomic_bool measuring;
 static atomic_ullong npub_acked;     /* OKs counted while measuring (main's early stop) */
 static struct sockaddr_in dst;
@@ -136,6 +137,11 @@ static void set_out(thr_t *t, conn_t *c, bool on) {
 
 static void kill_conn(thr_t *t, conn_t *c) {
     if (c->state == C_DEAD) return;
+    if (c->state == C_CONNECTING) {
+        int err = 0; socklen_t el = sizeof(err);
+        if (!getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el) && err > 0 && err < 256)
+            atomic_fetch_add(&connect_errno[err], 1);
+    }
     if (c->state == C_OPEN) { t->open--; atomic_fetch_sub(&total_open, 1); }
     else { t->connecting--; }
     t->failed++; atomic_fetch_add(&total_failed, 1);
@@ -151,6 +157,8 @@ static void do_write(thr_t *t, conn_t *c) {
     }
     c->woff = c->wlen = 0;
     set_out(t, c, false);
+    /* Hold clients need no permanent handshake output allocation. */
+    if (mode == M_HOLD) { free(c->wb); c->wb = NULL; c->wcap = 0; }
 }
 
 /* masked client frame */
@@ -305,6 +313,9 @@ static void do_read(thr_t *t, conn_t *c) {
     if (off) { memmove(c->rb, c->rb + off, c->rlen - off); c->rlen -= off; }
     if (c->rcap > 262144 && c->rlen < 4096) { c->rcap = 4096; c->rb = realloc(c->rb, c->rcap); }
     if (c->wlen > c->woff) do_write(t, c);
+    /* At scale retaining two 4 KiB handshake buffers per idle client
+     * exhausts the generator before the server. Reallocate on ping only. */
+    if (mode == M_HOLD && !c->rlen) { free(c->rb); c->rb = NULL; c->rcap = 0; }
 }
 
 static void start_connect(thr_t *t, conn_t *c, int global_idx);
@@ -321,7 +332,7 @@ static void recycle(thr_t *t, conn_t *c) {
 
 static void start_connect(thr_t *t, conn_t *c, int global_idx) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (fd < 0) { c->state = C_DEAD; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
+    if (fd < 0) { if (errno < 256) atomic_fetch_add(&connect_errno[errno], 1); c->state = C_DEAD; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #ifdef IP_BIND_ADDRESS_NO_PORT
@@ -330,11 +341,14 @@ static void start_connect(thr_t *t, conn_t *c, int global_idx) {
     if (nsrc > 0) {
         struct sockaddr_in src = { .sin_family = AF_INET };
         src.sin_addr.s_addr = htonl(0x7F000002u + (uint32_t) (global_idx % nsrc));
-        bind(fd, (struct sockaddr *) &src, sizeof(src));
+        if (bind(fd, (struct sockaddr *) &src, sizeof(src)) < 0) {
+            if (errno < 256) atomic_fetch_add(&connect_errno[errno], 1);
+            close(fd); c->state = C_DEAD; t->failed++; atomic_fetch_add(&total_failed, 1); return;
+        }
     }
     c->fd = fd; c->state = C_CONNECTING; t->connecting++; c->gi = global_idx; c->conn_start_ns = now_ns();
     int r = connect(fd, (struct sockaddr *) &dst, sizeof(dst));
-    if (r < 0 && errno != EINPROGRESS) { close(fd); c->state = C_DEAD; t->connecting--; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
+    if (r < 0 && errno != EINPROGRESS) { if (errno < 256) atomic_fetch_add(&connect_errno[errno], 1); close(fd); c->state = C_DEAD; t->connecting--; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
     struct epoll_event e = { .events = EPOLLOUT | EPOLLIN, .data.ptr = c };
     c->want_out = true;
     epoll_ctl(t->ep, EPOLL_CTL_ADD, fd, &e);
@@ -343,7 +357,7 @@ static void start_connect(thr_t *t, conn_t *c, int global_idx) {
 static void handshake_send(thr_t *t, conn_t *c) {
     int err = 0; socklen_t el = sizeof(err);
     getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el);
-    if (err) { kill_conn(t, c); return; }
+    if (err) { if (err < 256) atomic_fetch_add(&connect_errno[err], 1); kill_conn(t, c); return; }
     char req[256];
     int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", host, port);
@@ -369,7 +383,7 @@ static void *thr_main(void *arg) {
             started = true;
             for (int i = 0; i < t->n; i++) start_traffic(t, &t->c[i]);
         }
-        int timeout = 1;
+        int timeout = mode == M_HOLD ? 100 : 1;
         int n = epoll_wait(t->ep, ev, 512, timeout);
         for (int i = 0; i < n; i++) {
             conn_t *c = ev[i].data.ptr;
@@ -502,6 +516,7 @@ int main(int argc, char **argv) {
     long rss1 = server_pid ? rss_kb(server_pid) : -1;
     if (!quiet) fprintf(stderr, "connected %d (failed %d) in %.2fs\n", atomic_load(&total_open), atomic_load(&total_failed), connect_s);
 
+    int connected = atomic_load(&total_open);
     atomic_store(&phase, 1);
     sleep((unsigned) warmup);
     uint64_t m0 = 0, b0 = 0;
@@ -534,6 +549,8 @@ int main(int argc, char **argv) {
     (void) m0; (void) b0;
     printf("mode=%s conns=%d open=%d failed=%d threads=%d src_ips=%d connect_s=%.2f",
            ms, nconns, atomic_load(&total_open), atomic_load(&total_failed), nthreads, nsrc, connect_s);
+    printf(" connected=%d dropped=%d", connected, connected - atomic_load(&total_open));
+    for (int i = 1; i < 256; i++) { unsigned n = atomic_load(&connect_errno[i]); if (n) printf(" errno_%d=%u", i, n); }
     if (mode != M_HOLD)
         printf(" secs=%.2f msgs=%llu msgs_s=%.0f MB_s=%.1f", secs, (unsigned long long) msgs, msgs / secs, bytes / secs / 1e6);
     if (mode == M_NPUB || mode == M_NFAN) printf(" ok=%llu rejected=%llu", (unsigned long long) oks, (unsigned long long) fails);

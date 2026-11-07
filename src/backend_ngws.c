@@ -354,6 +354,10 @@ static void bset_unref(bset_t *s) {
 
 static void *worker_thread(void *arg) {
     worker_t *wk = (worker_t *) arg;
+#ifdef __linux__
+    char name[16]; snprintf(name, sizeof(name), "ng-worker-%d", wk->idx);
+    pthread_setname_np(pthread_self(), name);
+#endif
     storage_context_t *st = relay_core_storage();
     if (st->thread_open && !st->thread_open(true)) fprintf(stderr, "worker %d: no reader db\n", wk->idx);
     for (;;) {
@@ -432,6 +436,9 @@ static long long now_ms(void) {
 
 static void *writer_thread(void *arg) {
     (void) arg;
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "ng-writer");
+#endif
     storage_context_t *st = relay_core_storage();
     if (st->thread_open && !st->thread_open(false)) { fprintf(stderr, "writer: db open failed\n"); return NULL; }
     unsigned interval = relay_core_timer_interval();
@@ -558,6 +565,9 @@ static void *writer_thread(void *arg) {
 static pthread_t ckpt_th;
 static void *checkpoint_thread(void *arg) {
     (void) arg;
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "ng-checkpoint");
+#endif
     storage_context_t *st = relay_core_storage();
     if (!st->checkpoint || (st->thread_open && !st->thread_open(false))) return NULL;
     int ms = 250;

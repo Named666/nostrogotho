@@ -878,6 +878,10 @@ void ngws_loop_set_user(ngws_loop_t *l, void *p) { l->user = p; }
 
 static void *loop_thread(void *arg) {
     ngws_loop_t *l = (ngws_loop_t *) arg;
+#ifdef __linux__
+    char name[16]; snprintf(name, sizeof(name), "ng-io-%d", l->idx);
+    pthread_setname_np(pthread_self(), name);
+#endif
     if (l->srv->cfg.on_loop_start) l->srv->cfg.on_loop_start(l);
     us_loop_run(l->loop);
     if (l->srv->cfg.on_loop_stop) l->srv->cfg.on_loop_stop(l);
