@@ -264,7 +264,9 @@ static bool flush(sockx_t *x) {
             for (; j && k < 64; j = l->nodes[j - 1].next, k++) {
                 iov[k].iov_base = (void *) l->nodes[j - 1].p; iov[k].iov_len = l->nodes[j - 1].len; want += iov[k].iov_len;
             }
-            ssize_t w = us_socket_is_closed(0, s) || us_socket_is_shut_down(0, s) ? -1 : writev(fd, iov, k);
+            /* one iovec (the common case: a socket's frames coalesce): send() skips the iovec import */
+            ssize_t w = us_socket_is_closed(0, s) || us_socket_is_shut_down(0, s) ? -1 :
+                        k == 1 ? send(fd, iov[0].iov_base, iov[0].iov_len, MSG_NOSIGNAL) : writev(fd, iov, k);
             if (w == (ssize_t) want) { i = j; continue; }
             /* partial: copy the unsent rest of this batch and all later nodes to the backlog */
             size_t done = w > 0 ? (size_t) w : 0;
