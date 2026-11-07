@@ -1,3 +1,4 @@
+#include "../dedupe.h"
 #include "json_lite.h"
 #include "relay_conn.h"
 #include <stdlib.h>
@@ -139,7 +140,14 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
     int result;
     bool ok = true;
 
-    if (!target) return true;  /* No knowledge of this event — nothing to do. */
+    /* Tombstone the id for this author first, even when the target has not
+     * arrived yet: the writer refuses any later insert of (id, author). */
+    if (storage->add_tombstone && !storage->add_tombstone(id, event->pubkey)) ok = false;
+    /* Drop it from the recent-id cache so a re-send reaches the tombstone
+     * check and is answered "blocked:" instead of "duplicate:". */
+    dedupe_forget(id);
+
+    if (!target) return ok;  /* No knowledge of this event — nothing to do. */
 
     /* Author-scoped: only delete if the deletion author matches the target's
      * pubkey (directly or via NIP-26 delegation), and (when "k" tags are

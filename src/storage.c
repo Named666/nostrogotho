@@ -25,6 +25,36 @@
  * read-write connection opened by init(); reader threads call
  * thread_open(true) to get their own read-only WAL connection. */
 static __thread sqlite3 *db_conn = NULL;
+
+/* Per-connection prepared statements for the hot write path (reused across
+ * every event: sqlite3_reset instead of prepare/finalize per insert). */
+enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_COUNT };
+static const char *const ps_sql[PS_COUNT] = {
+    "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+    "SELECT 1 FROM deleted_event WHERE id = ? AND pubkey = ?",
+    "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (?, ?)",
+    "SELECT id, created_at, tags FROM event WHERE pubkey = ? AND kind = ?",
+    "DELETE FROM event WHERE id = ?",
+};
+static __thread sqlite3_stmt *ps[PS_COUNT];
+
+static sqlite3_stmt *ps_get(int which) {
+    if (!db_conn) return NULL;
+    if (!ps[which] && sqlite3_prepare_v3(db_conn, ps_sql[which], -1, SQLITE_PREPARE_PERSISTENT,
+                                         &ps[which], NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        ps[which] = NULL;
+        return NULL;
+    }
+    sqlite3_reset(ps[which]);
+    sqlite3_clear_bindings(ps[which]);
+    return ps[which];
+}
+
+static void ps_finalize_all(void) {
+    for (int i = 0; i < PS_COUNT; i++) { if (ps[i]) sqlite3_finalize(ps[i]); ps[i] = NULL; }
+}
 static char db_dsn[1024];
 
 /* Parameter types for bound SQL statements.
@@ -261,36 +291,111 @@ static event_t *get_event_by_id(const char *id) {
  * 
  * Note: Does NOT duplicate-check before insert (relies on DB unique constraint)
  */
-static bool insert_record(const event_t *ev) {
-    if (!db_conn || !ev) return false;
-    
-    const char *sql = "INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) VALUES (?, ?, ?, ?, ?, ?, ?)";
-    sqlite3_stmt *stmt = NULL;
-    
-    if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        return false;
-    }
-    
-    sqlite3_bind_text(stmt, 1, ev->id, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, ev->pubkey, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, (int)ev->created_at);
-    sqlite3_bind_int(stmt, 4, ev->kind);
-    sqlite3_bind_text(stmt, 5, ev->tags_json ? ev->tags_json : "[]", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, ev->content ? ev->content : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, ev->sig, -1, SQLITE_TRANSIENT);
-    
-    bool result = (sqlite3_step(stmt) == SQLITE_DONE);
-    if (!result) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-    }
-    
-    sqlite3_finalize(stmt);
+static int insert_event(const event_t *ev) {
+    if (!db_conn || !ev) return STORE_ERROR;
 
-    /* Index delegation tags only after the event row exists so the FK is
-     * satisfied; on insert failure (duplicate id) there is nothing to index. */
-    if (result) store_delegations(ev);
-    return result;
+    /* NIP-09: an author's deletion request permanently blocks the id. */
+    sqlite3_stmt *t = ps_get(PS_TOMB_CHECK);
+    if (!t) return STORE_ERROR;
+    sqlite3_bind_text(t, 1, ev->id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(t, 2, ev->pubkey, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(t);
+    sqlite3_reset(t);
+    if (rc == SQLITE_ROW) return STORE_DELETED;
+    if (rc != SQLITE_DONE) return STORE_ERROR;
+
+    sqlite3_stmt *stmt = ps_get(PS_INSERT);
+    if (!stmt) return STORE_ERROR;
+    sqlite3_bind_text(stmt, 1, ev->id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, ev->pubkey, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64) ev->created_at);
+    sqlite3_bind_int(stmt, 4, ev->kind);
+    sqlite3_bind_text(stmt, 5, ev->tags_json ? ev->tags_json : "[]", -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 6, ev->content ? ev->content : "", -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 7, ev->sig, -1, SQLITE_STATIC);
+    rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db_conn);
+    sqlite3_reset(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+        return STORE_ERROR;
+    }
+    if (changes == 0) return STORE_DUPLICATE;   /* ON CONFLICT(id) DO NOTHING */
+    /* Index delegation tags only after the event row exists (FK). */
+    store_delegations(ev);
+    return STORE_INSERTED;
+}
+
+static bool insert_record(const event_t *ev) { return insert_event(ev) == STORE_INSERTED; }
+
+static bool add_tombstone(const char *id, const char *pubkey) {
+    sqlite3_stmt *t = ps_get(PS_TOMB_ADD);
+    if (!t || !id || !pubkey) return false;
+    sqlite3_bind_text(t, 1, id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(t, 2, pubkey, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(t);
+    sqlite3_reset(t);
+    return rc == SQLITE_DONE;
+}
+
+/* d-tag value of a tags JSON array ("" when absent), compared to want. */
+static bool tags_d_equals(const char *tags_json, const char *want) {
+    bool match = want[0] == '\0';
+    if (!tags_json) return match;
+    jstr_t key, t, tags_str = jl_str(tags_json);
+    size_t offset = 0;
+    while ((offset = jl_next(tags_str, offset, &key, &t)) != 0) {
+        char *name = nip_tag_element(t, 0);
+        bool is_d = name && strcmp(name, "d") == 0;
+        free(name);
+        if (!is_d) continue;
+        char *v = nip_tag_element(t, 1);
+        match = strcmp(v ? v : "", want) == 0;
+        free(v);
+        break;
+    }
+    return match;
+}
+
+static int replaceable_admit(const event_t *ev, const char *dtag) {
+    sqlite3_stmt *sel = ps_get(PS_REPL_SEL);
+    if (!sel || !ev) return -1;
+    sqlite3_bind_text(sel, 1, ev->pubkey, -1, SQLITE_STATIC);
+    sqlite3_bind_int(sel, 2, ev->kind);
+    char (*victims)[MAX_ID_SIZE + 1] = NULL;
+    size_t nv = 0, cap = 0;
+    int rc, verdict = 1;
+    while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+        const char *id = (const char *) sqlite3_column_text(sel, 0);
+        sqlite3_int64 at = sqlite3_column_int64(sel, 1);
+        if (!id) continue;
+        if (dtag && !tags_d_equals((const char *) sqlite3_column_text(sel, 2), dtag)) continue;
+        int idcmp = strcmp(id, ev->id);
+        if (idcmp == 0) { verdict = 0; break; }                      /* exact duplicate */
+        /* NIP-01: newest created_at wins; on a tie the lowest id wins. */
+        if (at > (sqlite3_int64) ev->created_at ||
+            (at == (sqlite3_int64) ev->created_at && idcmp < 0)) { verdict = 0; break; }
+        if (nv == cap) {
+            size_t nc = cap ? cap * 2 : 4;
+            void *p = realloc(victims, nc * sizeof(*victims));
+            if (!p) { verdict = -1; break; }
+            victims = p; cap = nc;
+        }
+        snprintf(victims[nv++], MAX_ID_SIZE + 1, "%s", id);
+    }
+    if (verdict == 1 && rc != SQLITE_DONE) verdict = -1;
+    sqlite3_reset(sel);
+    if (verdict == 1) {
+        sqlite3_stmt *del = ps_get(PS_DEL_ID);
+        for (size_t i = 0; del && i < nv; i++) {
+            sqlite3_bind_text(del, 1, victims[i], -1, SQLITE_STATIC);
+            if (sqlite3_step(del) != SQLITE_DONE) verdict = -1;
+            sqlite3_reset(del);
+        }
+        if (!del && nv) verdict = -1;
+    }
+    free(victims);
+    return verdict;
 }
 
 /* Delete record by ID and pubkey */
@@ -1203,8 +1308,16 @@ static bool storage_init_sqlite3(const char *dsn) {
     /* Page size must be set before the first table is created (it is baked
      * into the database file on creation). 1MB is the SQLite maximum and
      * suits large Nostr payloads; existing databases keep their page size. */
+    char page_sql[64];
+    {
+        /* Only effective for a new database (fixed at first table). Small
+         * pages keep the per-event write cost low: each insert dirties a
+         * leaf in every index and the whole page is written to the WAL. */
+        const char *ps_env = getenv("NG_PAGE_SIZE");
+        snprintf(page_sql, sizeof(page_sql), "PRAGMA page_size = %d;", ps_env ? atoi(ps_env) : 4096);
+        sqlite3_exec(db_conn, page_sql, NULL, NULL, NULL);
+    }
     const char *pragmas_sql =
-        "PRAGMA page_size = 1048576;"
         "PRAGMA journal_mode = WAL;"
         "PRAGMA synchronous = NORMAL;"
         "PRAGMA busy_timeout = 5000;"
@@ -1233,10 +1346,17 @@ static bool storage_init_sqlite3(const char *dsn) {
         "    sig TEXT NOT NULL"
         ");"
         "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event(id);"
-        "CREATE INDEX IF NOT EXISTS pubkeyprefix ON event(pubkey);"
+        /* (pubkey,kind) serves authors filters (prefix) and the replaceable
+         * lookup; kindidx was a redundant prefix of kindtimeidx. */
+        "DROP INDEX IF EXISTS pubkeyprefix;"
+        "DROP INDEX IF EXISTS kindidx;"
+        "CREATE INDEX IF NOT EXISTS pubkindidx ON event(pubkey,kind);"
         "CREATE INDEX IF NOT EXISTS timeidx ON event(created_at DESC);"
-        "CREATE INDEX IF NOT EXISTS kindidx ON event(kind);"
         "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);"
+        /* NIP-09 tombstones: (id, deleting author). */
+        "CREATE TABLE IF NOT EXISTS deleted_event ("
+        "    id TEXT NOT NULL, pubkey TEXT NOT NULL, PRIMARY KEY (id, pubkey)"
+        ") WITHOUT ROWID;"
         /* NIP-26 delegation side table: one row per (event, delegator).
          * ON DELETE CASCADE keeps it in sync with event deletions because
          * PRAGMA foreign_keys is enabled above. */
@@ -1332,6 +1452,7 @@ static bool storage_init_sqlite3(const char *dsn) {
  * Thread safety: NOT thread-safe; must be called during shutdown
  */
 static void storage_deinit_sqlite3(void) {
+    ps_finalize_all();
     if (db_conn) {
         sqlite3_close_v2(db_conn);
         db_conn = NULL;
@@ -1378,11 +1499,27 @@ static bool storage_thread_open_sqlite3(bool readonly) {
                  "PRAGMA busy_timeout = 5000;"
                  "PRAGMA cache_size = -65536;"
                  "PRAGMA temp_store = memory;"
+                 "PRAGMA mmap_size = 268435456;"
                  "PRAGMA foreign_keys = true;", NULL, NULL, NULL);
+    if (!readonly) {
+        /* synchronous is per connection: WAL + NORMAL keeps every committed
+         * batch safe against process crashes (the OK is sent after COMMIT);
+         * only a power loss / kernel crash can drop the last few batches.
+         * NG_SYNC=FULL fsyncs the WAL on every batch commit instead. */
+        const char *sync = getenv("NG_SYNC");
+        char sql[160];
+        snprintf(sql, sizeof(sql),
+                 "PRAGMA synchronous = %s; PRAGMA cache_size = -262144;"
+                 "PRAGMA wal_autocheckpoint = %d;",
+                 sync && strcmp(sync, "FULL") == 0 ? "FULL" : "NORMAL",
+                 getenv("NG_WAL_CKPT") ? atoi(getenv("NG_WAL_CKPT")) : 0);
+        sqlite3_exec(db_conn, sql, NULL, NULL, NULL);
+    }
     return true;
 }
 
 static void storage_thread_close_sqlite3(void) {
+    ps_finalize_all();
     if (db_conn) { sqlite3_close_v2(db_conn); db_conn = NULL; }
 }
 
@@ -1393,6 +1530,27 @@ static bool storage_exec_sqlite3(const char *sql) {
         return false;
     }
     return true;
+}
+/* PASSIVE checkpoints never block the writer, but under sustained writes
+ * they never let the WAL wrap either (the log only restarts once fully
+ * backfilled), so it would grow without bound. When the log passes
+ * NG_WAL_RESTART_FRAMES (default 262144 pages = 1 GiB at 4 KiB) we follow a
+ * PASSIVE pass (which already backfilled almost everything) with a RESTART
+ * checkpoint: it waits for the current batch COMMIT, backfills the few
+ * remaining frames and makes the next batch rewrite the WAL from the start.
+ * The writer stalls only for that short tail. */
+static int storage_checkpoint_sqlite3(void) {
+    int log = 0, done = 0;
+    if (!db_conn) return -1;
+    if (sqlite3_wal_checkpoint_v2(db_conn, NULL, SQLITE_CHECKPOINT_PASSIVE, &log, &done) != SQLITE_OK) return -1;
+    static int restart_frames;
+    if (!restart_frames) {
+        const char *v = getenv("NG_WAL_RESTART_FRAMES");
+        restart_frames = v && atoi(v) > 0 ? atoi(v) : 262144;
+    }
+    if (log >= restart_frames)
+        sqlite3_wal_checkpoint_v2(db_conn, NULL, SQLITE_CHECKPOINT_RESTART, &log, &done);
+    return log - done;
 }
 static bool storage_begin_sqlite3(void) { return storage_exec_sqlite3("BEGIN IMMEDIATE"); }
 static bool storage_commit_sqlite3(void) { return storage_exec_sqlite3("COMMIT"); }
@@ -1410,6 +1568,9 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->deinit = storage_deinit_sqlite3;
     ctx->get_event_by_id = get_event_by_id;
     ctx->insert_record = insert_record;
+    ctx->insert_event = insert_event;
+    ctx->replaceable_admit = replaceable_admit;
+    ctx->add_tombstone = add_tombstone;
     ctx->delete_record_by_id_and_pubkey = delete_record_by_id_and_pubkey;
     ctx->delete_record_by_kind_and_pubkey = delete_record_by_kind_and_pubkey;
     ctx->delete_record_by_kind_and_pubkey_and_dtag = delete_record_by_kind_and_pubkey_and_dtag;
@@ -1422,4 +1583,5 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->begin_batch = storage_begin_sqlite3;
     ctx->commit_batch = storage_commit_sqlite3;
     ctx->rollback_batch = storage_rollback_sqlite3;
+    ctx->checkpoint = storage_checkpoint_sqlite3;
 }

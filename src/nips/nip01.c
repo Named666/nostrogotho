@@ -194,7 +194,11 @@ static nip01_process_result_t nip01_replaceable_listener(
         return nip_plugin_reject("error: storage unavailable");
     }
 
-    if (!nip01_replace_event(event, storage)) {
+    if (storage->replaceable_admit) {
+        int v = storage->replaceable_admit(event, NULL);
+        if (v < 0) return nip_plugin_reject("error: failed to replace event");
+        if (v == 0) return nip_plugin_duplicate("duplicate: have this or a newer version");
+    } else if (!nip01_replace_event(event, storage)) {
         return nip_plugin_reject("error: failed to replace event");
     }
 
@@ -208,6 +212,19 @@ static nip01_process_result_t nip01_replaceable_listener(
  * only the latest event is stored. The "d" tag value is the addressable
  * identifier; an event without a "d" tag is treated as having an empty one.
  * ============================================================================ */
+
+/* First "d" tag value (malloc'd) or NULL when the event has none. */
+static char *nip_event_d_value(const event_t *event) {
+    jstr_t key, tag, tags = jl_str(event->tags_json);
+    size_t offset = 0;
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
+        char *name = nip_tag_element(tag, 0);
+        bool is_d = name && strcmp(name, "d") == 0;
+        free(name);
+        if (is_d) return nip_tag_element(tag, 1);
+    }
+    return NULL;
+}
 
 static bool nip01_replace_addressable_event(const event_t *event,
                                             storage_context_t *storage) {
@@ -245,7 +262,13 @@ static nip01_process_result_t nip01_addressable_listener(
         return nip_plugin_reject("error: storage unavailable");
     }
 
-    if (!nip01_replace_addressable_event(event, storage)) {
+    if (storage->replaceable_admit) {
+        char *d = nip_event_d_value(event);
+        int v = storage->replaceable_admit(event, d ? d : "");
+        free(d);
+        if (v < 0) return nip_plugin_reject("error: failed to replace event");
+        if (v == 0) return nip_plugin_duplicate("duplicate: have this or a newer version");
+    } else if (!nip01_replace_addressable_event(event, storage)) {
         return nip_plugin_reject("error: failed to replace event");
     }
 

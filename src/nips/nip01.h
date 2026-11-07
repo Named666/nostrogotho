@@ -67,6 +67,7 @@ typedef struct {
     bool accepted;              /* true if event accepted, false if rejected */
     bool should_broadcast;      /* true if event should be sent to subscribers */
     char response_msg[256];     /* Human-readable reason (OK or rejection message) */
+    bool duplicate;             /* already known / superseded: OK true, never broadcast */
 } nip01_process_result_t;
 
 /* Listener function type - called when event of registered kind arrives

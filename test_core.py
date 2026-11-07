@@ -58,7 +58,7 @@ async def main():
 
         await a.send(json.dumps(["EVENT", ev]))
         ok = await until(a, lambda m: m[0] == "OK")
-        check("duplicate rejected", ok[2] is False and "duplicate" in ok[3], str(ok))
+        check("duplicate -> OK true duplicate:", ok[2] is True and ok[3].startswith("duplicate:"), str(ok))
 
         bad = dict(ev); bad["sig"] = "00" * 64
         bad["content"] = "tampered"

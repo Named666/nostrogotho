@@ -8,8 +8,10 @@
 #include "json_lite.h"
 #include "json_util.h"
 #include "nostrogotho.h"
+#include "dedupe.h"
 #include "relay_conn_internal.h"
 #include "relay_core.h"
+#include "dedupe.h"
 #include "storage.h"
 #include "nips/nip01.h"
 #include "nips/nip_event.h"
@@ -512,6 +514,15 @@ nip01_process_result_t relay_core_commit_event(relay_conn_t *conn, const event_t
     return nip01_dispatch_event(conn, event, storage_ctx, service_url);
 }
 
+void relay_core_dedupe_settle(const event_t *event, const nip01_process_result_t *r) {
+    if (event->kind >= 20000 && event->kind < 30000) return;
+    /* Stored, already present, superseded or tombstoned: remember the id.
+     * Anything else (errors, policy rejects, rollback) frees it for a retry. */
+    if (r->accepted || strncmp(r->response_msg, "blocked: this event was deleted", 31) == 0)
+        dedupe_resolve(event->id);
+    else dedupe_release(event->id);
+}
+
 void relay_core_send_ok(relay_conn_t *conn, const event_t *event, const nip01_process_result_t *result) {
     nip_plugin_send_status(conn, "OK", event->id, result->accepted, result->response_msg);
 }
@@ -528,6 +539,9 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
                 event.kind, (int) sizeof(event.id), event.id,
                 (int) sizeof(event.pubkey), event.pubkey, (long long) event.created_at);
 
+    /* Ephemeral kinds are never stored, so they are exempt from dedupe. */
+    bool guarded = !(event.kind >= 20000 && event.kind < 30000);
+
     /* CPU-bound, stateless: id hash, schnorr signature, size, timestamps. */
     nip01_process_result_t result = nip01_precheck_event(&event, MAX_EVENT_CONTENT_LENGTH,
         created_at_lower_limit, created_at_upper_limit, min_pow_difficulty);
@@ -541,18 +555,30 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
         return;
     }
 
+    /* Claim the (now verified) id; a copy verified concurrently on another
+     * worker loses the race here and is answered as a duplicate. */
+    if (guarded && !dedupe_claim(event.id)) {
+        nip_plugin_send_status(connection, "OK", event.id, true, "duplicate: already have this event");
+        event_release(&event);
+        return;
+    }
+
     if (publisher) {
-        event_t *heap = (event_t *) malloc(sizeof(*heap));
-        if (!heap) { event_release(&event); return; }
-        *heap = event;                 /* ownership of tags/content moves */
+        relay_bcast_t *b = relay_bcast_new(&event);   /* takes ownership */
+        if (!b) {
+            dedupe_release(event.id);
+            nip_plugin_send_status(connection, "OK", event.id, false, "error: out of memory");
+            return;
+        }
         relay_conn_retain(connection); /* released by the writer */
-        publisher(connection, heap);
+        publisher(connection, b);
         return;
     }
 
     result = relay_core_commit_event(connection, &event);
+    if (guarded) relay_core_dedupe_settle(&event, &result);
     relay_core_send_ok(connection, &event, &result);
-    if (result.accepted && result.should_broadcast) {
+    if (result.accepted && result.should_broadcast && !result.duplicate) {
         relay_bcast_t *b = relay_bcast_new(&event);       /* takes ownership */
         if (b) { relay_core_broadcast_shard(0, b); relay_bcast_free(b); }
         return;
@@ -624,6 +650,11 @@ void relay_core_run_timers(void) {
 
 void relay_core_configure(storage_context_t *storage, const char *relay_url, int min_pow,
                           time_t lower_limit, time_t upper_limit) {
+    {
+        const char *v = getenv("NG_DEDUPE_RECENT");
+        static bool dedupe_ready;
+        if (!dedupe_ready) { dedupe_init(v ? (size_t) strtoull(v, NULL, 10) : 131072); dedupe_ready = true; }
+    }
     storage_ctx = storage; min_pow_difficulty = min_pow < 0 ? 0 : min_pow;
     snprintf(service_url, sizeof(service_url), "%s", relay_url ? relay_url : "");
     created_at_lower_limit = lower_limit < 0 ? 0 : lower_limit;

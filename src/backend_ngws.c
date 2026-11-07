@@ -36,7 +36,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <stdint.h>
 #include "ngws/ngws.h"
+#include "nips/nip_plugin.h"
+#include "dedupe.h"
 #include "relay_conn_internal.h"
 #include "relay_core.h"
 #include "server.h"
@@ -45,7 +48,7 @@
 #define MAX_WS_MESSAGE   (5u * 1024 * 1024)
 #define MAX_OUT_BUFFER   (32u * 1024 * 1024)   /* slow-consumer cutoff */
 #define MAX_IO_LOOPS     64
-#define WRITER_BATCH     1024
+#define WRITER_BATCH     8192   /* hard cap; NG_BATCH_MAX tunes below it */
 #define OUTBOX_FLUSH     (256u * 1024)
 
 /* ---------------------------------------------------------------- types -- */
@@ -55,18 +58,20 @@ typedef struct {
     ngws_socket_t *ws;          /* loop thread only; NULL once closed */
 } ng_conn_t;
 
-enum { J_OPEN, J_MSG, J_CLOSE, J_BCAST };
+enum { J_OPEN, J_MSG, J_CLOSE, J_BSET };
 typedef struct job {
     struct job *next;
     int type;
     ng_conn_t *conn;
     relay_bcast_t *bc;
-    struct bcast_ref *bref;
+    struct bset *bset;
     size_t len;
     char payload[];             /* J_MSG: NUL-terminated message */
 } job_t;
 
-typedef struct bcast_ref { relay_bcast_t *b; atomic_int refs; } bcast_ref_t;
+/* One committed batch's broadcasts, shared by every worker (one job per
+ * worker per batch); the last worker to finish frees it. */
+typedef struct bset { atomic_int refs; int n; relay_bcast_t *b[]; } bset_t;
 
 typedef struct {
     int idx;
@@ -79,7 +84,7 @@ typedef struct {
 typedef struct wjob {
     struct wjob *next;
     ng_conn_t *conn;
-    event_t *ev;
+    relay_bcast_t *bc;
 } wjob_t;
 
 /* per-loop pending jobs for each worker, flushed at end of iteration */
@@ -332,8 +337,11 @@ static void on_close(ngws_socket_t *ws, int code) {
 }
 
 /* -------------------------------------------------------------- workers -- */
-static void bref_unref(bcast_ref_t *r) {
-    if (atomic_fetch_sub(&r->refs, 1) == 1) { relay_bcast_free(r->b); free(r); }
+static void bset_unref(bset_t *s) {
+    if (atomic_fetch_sub(&s->refs, 1) == 1) {
+        for (int i = 0; i < s->n; i++) relay_bcast_free(s->b[i]);
+        free(s);
+    }
 }
 
 static void *worker_thread(void *arg) {
@@ -356,7 +364,9 @@ static void *worker_thread(void *arg) {
                 if (rc->core && !atomic_load(&rc->closed)) relay_core_on_message(rc, j->payload, j->len);
                 relay_conn_unref(rc); break;
             case J_CLOSE: if (rc->core) relay_core_on_close(rc); relay_conn_unref(rc); break;
-            case J_BCAST: relay_core_broadcast_shard(wk->idx, j->bref->b); bref_unref(j->bref); break;
+            case J_BSET:
+                for (int i = 0; i < j->bset->n; i++) relay_core_broadcast_shard(wk->idx, j->bset->b[i]);
+                bset_unref(j->bset); break;
             }
             free(j);
             j = next;
@@ -370,16 +380,41 @@ static void *worker_thread(void *arg) {
 }
 
 /* --------------------------------------------------------------- writer -- */
-static void publish_to_writer(relay_conn_t *rc, event_t *ev) {
+static void publish_to_writer(relay_conn_t *rc, relay_bcast_t *bc) {
     wjob_t *w = (wjob_t *) malloc(sizeof(*w));
-    if (!w) { event_release(ev); free(ev); relay_conn_unref(rc); return; }
-    w->next = NULL; w->conn = (ng_conn_t *) rc; w->ev = ev;
+    if (!w) { dedupe_release(bc->ev.id); relay_bcast_free(bc); relay_conn_unref(rc); return; }
+    w->next = NULL; w->conn = (ng_conn_t *) rc; w->bc = bc;
     pthread_mutex_lock(&writer_mu);
     bool was_empty = writer_head == NULL;
     if (writer_tail) writer_tail->next = w; else writer_head = w;
     writer_tail = w;
     pthread_mutex_unlock(&writer_mu);
     if (was_empty) pthread_cond_signal(&writer_cv);
+}
+
+static int env_int(const char *name, int dflt) {
+    const char *v = getenv(name);
+    int x = v ? atoi(v) : 0;
+    return x > 0 ? x : dflt;
+}
+
+/* Per-batch id set (writer thread only). */
+static struct { const char *id; unsigned gen; } bseen[16384];
+static unsigned bseen_gen;
+static unsigned long long stat_batches, stat_events;
+static void batch_seen_reset(int n) { (void) n; if (++bseen_gen == 0) { memset(bseen, 0, sizeof(bseen)); bseen_gen = 1; } }
+static bool batch_seen_add(const char *id) {
+    uint64_t h; memcpy(&h, id, 8); h *= 0x9E3779B97F4A7C15ull;
+    for (size_t i = (size_t) (h >> 50);; i = (i + 1) & 16383) {
+        if (bseen[i].gen != bseen_gen) { bseen[i].gen = bseen_gen; bseen[i].id = id; return true; }
+        if (strcmp(bseen[i].id, id) == 0) return false;
+    }
+}
+
+static unsigned long long stat_us[3];
+static long long now_us(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
 static long long now_ms(void) {
@@ -395,6 +430,15 @@ static void *writer_thread(void *arg) {
     long long next_timer = interval ? now_ms() : 0;
     static wjob_t *batch[WRITER_BATCH];
     static nip01_process_result_t results[WRITER_BATCH];
+    int batch_max = env_int("NG_BATCH_MAX", 4096);
+    if (batch_max > WRITER_BATCH) batch_max = WRITER_BATCH;
+    int batch_min = env_int("NG_BATCH_MIN", 1024);
+    int linger_min = env_int("NG_LINGER_MIN", 64);
+    /* Off by default: measured no gain (COMMIT cost here scales with pages
+     * dirtied, i.e. with events, not with commits) and it can only add
+     * latency for closed-loop publishers. */
+    long long linger_us = getenv("NG_LINGER_US") ? atoi(getenv("NG_LINGER_US")) : 0;
+    int prev_n = 0;
     for (;;) {
         pthread_mutex_lock(&writer_mu);
         while (!writer_head && !atomic_load(&stopping)) {
@@ -408,7 +452,28 @@ static void *writer_thread(void *arg) {
             if (now_ms() >= next_timer) break;
         }
         int n = 0;
-        while (writer_head && n < WRITER_BATCH) { batch[n++] = writer_head; writer_head = writer_head->next; }
+        while (writer_head && n < batch_max) { batch[n++] = writer_head; writer_head = writer_head->next; }
+        /* Adaptive linger: only when the previous batch shows sustained load
+         * (>= linger_min events), wait up to linger_us for the batch to reach
+         * batch_min, amortizing COMMIT over more events. Idle/light traffic
+         * never waits, so OK latency stays at one commit. */
+        if (n > 0 && n < batch_min && prev_n >= linger_min && linger_us > 0 && !atomic_load(&stopping)) {
+            long long deadline = now_us() + linger_us;
+            while (n < batch_min) {
+                if (!writer_head) {
+                    long long left = deadline - now_us();
+                    if (left <= 0) break;
+                    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+                    ts.tv_nsec += (long) (left % 1000000) * 1000; ts.tv_sec += left / 1000000;
+                    if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+                    pthread_cond_timedwait(&writer_cv, &writer_mu, &ts);
+                    if (!writer_head) continue;
+                }
+                while (writer_head && n < batch_max) { batch[n++] = writer_head; writer_head = writer_head->next; }
+                if (n >= batch_max) break;
+            }
+        }
+        prev_n = n;
         if (!writer_head) writer_tail = NULL;
         bool stop = atomic_load(&stopping) && n == 0;
         pthread_mutex_unlock(&writer_mu);
@@ -420,50 +485,86 @@ static void *writer_thread(void *arg) {
         }
         if (n == 0) continue;
 
+        /* Layer 1 duplicate guard: two copies of one id inside this batch
+         * (possible only if the in-flight set was full/disabled) - the first
+         * is dispatched, later ones are answered as duplicates and never hit
+         * SQLite or the broadcast path. */
+        long long t0 = now_us();
+        batch_seen_reset(n);
         bool tx = st->begin_batch && st->begin_batch();
-        for (int i = 0; i < n; i++) results[i] = relay_core_commit_event(&batch[i]->conn->base, batch[i]->ev);
+        for (int i = 0; i < n; i++) {
+            if (!batch_seen_add(batch[i]->bc->ev.id)) {
+                results[i] = nip_plugin_duplicate("duplicate: already have this event");
+                continue;
+            }
+            results[i] = relay_core_commit_event(&batch[i]->conn->base, &batch[i]->bc->ev);
+        }
+        long long t1 = now_us();
         if (tx && st->commit_batch && !st->commit_batch()) {
             if (st->rollback_batch) st->rollback_batch();
             for (int i = 0; i < n; i++) if (results[i].accepted) {
-                results[i].accepted = false; results[i].should_broadcast = false;
+                results[i].accepted = false; results[i].should_broadcast = false; results[i].duplicate = false;
                 snprintf(results[i].response_msg, sizeof(results[i].response_msg), "error: storage commit failed");
             }
         }
+        long long t2 = now_us();
+        for (int i = 0; i < n; i++) relay_core_dedupe_settle(&batch[i]->bc->ev, &results[i]);
+        stat_batches++; stat_events += (unsigned long long) n;
+        bset_t *set = (bset_t *) malloc(sizeof(*set) + (size_t) n * sizeof(relay_bcast_t *));
+        if (set) set->n = 0;
         for (int i = 0; i < n; i++) {
             relay_conn_t *rc = &batch[i]->conn->base;
-            relay_core_send_ok(rc, batch[i]->ev, &results[i]);
-            if (results[i].accepted && results[i].should_broadcast) {
-                relay_bcast_t *b = relay_bcast_new(batch[i]->ev);    /* takes ownership */
-                bcast_ref_t *r = b ? (bcast_ref_t *) malloc(sizeof(*r)) : NULL;
-                if (r) {
-                    r->b = b;
-                    atomic_init(&r->refs, n_workers);
-                    for (int w = 0; w < n_workers; w++) {
-                        job_t *j = job_new(J_BCAST, NULL, 0);
-                        if (!j) { bref_unref(r); continue; }
-                        j->bref = r;
-                        worker_push(w, j);
-                    }
-                } else if (b) relay_bcast_free(b);
-                else event_release(batch[i]->ev);
-            } else event_release(batch[i]->ev);
-            free(batch[i]->ev);
+            relay_core_send_ok(rc, &batch[i]->bc->ev, &results[i]);
+            /* Only events newly written (or ephemeral) are ever broadcast. */
+            if (set && results[i].accepted && results[i].should_broadcast && !results[i].duplicate)
+                set->b[set->n++] = batch[i]->bc;
+            else relay_bcast_free(batch[i]->bc);
             relay_conn_unref(rc);
             free(batch[i]);
         }
+        if (set && set->n) {
+            atomic_init(&set->refs, n_workers);
+            for (int w = 0; w < n_workers; w++) {
+                job_t *j = job_new(J_BSET, NULL, 0);
+                if (!j) { bset_unref(set); continue; }
+                j->bset = set;
+                worker_push(w, j);
+            }
+        } else free(set);
         outbox_flush();
+        stat_us[0] += t1 - t0; stat_us[1] += t2 - t1; stat_us[2] += now_us() - t2;
     }
     outbox_flush();
+    if (getenv("NG_WRITER_STATS")) fprintf(stderr, "writer: dispatch %.2fs commit %.2fs post %.2fs\n", stat_us[0]/1e6, stat_us[1]/1e6, stat_us[2]/1e6);
+    if (getenv("NG_WRITER_STATS")) fprintf(stderr, "writer: %llu events in %llu batches (avg %.1f)\n",
+        stat_events, stat_batches, stat_batches ? (double) stat_events / (double) stat_batches : 0.0);
+    if (st->thread_close) st->thread_close();
+    return NULL;
+}
+
+/* ---------------------------------------------------------- checkpointer -- */
+/* WAL checkpoints moved off the writer: the writer's connection runs with
+ * wal_autocheckpoint=0 so COMMIT never does checkpoint I/O; this thread runs
+ * PASSIVE checkpoints on its own connection (they never take the write lock,
+ * so they cannot stall the writer) every NG_CKPT_MS (default 250 ms). */
+static pthread_t ckpt_th;
+static void *checkpoint_thread(void *arg) {
+    (void) arg;
+    storage_context_t *st = relay_core_storage();
+    if (!st->checkpoint || (st->thread_open && !st->thread_open(false))) return NULL;
+    int ms = 250;
+    { const char *v = getenv("NG_CKPT_MS"); if (v && atoi(v) > 0) ms = atoi(v); }
+    while (!atomic_load(&stopping)) {
+        struct timespec ts = { ms / 1000, (long) (ms % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        st->checkpoint();
+    }
+    st->checkpoint();
     if (st->thread_close) st->thread_close();
     return NULL;
 }
 
 /* ----------------------------------------------------------------- run --- */
-static int env_int(const char *name, int dflt) {
-    const char *v = getenv(name);
-    int x = v ? atoi(v) : 0;
-    return x > 0 ? x : dflt;
-}
 
 bool server_run(int port) {
     if (!relay_core_storage() || port < 1 || port > 65535) return false;
@@ -486,6 +587,7 @@ bool server_run(int port) {
         pthread_create(&workers[i].th, NULL, worker_thread, &workers[i]);
     }
     pthread_create(&writer_th, NULL, writer_thread, NULL);
+    pthread_create(&ckpt_th, NULL, checkpoint_thread, NULL);
 
     ngws_config_t cfg; memset(&cfg, 0, sizeof(cfg));
     cfg.port = port;
@@ -505,6 +607,7 @@ bool server_run(int port) {
     atomic_store(&stopping, true);
     pthread_mutex_lock(&writer_mu); pthread_cond_broadcast(&writer_cv); pthread_mutex_unlock(&writer_mu);
     pthread_join(writer_th, NULL);
+    pthread_join(ckpt_th, NULL);
     for (int i = 0; i < n_workers; i++) {
         pthread_mutex_lock(&workers[i].mu);
         pthread_cond_broadcast(&workers[i].cv);

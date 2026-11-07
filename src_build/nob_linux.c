@@ -77,7 +77,7 @@ static void common_flags(Cmd *cmd, const char *std)
 
 #define CORE_SOURCES \
     SRC_FOLDER"main.c", SRC_FOLDER"relay_core.c", SRC_FOLDER"relay_conn.c", \
-    SRC_FOLDER"backend_ngws.c", \
+    SRC_FOLDER"backend_ngws.c", SRC_FOLDER"dedupe.c", \
     SRC_FOLDER"json_lite.c", SRC_FOLDER"crypto.c", SRC_FOLDER"storage.c", \
     SRC_FOLDER"nostrogotho.c", SRC_FOLDER"json_util.c", THIRD_PARTY_FOLDER"sqlite3.c", \
     THIRD_PARTY_FOLDER"secp256k1/src/secp256k1.c", \

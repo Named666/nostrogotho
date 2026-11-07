@@ -153,6 +153,7 @@ nip01_process_result_t nip_plugin_accept(void);
 
 /* Rejected with a human-readable reason (sent as the OK message). */
 nip01_process_result_t nip_plugin_reject(const char *message);
+nip01_process_result_t nip_plugin_duplicate(const char *message);
 
 /* Store the event and accept it for broadcast. Returns a duplicate result
  * when the event already exists (storage->insert_record returned false). */

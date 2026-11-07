@@ -11,7 +11,7 @@ for t in tests/test_*.c; do
   n=$(basename "$t" .c)
   L="$LIB"
   grep -q '#include "../src/crypto.c"' "$t" && L=$(echo "$LIB" | sed 's| src/crypto.c||')
-  if cc $F -o build/tests/$n "$t" $L src/storage.c src/relay_core.c build/tests/sqlite3.o -lpthread -lm -ldl 2>build/tests/$n.log; then
+  if cc $F -o build/tests/$n "$t" $L src/storage.c src/relay_core.c src/dedupe.c build/tests/sqlite3.o -lpthread -lm -ldl 2>build/tests/$n.log; then
     if ./build/tests/$n >build/tests/$n.out 2>&1; then echo "PASS $n"; else echo "FAIL $n (see build/tests/$n.out)"; rc=1; fi
   else echo "BUILD-FAIL $n (see build/tests/$n.log)"; rc=1; fi
 done

@@ -50,10 +50,16 @@ storage_context_t *relay_core_storage(void);
  * (heap event_t, ownership transferred; conn already retained by the core
  * via relay_conn_retain — the hook's consumer must release it). When NULL
  * the core commits inline and broadcasts to shard 0. */
-typedef void (*relay_publish_fn)(relay_conn_t *conn, event_t *event);
+struct relay_bcast;
+/* The worker pre-serializes the broadcast body and parses tags before
+ * queueing (keeps that CPU off the single writer); ownership moves. */
+typedef void (*relay_publish_fn)(relay_conn_t *conn, struct relay_bcast *bcast);
 void relay_core_set_publisher(relay_publish_fn fn);
 
 nip01_process_result_t relay_core_commit_event(relay_conn_t *conn, const event_t *event);
+/* Writer: after a batch commits (or rolls back with r->accepted cleared),
+ * move the event id from in-flight to known or release it. */
+void relay_core_dedupe_settle(const event_t *event, const nip01_process_result_t *r);
 void relay_core_send_ok(relay_conn_t *conn, const event_t *event,
                         const nip01_process_result_t *result);
 /* Single-letter-or-longer tag (name, first value) pairs of an event, decoded
@@ -65,7 +71,7 @@ void relay_tags_free(relay_tags_t *t);
 
 /* A committed event prepared for fan-out: serialized once (body), tags
  * decoded once. Immutable after creation; safe to read from all shards. */
-typedef struct {
+typedef struct relay_bcast {
     event_t ev;
     relay_body_t *body;
     relay_tags_t tags;

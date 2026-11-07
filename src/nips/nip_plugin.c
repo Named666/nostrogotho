@@ -61,6 +61,14 @@ nip01_process_result_t nip_plugin_accept(void) {
     return result;
 }
 
+nip01_process_result_t nip_plugin_duplicate(const char *message) {
+    nip01_process_result_t result = {0};
+    result.accepted = true;            /* NIP-01: ["OK", id, true, "duplicate: ..."] */
+    result.duplicate = true;           /* never broadcast */
+    snprintf(result.response_msg, sizeof(result.response_msg), "%s", message);
+    return result;
+}
+
 nip01_process_result_t nip_plugin_reject(const char *message) {
     nip01_process_result_t result = {0};
     result.accepted = false;
@@ -79,10 +87,12 @@ nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage
     if (!storage || !storage->insert_record) {
         return nip_plugin_reject("error: storage unavailable");
     }
-    if (!storage->insert_record(event)) {
-        return nip_plugin_reject("duplicate: event already exists");
-    }
-    return nip_plugin_accept();
+    int rc = storage->insert_event ? storage->insert_event(event)
+                                   : (storage->insert_record(event) ? STORE_INSERTED : STORE_DUPLICATE);
+    if (rc == STORE_INSERTED) return nip_plugin_accept();
+    if (rc == STORE_DUPLICATE) return nip_plugin_duplicate("duplicate: already have this event");
+    if (rc == STORE_DELETED) return nip_plugin_reject("blocked: this event was deleted by its author");
+    return nip_plugin_reject("error: failed to store event");
 }
 
 nip01_process_result_t nip_plugin_store_only(storage_context_t *storage,

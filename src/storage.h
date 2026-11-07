@@ -30,6 +30,8 @@
  * 
  * Note: json_event and event are valid only for the duration of the callback
  */
+enum { STORE_ERROR = -1, STORE_DUPLICATE = 0, STORE_INSERTED = 1, STORE_DELETED = 2 };
+
 typedef void (*send_records_callback_t)(const char *json_event, const event_t *event);
 
 /* ============================================================================
@@ -87,6 +89,25 @@ typedef struct {
      * Note: May enforce uniqueness on event ID
      */
     bool (*insert_record)(const event_t *ev);
+
+    /* insert_event - insert with a precise outcome (writer thread only).
+     * Returns STORE_INSERTED, STORE_DUPLICATE (id already stored; the
+     * UNIQUE index on event.id is authoritative), STORE_DELETED (a NIP-09
+     * tombstone from the same author blocks re-insertion) or STORE_ERROR. */
+    int (*insert_event)(const event_t *ev);
+
+    /* replaceable_admit - NIP-01 replaceable / addressable admission.
+     * dtag is NULL for replaceable kinds, the "d" value ("" if absent) for
+     * addressable ones. If a stored version for the same key is newer (or
+     * same created_at and lower id), returns 0 and deletes nothing. Otherwise
+     * deletes every stored version for the key and returns 1. -1 on error.
+     * Writer thread only; runs inside the batch transaction so two versions
+     * in one batch resolve in order and only the winner survives. */
+    int (*replaceable_admit)(const event_t *ev, const char *dtag);
+
+    /* add_tombstone - remember that `pubkey` deleted event `id` (NIP-09), so
+     * the event can never be re-inserted by that author. */
+    bool (*add_tombstone)(const char *id, const char *pubkey);
     
     /* ====================================================================
      * Event Deletion Operations
@@ -203,6 +224,9 @@ typedef struct {
     bool (*begin_batch)(void);
     bool (*commit_batch)(void);
     bool (*rollback_batch)(void);   /* after a failed commit */
+    /* Checkpointer thread: PASSIVE WAL checkpoint on this thread's own
+     * connection (never blocks the writer). Returns WAL frames left. */
+    int (*checkpoint)(void);
 } storage_context_t;
 
 /* ============================================================================
