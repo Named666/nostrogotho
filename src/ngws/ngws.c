@@ -28,6 +28,7 @@
 #define MAX_HTTP_HEADER   8192
 #define ARENA_CHUNK       (256 * 1024)
 #define SEND_WATERMARK    (64 * 1024)
+#define DIRECT_MIN        (64 * 1024)  /* frames this big skip the arena copy (send_direct) */
 #define MSG_CHUNK         65536      /* pooled message-assembly buffer */
 #define POOL_MAX          256        /* pooled buffers kept per loop */
 #define MAX_LOOPS         64
@@ -295,7 +296,38 @@ static int send_status(sockx_t *x) {
     return (x->olen - x->ooff) + x->qbytes > SEND_WATERMARK ? NGWS_SEND_BACKPRESSURE : NGWS_SEND_OK;
 }
 
+/* Large frame with nothing queued ahead of it: write it straight from the
+ * caller's buffer (header + payload in one writev) instead of copying it
+ * into the arena first; only what the kernel does not take is copied, to
+ * the backlog. Saves one full copy per large message. Smaller frames keep
+ * the arena path so a socket's frames coalesce into one writev. */
+static int send_direct(sockx_t *x, int op, const void *data, size_t len) {
+    struct us_socket_t *s = x->s;
+    unsigned char hdr[10];
+    size_t h = ws_frame_header(hdr, op, len), total = h + len;
+    if (total > SRV(x)->cfg.max_backpressure) { ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
+    struct iovec iov[2] = { { hdr, h }, { (void *) data, len } };
+    ssize_t w = writev((int) (intptr_t) us_socket_get_native_handle(0, s), iov, 2);
+    if (w == (ssize_t) total) return NGWS_SEND_OK;
+    if (w < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
+        w = 0;
+    }
+    size_t done = (size_t) w;
+    bool ok = done < h ? backlog_append(x, hdr + done, h - done) && backlog_append(x, data, len)
+                       : backlog_append(x, (const char *) data + (done - h), len - (done - h));
+    if (!ok) { ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
+    /* let uSockets arm the writable poll (on_writable drains the backlog) */
+    int w2 = us_socket_write(0, s, x->obuf + x->ooff, (int) (x->olen - x->ooff), 0);
+    if (w2 > 0) x->ooff += (size_t) w2;
+    if (x->ooff == x->olen) { out_release(x); return NGWS_SEND_OK; }
+    return send_status(x);
+}
+
 static int queue_frame(sockx_t *x, int op, const void *data, size_t len) {
+    if (len >= DIRECT_MIN && !x->qhead && x->olen == x->ooff && !us_socket_is_closed(0, x->s) &&
+        !us_socket_is_shut_down(0, x->s))
+        return send_direct(x, op, data, len);
     char *p = out_reserve(x, len + ngws_frame_overhead(len));
     if (!p) return NGWS_SEND_DROPPED;
     size_t h = ws_frame_header((unsigned char *) p, op, len);
