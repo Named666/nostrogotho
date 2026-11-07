@@ -130,6 +130,8 @@ void *ngws_loop_alloc(ngws_loop_t *l, size_t n) {
     return arena_alloc(l, (n + 15) & ~(size_t) 15);
 }
 
+void *ngws_loop_alloc_frame(ngws_loop_t *l, size_t n) { return arena_alloc(l, n); }
+
 /* Unaligned bump allocation (frame bytes need no alignment), so that a
  * socket's consecutive frames in one iteration land back to back and can
  * be coalesced into a single iovec. */
@@ -362,7 +364,10 @@ int ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len) {
         if (!backlog_append(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
         dirty_add(x);
     } else {
-        if (x->qbytes + len > SRV(x)->cfg.max_backpressure || !node_add(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
+        if (x->qbytes + len > SRV(x)->cfg.max_backpressure) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
+        ionode_t *t = x->qtail ? &x->loop->nodes[x->qtail - 1] : NULL;
+        if (t && (const char *) t->p + t->len == (const char *) frame) { t->len += len; x->qbytes += len; }  /* contiguous: one iovec */
+        else if (!node_add(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
     }
     return send_status(x);
 }

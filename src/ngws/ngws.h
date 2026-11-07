@@ -97,6 +97,9 @@ void ngws_http_respond(ngws_socket_t *s, const char *status, const char *extra_h
 void ngws_loop_foreach(ngws_loop_t *loop, void (*fn)(ngws_socket_t *ws, void *arg), void *arg);
 /* Scratch memory valid until the end of the current loop iteration. */
 void *ngws_loop_alloc(ngws_loop_t *loop, size_t n);
+/* Same, unaligned: frames allocated back to back this way and passed to
+ * ngws_send_shared() in order coalesce into one iovec per socket. */
+void *ngws_loop_alloc_frame(ngws_loop_t *loop, size_t n);
 /* Run fn(arg) at the end of the current iteration, after output is flushed
  * (e.g. to drop a reference on a frame passed to ngws_send_shared). */
 void ngws_loop_defer(ngws_loop_t *loop, void (*fn)(void *), void *arg);

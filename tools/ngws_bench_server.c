@@ -23,7 +23,7 @@ static void bc_one(ngws_socket_t *ws, void *a) { bc_t *b = a; ngws_send_shared(w
 
 static void on_message(ngws_socket_t *ws, char *d, size_t n, int op) {
     if (!mode_bcast) { ngws_send(ws, d, n, op); return; }
-    char *fbuf = ngws_loop_alloc(ngws_socket_loop(ws), n + 10);   /* frame once, share */
+    char *fbuf = ngws_loop_alloc_frame(ngws_socket_loop(ws), ngws_frame_overhead(n) + n);   /* frame once, share */
     bc_t b = { fbuf, ngws_frame_build(fbuf, op, d, n) };
     ngws_loop_foreach(ngws_socket_loop(ws), bc_one, &b);
 }
