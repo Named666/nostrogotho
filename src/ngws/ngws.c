@@ -80,6 +80,7 @@ struct ngws_server {
     int n_loops;
     ngws_loop_t loops[MAX_LOOPS];
     atomic_bool stopping;
+    bool uncork;                        /* flush a socket at the end of its on_data */
 };
 
 static inline sockx_t *X(struct us_socket_t *s) { return (sockx_t *) us_socket_ext(0, s); }
@@ -714,6 +715,11 @@ static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length
     }
     x->in_data = 0;
     if (us_socket_is_closed(0, s)) { free_inputs(x); return s; }
+    /* Uncork: replies produced while handling this read go out now instead
+     * of at the end of the loop iteration (lower latency; same writev
+     * count, since a socket's frames from one read are already coalesced).
+     * Sends from other sockets' callbacks/tasks still batch until loop_post. */
+    if (x->dirty && SRV(x)->uncork) { dirty_del(x); flush(x); }
     return s;
 }
 
@@ -844,6 +850,7 @@ ngws_server_t *ngws_server_create(const ngws_config_t *cfg) {
         mallopt(M_TRIM_THRESHOLD, 256 << 20);
     } }
 #endif
+    { const char *c = getenv("NGWS_CORK"); srv->uncork = !(c && strcmp(c, "1") == 0); }
     if (!srv->cfg.max_payload) srv->cfg.max_payload = 16u << 20;
     if (!srv->cfg.max_backpressure) srv->cfg.max_backpressure = 16u << 20;
     if (!srv->cfg.handshake_timeout) srv->cfg.handshake_timeout = 12;
