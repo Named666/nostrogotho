@@ -5,6 +5,9 @@
 #include "ngws.h"
 
 #include <arpa/inet.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -117,8 +120,18 @@ static void dirty_del(sockx_t *x) {
     x->dirty = 0; x->dprev = x->dnext = NULL;
 }
 
+static void *arena_alloc(ngws_loop_t *l, size_t n);
 void *ngws_loop_alloc(ngws_loop_t *l, size_t n) {
-    n = (n + 15) & ~(size_t) 15;
+    arena_chunk_t *c = l->arena_cur;
+    if (c) c->used = (c->used + 15) & ~(size_t) 15;    /* caller-visible blocks are 16-aligned */
+    if (c && c->used > c->cap) c->used = c->cap;
+    return arena_alloc(l, (n + 15) & ~(size_t) 15);
+}
+
+/* Unaligned bump allocation (frame bytes need no alignment), so that a
+ * socket's consecutive frames in one iteration land back to back and can
+ * be coalesced into a single iovec. */
+static void *arena_alloc(ngws_loop_t *l, size_t n) {
     arena_chunk_t *c = l->arena_cur;
     if (c && c->used + n <= c->cap) { void *p = c->data + c->used; c->used += n; return p; }
     /* next chunk: reuse a retained one or allocate */
@@ -203,7 +216,17 @@ static char *out_reserve(sockx_t *x, size_t n) {
         return p;
     }
     if (x->qbytes + n > SRV(x)->cfg.max_backpressure) goto fail;
-    char *p = (char *) ngws_loop_alloc(x->loop, n);
+    ngws_loop_t *l = x->loop;
+    arena_chunk_t *c = l->arena_cur;
+    if (x->qtail && c && c->used + n <= c->cap) {
+        ionode_t *t = &l->nodes[x->qtail - 1];
+        if ((const unsigned char *) t->p + t->len == c->data + c->used) {   /* extend our tail iovec */
+            char *p = (char *) c->data + c->used;
+            c->used += n; t->len += n; x->qbytes += n;
+            return p;
+        }
+    }
+    char *p = (char *) arena_alloc(l, n);
     if (!p || !node_add(x, p, n)) goto fail;
     return p;
 fail:
@@ -811,6 +834,16 @@ ngws_server_t *ngws_server_create(const ngws_config_t *cfg) {
     ngws_server_t *srv = (ngws_server_t *) calloc(1, sizeof(*srv));
     if (!srv) return NULL;
     srv->cfg = *cfg;
+#ifdef __GLIBC__
+    /* Large frames / backlogs (64 KiB .. max_payload) would otherwise be
+     * mmap'd and munmap'd per message by glibc (threshold 128 KiB), paying
+     * page faults on every large send/receive. Serve them from the heap and
+     * keep freed memory for reuse. NGWS_NO_MALLOPT=1 leaves glibc alone. */
+    { const char *nm = getenv("NGWS_NO_MALLOPT"); if (!nm || strcmp(nm, "1") != 0) {
+        mallopt(M_MMAP_THRESHOLD, (int) (srv->cfg.max_payload + (1u << 20) < (1u << 30) ? srv->cfg.max_payload + (1u << 20) : (1u << 30)));
+        mallopt(M_TRIM_THRESHOLD, 256 << 20);
+    } }
+#endif
     if (!srv->cfg.max_payload) srv->cfg.max_payload = 16u << 20;
     if (!srv->cfg.max_backpressure) srv->cfg.max_backpressure = 16u << 20;
     if (!srv->cfg.handshake_timeout) srv->cfg.handshake_timeout = 12;

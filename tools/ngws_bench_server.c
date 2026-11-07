@@ -8,6 +8,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ngws/ngws.h"
+#include <signal.h>
+#include <unistd.h>
+
+#ifdef NGWS_PGO_GEN
+/* PGO training build: write the profile when the benchmark harness kills us. */
+extern void __gcov_dump(void);
+static void on_term(int sig) { (void) sig; __gcov_dump(); _exit(0); }
+#endif
 
 static int mode_bcast;
 typedef struct { const char *f; size_t n; } bc_t;
@@ -29,6 +37,9 @@ int main(int argc, char **argv) {
     c.max_payload = 16u << 20;
     c.max_backpressure = 64u << 20;
     c.idle_timeout = 120;
+#ifdef NGWS_PGO_GEN
+    signal(SIGTERM, on_term); signal(SIGINT, on_term);
+#endif
     ngws_server_t *s = ngws_server_create(&c);
     fprintf(stderr, "ngws bench server :%d loops=%d mode=%s\n", c.port, c.loops, mode_bcast ? "broadcast" : "echo");
     return ngws_server_run(s) ? 0 : 1;
