@@ -50,3 +50,42 @@ transport (server ~205% of 4 CPUs).
 `NG_SAN=thread ./nob` / `NG_SAN=address ./nob` produce `build/*_thread` /
 `build/*_address`. Under test_core, test_ws2, live broadcast and ngload
 pub/fanout/hold: 0 ThreadSanitizer warnings, 0 ASan/LSan errors.
+
+## Writer tuning + duplicate guards (Nov 2026)
+
+`tools/bench/pub.sh <bin> <conns> <pipeline>`: 1.5M unique pre-signed
+kind-1 events, fresh DB on the root disk (virtio), server CPUs 0-3, client
+4-7, 6 s. Latency = EVENT sent → its OK (OK is sent only after COMMIT).
+
+| Load | before (e04b0cc) | after |
+|---|---|---|
+| 64 conns × 16 in flight: EVENT/s | 21.3k | 43-48k |
+| ... OK latency p50 / p99 | 47 ms / 60 ms | 19 ms / 35-120 ms |
+| 256 × 16: EVENT/s | 23.7k | 50-52k |
+| 16 × 1 (light): EVENT/s | 11.4k | 15.5-20k |
+| ... OK latency p50 / p99 / p999 | 1.13 / 4.3 / 9.4 ms | 0.7-0.85 / 1.4-1.5 / 4.2 ms |
+| fanout 1000 subs @2000 ev/s p50/p99 | 6.2 / 11.7 ms | 6.6 / 10.4 ms |
+| fanout 5000 subs @500 ev/s p50/p99 | 38 / 105 ms | 38 / 56 ms |
+
+Writer CPU before: ~82% busy, of which COMMIT was the largest part (WAL
+autocheckpoint with fsync inside COMMIT, 1 MiB pages). What changed:
+- page_size 1 MiB → 4 KiB (new DBs; each insert rewrites whole dirty pages);
+- writer connection `synchronous=NORMAL` (was the per-connection default
+  FULL), `wal_autocheckpoint=0`, WAL checkpoints on a separate thread
+  (PASSIVE every 250 ms; RESTART only past 1 GiB of WAL);
+- prepared statements reused (`sqlite3_prepare_v3 PERSISTENT` + reset);
+- broadcast body serialization + tag parsing moved from the writer to the
+  worker that verified the event; fan-out is one job per worker per batch;
+- redundant `kindidx` and `pubkeyprefix` indexes replaced by one
+  `(pubkey, kind)` index (also serves replaceable lookups);
+- batch cap 1024 → 4096 (NG_BATCH_MAX); a size/time linger exists
+  (NG_LINGER_US / NG_BATCH_MIN) but is off: COMMIT cost here scales with
+  dirtied pages (≈ events), not commits, so lingering only added latency.
+
+Remaining tail: the RESTART checkpoint holds the write lock through a DB
+fsync (~100-250 ms on this disk), once per ~1 GiB of WAL (~120k events).
+Pure-PASSIVE (`NG_WAL_RESTART_FRAMES` huge) has max ≈ 16 ms but lets the WAL
+grow without bound under non-stop writes.
+
+Duplicate guards: `tools/run_dedupe_tests.sh` (23 checks, with and without
+the in-flight/recent set), clean under TSan and ASan.

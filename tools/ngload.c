@@ -90,6 +90,7 @@ typedef struct {
     bool want_out;
     uint64_t next_send_ns;
     size_t ev_lo, ev_hi, ev_pos;    /* nostr-pub slice */
+    uint64_t sent[64]; unsigned sh, st;   /* nostr-pub: send times, OKs arrive in order */
 } conn_t;
 
 typedef struct {
@@ -176,7 +177,7 @@ static void send_bcast(conn_t *c) {
 static bool send_next_event(conn_t *c, bool fanout) {
     size_t i;
     if (fanout) { i = atomic_fetch_add(&ev_next, 1); if (i >= nevents) return false; ev_sent_ns[i] = now_ns(); }
-    else { if (c->ev_pos >= c->ev_hi) return false; i = c->ev_pos++; }
+    else { if (c->ev_pos >= c->ev_hi) return false; i = c->ev_pos++; c->sent[c->st++ & 63] = now_ns(); }
     send_frame(c, 1, (const uint8_t *) events[i], strlen(events[i]));
     c->inflight++;
     return true;
@@ -233,7 +234,8 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
         if (n > 5 && memcmp(p, "[\"OK\"", 5) == 0) {
             c->inflight--;
             bool ok = memmem(p, n, "\",true,", 7) != NULL;
-            if (m) { if (ok) t->oks++; else t->fails++; t->msgs++; }
+            uint64_t sent_at = c->sh != c->st ? c->sent[c->sh++ & 63] : 0;
+            if (m) { if (ok) t->oks++; else t->fails++; t->msgs++; if (sent_at) hadd(&t->hist, now_ns() - sent_at); }
             if (atomic_load(&phase) == 1) send_next_event(c, false);
         }
         break;
@@ -423,6 +425,7 @@ int main(int argc, char **argv) {
     mode = !strcmp(ms, "hold") ? M_HOLD : !strcmp(ms, "echo") ? M_ECHO : !strcmp(ms, "bcast") ? M_BCAST :
            !strcmp(ms, "nostr-pub") ? M_NPUB : !strcmp(ms, "nostr-fanout") ? M_NFAN : -1;
     if (mode < 0) { fprintf(stderr, "bad mode\n"); return 2; }
+    if (mode == M_NPUB && pipel > 64) { fprintf(stderr, "nostr-pub: -P max 64\n"); return 2; }
     if ((mode == M_NPUB || mode == M_NFAN) && !evfile) { fprintf(stderr, "-f events file required\n"); return 2; }
     if (evfile) load_events();
     if (nsrc < 0) nsrc = nconns / 20000 + 1;
