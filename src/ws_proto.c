@@ -97,7 +97,8 @@ int ws_parse_header(const unsigned char *b, size_t n, ws_frame_t *f) {
 
 void ws_unmask(unsigned char *p, size_t n, const unsigned char m[4]) {
     size_t i = 0;
-    uint32_t m32; memcpy(&m32, m, 4);
-    for (; i + 4 <= n; i += 4) { uint32_t v; memcpy(&v, p + i, 4); v ^= m32; memcpy(p + i, &v, 4); }
+    unsigned char m8[8] = { m[0], m[1], m[2], m[3], m[0], m[1], m[2], m[3] };
+    uint64_t m64; memcpy(&m64, m8, 8);
+    for (; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); v ^= m64; memcpy(p + i, &v, 8); }
     for (; i < n; i++) p[i] ^= m[i & 3];
 }
