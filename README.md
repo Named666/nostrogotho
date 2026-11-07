@@ -1,8 +1,10 @@
 # nostrogotho
 
-`nostrogotho` is a C99 Nostr relay with SQLite persistence. It uses bundled
-Mongoose for HTTP/WebSocket transport and bundled libsecp256k1 for Schnorr
-signature verification. The current build targets Windows with GCC/MinGW.
+`nostrogotho` is a C99 Nostr relay with SQLite persistence. It uses its own
+in-tree multithreaded WebSocket server, ngws (`src/ngws`, pure C on vendored
+uSockets, epoll, no TLS — put nginx in front), and bundled libsecp256k1 for
+Schnorr signature verification. The build targets Linux with GCC. See
+[BENCHMARKS.md](BENCHMARKS.md).
 
 ## Repository Structure
 
@@ -28,7 +30,7 @@ nostrogotho/
 │   └── main.c               Example main entry point
 ├── thirdparty/              Bundled dependencies
 │   ├── sqlite3.c/h          SQLite3 amalgamation
-│   ├── mongoose/            WebSocket library
+│   ├── uSockets/            Event loop / sockets (Apache-2.0)
 │   └── secp256k1/           Schnorr signature library
 └── src/nips/                NIP protocol plugins
     ├── nip01.c/h            Basic Protocol Flow
@@ -153,8 +155,9 @@ time ranges, and content search; stored events are delivered before EOSE.
 
 ## Protocol Modules
 
-Protocol policy is isolated under [src/nips](src/nips). `server.c` owns the
-Mongoose event loop, WebSocket framing, subscription lifecycle, and dispatch;
+Protocol policy is isolated under [src/nips](src/nips). `src/ngws` owns the
+event loops and WebSocket framing, `backend_ngws.c` the threading model, and
+`relay_core.c` the subscription index, lifecycle and dispatch;
 NIP modules own protocol-specific decisions. Every supported server-side NIP has
 its own implementation and header: `nip09`, `nip11`, `nip13`, `nip17`, `nip33`,
 `nip62`, and `nip40`/`nip45`/`nip67`. Shared event-tag inspection lives in
@@ -180,14 +183,13 @@ large-scale social network. They are future work, not current support claims.
 
 ## Build
 
-The project uses [nob](nob.c) and GCC; it does not use a project CMake build. Build the bootstrap executable and invoke it from the repository root:
+The project uses [nob](nob.c) and GCC on Linux:
 
-```powershell
-gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
-.\nob.exe
+```sh
+cc -o nob nob.c && ./nob            # build/main, build/ngload, build/ngws_bench_server
+NG_SAN=address ./nob                # build/main_address (ASan), or NG_SAN=thread
+./build/main --port 7447            # env: NG_IO_THREADS, NG_WORKERS, NG_IDLE_TIMEOUT
 ```
 
-`nob` compiles the relay and SQLite amalgamation directly. It links the other
-bundled dependencies from `thirdparty/install`, which must contain the
-configured headers and static libraries for mongoose, secp256k1, and
-OpenSSL. The output executable is `build/nostrogotho.exe`.
+All dependencies (SQLite 3.54.1 amalgamation, secp256k1, uSockets) are compiled
+from `thirdparty/`; nothing is linked from the system besides libc/pthread.

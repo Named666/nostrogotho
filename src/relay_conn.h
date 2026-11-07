@@ -5,9 +5,10 @@
  * relay_conn - transport-neutral connection handle.
  *
  * The relay core and every NIP plugin talk to clients only through this
- * opaque handle; the concrete backend (Mongoose or uSockets) lives behind it.
+ * opaque handle; the transport (ngws: uSockets + in-tree RFC 6455) lives
+ * behind it.
  *
- * Threading contract (uSockets backend):
+ * Threading contract:
  *   - A connection is pinned to one worker ("shard"). All protocol callbacks
  *     for that connection (on_connect/on_message/on_disconnect, delivery
  *     checks for its subscriptions) run on that worker, in order.
@@ -20,13 +21,29 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 typedef struct relay_conn relay_conn_t;
 
 #define RELAY_CONN_MAX_SLOTS 8
 
+/* Immutable, refcounted serialized event object ("{...}") shared by every
+ * delivery of one broadcast: serialized once, framed per subscription with a
+ * small prefix, and written with zero copies. */
+typedef struct relay_body {
+    _Atomic int refs;
+    size_t len;
+    char json[];
+} relay_body_t;
+relay_body_t *relay_body_new(const char *json, size_t len);
+void relay_body_retain(relay_body_t *b, int n);
+void relay_body_release(relay_body_t *b);
+
 void relay_conn_send(relay_conn_t *conn, const char *json, size_t len);
 void relay_conn_close(relay_conn_t *conn);
+/* Send ["EVENT",<sub_json>,<body>]. sub_json is the already JSON-encoded
+ * subscription id (with quotes). Takes no reference on body unless queued. */
+void relay_conn_send_event(relay_conn_t *conn, const char *sub_json, size_t sub_len, relay_body_t *body);
 uint64_t relay_conn_id(const relay_conn_t *conn);
 const char *relay_conn_peer(const relay_conn_t *conn);
 

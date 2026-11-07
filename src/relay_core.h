@@ -4,12 +4,11 @@
 /* ============================================================================
  * relay_core - transport-agnostic Nostr protocol engine.
  *
- * Backends (backend_mongoose.c, backend_usockets.c) feed it connection
- * lifecycle + text messages through relay_conn_t handles. Protocol state is
- * sharded: each connection belongs to one shard (conn->shard) and all calls
- * for that connection, plus broadcast matching for its subscriptions, must
- * happen on the thread that owns the shard. The Mongoose backend uses a
- * single shard on its single thread.
+ * The backend (backend_ngws.c) feeds it connection lifecycle + text messages
+ * through relay_conn_t handles. Protocol state is sharded: each connection
+ * belongs to one shard (conn->shard) and all calls for that connection, plus
+ * broadcast matching for its subscriptions, must happen on the thread that
+ * owns the shard.
  *
  * EVENT publishing has two halves so the writer can be a single thread:
  *   worker:  parse + precheck (sig verify) + plugin accept_publish
@@ -57,7 +56,23 @@ void relay_core_set_publisher(relay_publish_fn fn);
 nip01_process_result_t relay_core_commit_event(relay_conn_t *conn, const event_t *event);
 void relay_core_send_ok(relay_conn_t *conn, const event_t *event,
                         const nip01_process_result_t *result);
-void relay_core_broadcast_shard(int shard, const event_t *event);
+/* Single-letter-or-longer tag (name, first value) pairs of an event, decoded
+ * once and shared read-only by every shard during a broadcast. */
+typedef struct { const char *name; size_t nlen; const char *val; size_t vlen; } relay_tagpair_t;
+typedef struct { relay_tagpair_t *p; size_t n; char *store; } relay_tags_t;
+void relay_tags_parse(const event_t *ev, relay_tags_t *out);
+void relay_tags_free(relay_tags_t *t);
+
+/* A committed event prepared for fan-out: serialized once (body), tags
+ * decoded once. Immutable after creation; safe to read from all shards. */
+typedef struct {
+    event_t ev;
+    relay_body_t *body;
+    relay_tags_t tags;
+} relay_bcast_t;
+relay_bcast_t *relay_bcast_new(event_t *ev);    /* takes ownership of ev's heap fields */
+void relay_bcast_free(relay_bcast_t *b);
+void relay_core_broadcast_shard(int shard, const relay_bcast_t *b);
 
 /* Free all subscriptions of every shard (shutdown). */
 void relay_core_shutdown(void);

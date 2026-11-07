@@ -599,6 +599,7 @@ static tags_array_t *parse_tags_json(const char *json_str) {
                 p++;
                 if (tag->count > 0) {
                     tags->tags[tags->count++] = *tag;
+                    free(tag); /* contents moved into array */
                 } else {
                     tag_free(tag);
                 }

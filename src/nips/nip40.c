@@ -52,8 +52,7 @@ bool nip40_event_is_expired(const event_t *event) {
 
 /* nip40_garbage_collect - Background sweep of NIP-40 expired events.
  *
- * Callback for a periodic mongoose timer. Runs inside the single-threaded
- * event loop (so it never races the storage backend) and asks the storage
+ * Callback for a periodic relay timer. Runs on the storage writer path (so it never races the storage backend) and asks the storage
  * layer to delete every event whose expiration timestamp has passed.
  *
  * The storage layer is best-effort; we only log the outcome and never fail

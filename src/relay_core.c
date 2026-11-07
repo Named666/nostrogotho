@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <time.h>
 #include "crypto.h"
 #include "json_lite.h"
@@ -32,11 +33,20 @@
  * build_count, timer, info_document).
  * ============================================================================ */
 
+typedef struct sub_entry {
+    struct sub_entry *next, **pprev;   /* bucket chain */
+    struct subscription *sub;
+    const filter_t *filter;
+} sub_entry_t;
+
 typedef struct subscription {
     relay_conn_t *connection;
     char *id;
+    char *id_json; size_t id_json_len;            /* JSON-encoded id, with quotes */
     filter_t *filters;
     size_t filters_count;
+    sub_entry_t *entries; size_t entries_count;   /* index entries */
+    uint64_t gen;                                 /* last broadcast delivered */
     struct subscription *shard_prev, *shard_next; /* shard-wide list */
     struct subscription *conn_next;               /* per-connection list */
 } subscription_t;
@@ -46,7 +56,21 @@ typedef struct {
     int count;
 } core_conn_t;
 
+/* Per-shard subscription index. Each filter is indexed under the keys of its
+ * most selective exact-match field (ids > authors > single-letter tag values >
+ * kinds) or on the wildcard list. An event probes the buckets of its own id,
+ * pubkey, tag values and kind plus the wildcard list, so only plausible
+ * filters are evaluated; collisions are harmless (full match follows). */
+#define IDX_BUCKETS 16384
+typedef struct {
+    sub_entry_t *buckets[IDX_BUCKETS];
+    sub_entry_t *wild;
+    uint64_t gen;
+    size_t n_subs;
+} shard_index_t;
+
 static subscription_t *shard_subs[RELAY_MAX_SHARDS];
+static shard_index_t *shard_idx[RELAY_MAX_SHARDS];
 static storage_context_t *storage_ctx;
 static int min_pow_difficulty;
 static time_t created_at_lower_limit;
@@ -83,12 +107,139 @@ static void log_message(relay_conn_t *connection, const char *fmt, ...) {
 
 static core_conn_t *core_of(relay_conn_t *conn) { return (core_conn_t *) conn->core; }
 
+/* ------------------------------------------------------------ index ---- */
+static uint64_t key_hash(char type, const char *s, size_t n) {
+    uint64_t h = 1469598103934665603ull ^ (uint64_t) (unsigned char) type;
+    h *= 1099511628211ull;
+    for (size_t i = 0; i < n; i++) { h ^= (unsigned char) s[i]; h *= 1099511628211ull; }
+    return h ^ (h >> 29);
+}
+static uint64_t kind_hash(int kind) { char b[16]; int n = snprintf(b, sizeof(b), "%d", kind); return key_hash('k', b, (size_t) n); }
+
+static shard_index_t *index_of(int shard) {
+    if (!shard_idx[shard]) shard_idx[shard] = (shard_index_t *) calloc(1, sizeof(shard_index_t));
+    return shard_idx[shard];
+}
+
+static void entry_link(sub_entry_t **head, sub_entry_t *e) {
+    e->next = *head; e->pprev = head;
+    if (*head) (*head)->pprev = &e->next;
+    *head = e;
+}
+static void entry_unlink(sub_entry_t *e) {
+    if (!e->pprev) return;
+    *e->pprev = e->next;
+    if (e->next) e->next->pprev = e->pprev;
+    e->next = NULL; e->pprev = NULL;
+}
+
+static bool all_len(char **v, size_t n, size_t want) {
+    for (size_t i = 0; i < n; i++) if (strlen(v[i]) != want) return false;
+    return n > 0;
+}
+
+/* Number of index keys a filter is stored under, and the keys. */
+static size_t filter_keys(const filter_t *f, uint64_t *keys, size_t cap) {
+    size_t n = 0;
+    if (f->ids_count && all_len(f->ids, f->ids_count, 64)) {
+        for (size_t i = 0; i < f->ids_count && n < cap; i++) keys[n++] = key_hash('i', f->ids[i], 64);
+        return n;
+    }
+    if (f->authors_count && all_len(f->authors, f->authors_count, 64)) {
+        for (size_t i = 0; i < f->authors_count && n < cap; i++) keys[n++] = key_hash('a', f->authors[i], 64);
+        return n;
+    }
+    for (size_t t = 0; t < f->tags_count; t++) {
+        const tag_t *tg = &f->tags[t];
+        if (tg->count < 2 || strlen(tg->elements[0]) != 1) continue;
+        if (tg->count - 1 > cap) break;
+        for (size_t v = 1; v < tg->count; v++)
+            keys[n++] = key_hash((char) (tg->elements[0][0] | 0x80), tg->elements[v], strlen(tg->elements[v]));
+        return n;
+    }
+    if (f->kinds_count && f->kinds_count <= cap) {
+        for (size_t i = 0; i < f->kinds_count; i++) keys[n++] = kind_hash(f->kinds[i]);
+        return n;
+    }
+    return 0;   /* wildcard */
+}
+
+static void index_add(int shard, subscription_t *s) {
+    shard_index_t *ix = index_of(shard);
+    if (!ix) return;
+    uint64_t keys[MAX_FILTERS][64]; size_t nk[MAX_FILTERS]; size_t total = 0;
+    for (size_t i = 0; i < s->filters_count && i < MAX_FILTERS; i++) {
+        nk[i] = filter_keys(&s->filters[i], keys[i], 64);
+        total += nk[i] ? nk[i] : 1;
+    }
+    s->entries = (sub_entry_t *) calloc(total ? total : 1, sizeof(sub_entry_t));
+    if (!s->entries) return;
+    size_t e = 0;
+    for (size_t i = 0; i < s->filters_count && i < MAX_FILTERS; i++) {
+        if (!nk[i]) { s->entries[e].sub = s; s->entries[e].filter = &s->filters[i]; entry_link(&ix->wild, &s->entries[e]); e++; continue; }
+        for (size_t k = 0; k < nk[i]; k++) {
+            s->entries[e].sub = s; s->entries[e].filter = &s->filters[i];
+            entry_link(&ix->buckets[keys[i][k] & (IDX_BUCKETS - 1)], &s->entries[e]);
+            e++;
+        }
+    }
+    s->entries_count = e;
+    ix->n_subs++;
+}
+
+static void index_del(int shard, subscription_t *s) {
+    for (size_t i = 0; i < s->entries_count; i++) entry_unlink(&s->entries[i]);
+    free(s->entries); s->entries = NULL; s->entries_count = 0;
+    if (shard_idx[shard] && shard_idx[shard]->n_subs) shard_idx[shard]->n_subs--;
+}
+
+/* ------------------------------------------------------- event tags ---- */
+void relay_tags_parse(const event_t *ev, relay_tags_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!ev->tags_json || !ev->tags_json[0]) return;
+    jstr_t tags = jl_str(ev->tags_json), k, tag;
+    size_t o = 0, cap = 0;
+    while ((o = jl_next(tags, o, &k, &tag)) != 0) cap++;
+    if (!cap) return;
+    out->p = (relay_tagpair_t *) malloc(cap * sizeof(relay_tagpair_t));
+    out->store = (char *) malloc(strlen(ev->tags_json) + 2 * cap + 1);
+    if (!out->p || !out->store) { free(out->p); free(out->store); out->p = NULL; out->store = NULL; return; }
+    size_t so = 0; o = 0;
+    while ((o = jl_next(tags, o, &k, &tag)) != 0) {
+        jstr_t kk, n, v; size_t to = 0;
+        if ((to = jl_next(tag, 0, &kk, &n)) == 0) continue;
+        if (jl_next(tag, to, &kk, &v) == 0) { v.buf = NULL; v.len = 0; }
+        if (!n.buf || n.buf[0] != '"') continue;
+        size_t nl = jl_unescape(n, out->store + so);
+        if (nl == (size_t) -1) continue;
+        relay_tagpair_t *tp = &out->p[out->n];
+        tp->name = out->store + so; tp->nlen = nl; so += nl; out->store[so++] = '\0';
+        tp->val = NULL; tp->vlen = 0;
+        if (v.buf && v.buf[0] == '"') {
+            size_t vl = jl_unescape(v, out->store + so);
+            if (vl != (size_t) -1) { tp->val = out->store + so; tp->vlen = vl; so += vl; out->store[so++] = '\0'; }
+        }
+        out->n++;
+    }
+}
+void relay_tags_free(relay_tags_t *t) { free(t->p); free(t->store); memset(t, 0, sizeof(*t)); }
+
+static bool tags_have(const relay_tags_t *t, const char *name, const char *value) {
+    size_t nl = strlen(name), vl = strlen(value);
+    for (size_t i = 0; i < t->n; i++)
+        if (t->p[i].nlen == nl && t->p[i].val && t->p[i].vlen == vl &&
+            memcmp(t->p[i].name, name, nl) == 0 && memcmp(t->p[i].val, value, vl) == 0) return true;
+    return false;
+}
+
+
 static void subscription_free(subscription_t *s) {
     for (size_t i = 0; i < s->filters_count; i++) filter_release(&s->filters[i]);
-    free(s->filters); free(s->id); free(s);
+    free(s->filters); free(s->id); free(s->id_json); free(s->entries); free(s);
 }
 
 static void shard_unlink(int shard, subscription_t *s) {
+    index_del(shard, s);
     if (s->shard_prev) s->shard_prev->shard_next = s->shard_next;
     else shard_subs[shard] = s->shard_next;
     if (s->shard_next) s->shard_next->shard_prev = s->shard_prev;
@@ -110,7 +261,7 @@ static void remove_subscriptions(relay_conn_t *connection, const char *id) {
     }
 }
 
-static bool matches_filter(const filter_t *filter, const event_t *event) {
+static bool matches_filter(const filter_t *filter, const event_t *event, const relay_tags_t *tags) {
     if (filter->since && event->created_at < filter->since) return false;
     if (filter->until && event->created_at > filter->until) return false;
     if (filter->kinds_count) {
@@ -132,7 +283,8 @@ static bool matches_filter(const filter_t *filter, const event_t *event) {
         bool matched = false;
         tag_t *tag = &filter->tags[i];
         for (size_t j = 1; j < tag->count && !matched; j++) {
-            if (nip_event_has_tag(event, tag->elements[0], tag->elements[j])) matched = true;
+            if (tags ? tags_have(tags, tag->elements[0], tag->elements[j])
+                     : nip_event_has_tag(event, tag->elements[0], tag->elements[j])) matched = true;
         }
         if (!matched) return false;
     }
@@ -159,71 +311,67 @@ static bool plugins_can_deliver(const event_t *event, relay_conn_t *connection) 
     return true;
 }
 
-/* Match one event against every subscription of `shard`. Must run on the
- * shard's owner thread. The serialized event body is built once and reused
- * for every matching subscription. */
-void relay_core_broadcast_shard(int shard, const event_t *event) {
-    static __thread json_builder_t body, idb;  /* 64 KiB each: keep off the stack */
-    const char *body_json = NULL;
-    size_t body_len = 0;
-    char *out = NULL;
-    size_t out_cap = 0;
-    for (subscription_t *s = shard_subs[shard]; s; s = s->shard_next) {
-        bool matched = false;
-        for (size_t i = 0; i < s->filters_count && !matched; i++) if (matches_filter(&s->filters[i], event)) matched = true;
-        if (!matched || !plugins_can_deliver(event, s->connection)) continue;
-        if (!body_json) {
-            /* Serialize the event once: "[{...}]" -> strip the brackets. */
-            json_builder_start(&body);
-            json_serialize_event(event, &body);
-            body_json = json_builder_finish(&body);
-            body_len = strlen(body_json);
-            if (body_len < 2) return;
-            body_json++; body_len -= 2;
-        }
-        json_builder_start(&idb);
-        json_builder_append_string(&idb, s->id);
-        const char *idj = json_builder_finish(&idb);   /* ["<escaped id>"] */
-        size_t idl = strlen(idj) - 2;
-        size_t need = 9 + idl + 1 + body_len + 2;
-        if (need > out_cap) {
-            char *n = (char *) realloc(out, need);
-            if (!n) break;
-            out = n; out_cap = need;
-        }
-        size_t o = 0;
-        memcpy(out + o, "[\"EVENT\",", 9); o += 9;
-        memcpy(out + o, idj + 1, idl); o += idl;
-        out[o++] = ',';
-        memcpy(out + o, body_json, body_len); o += body_len;
-        out[o++] = ']';
-        out[o] = '\0';
-        relay_conn_send(s->connection, out, o);
-    }
-    free(out);
+relay_bcast_t *relay_bcast_new(event_t *ev) {
+    relay_bcast_t *b = (relay_bcast_t *) calloc(1, sizeof(*b));
+    if (!b) return NULL;
+    b->ev = *ev;                       /* ownership of tags/content moves */
+    static __thread json_builder_t body;
+    json_builder_start(&body);
+    json_serialize_event(&b->ev, &body);
+    const char *j = json_builder_finish(&body);   /* "[{...}]" */
+    size_t jl = strlen(j);
+    b->body = jl >= 2 ? relay_body_new(j + 1, jl - 2) : NULL;
+    relay_tags_parse(&b->ev, &b->tags);
+    if (!b->body) { relay_bcast_free(b); return NULL; }
+    return b;
 }
 
-static void query_sender(const char *json) {
-    json_value_t values[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
-    size_t count;
-    event_t event;
-    bool matched = false;
+void relay_bcast_free(relay_bcast_t *b) {
+    if (!b) return;
+    relay_body_release(b->body);
+    relay_tags_free(&b->tags);
+    event_release(&b->ev);
+    free(b);
+}
 
-    if (!query_connection) return;
-    count = json_array_parse(json, values, MAX_JSON_ARRAY_ELEMENTS);
-    if (count == 3 && values[0].type == JSON_TYPE_STRING &&
-        strcmp(values[0].value.string_val, "EVENT") == 0 &&
-        values[2].type == JSON_TYPE_OBJECT &&
-        json_parse_event(values[2].value.string_val, &event)) {
-        for (size_t i = 0; i < query_filters_count && !matched; i++) {
-            if (matches_filter(&query_filters[i], &event)) matched = true;
-        }
-        if (matched && plugins_can_deliver(&event, query_connection)) {
-            nip_plugin_send_json(query_connection, json);
-        }
-        event_release(&event);
+static void probe(shard_index_t *ix, sub_entry_t *e, const relay_bcast_t *b) {
+    for (; e; e = e->next) {
+        subscription_t *s = e->sub;
+        if (s->gen == ix->gen) continue;
+        if (!matches_filter(e->filter, &b->ev, &b->tags)) continue;
+        s->gen = ix->gen;                       /* at most once per subscription */
+        if (!plugins_can_deliver(&b->ev, s->connection)) continue;
+        relay_conn_send_event(s->connection, s->id_json, s->id_json_len, b->body);
     }
-    json_array_free(values, count);
+}
+
+/* Match one event against the subscriptions of `shard` (owner thread only). */
+void relay_core_broadcast_shard(int shard, const relay_bcast_t *b) {
+    shard_index_t *ix = shard_idx[shard];
+    if (!ix || !ix->n_subs) return;
+    ix->gen++;
+    const event_t *ev = &b->ev;
+    probe(ix, ix->buckets[key_hash('i', ev->id, strlen(ev->id)) & (IDX_BUCKETS - 1)], b);
+    probe(ix, ix->buckets[key_hash('a', ev->pubkey, strlen(ev->pubkey)) & (IDX_BUCKETS - 1)], b);
+    for (size_t i = 0; i < b->tags.n; i++) {
+        const relay_tagpair_t *t = &b->tags.p[i];
+        if (t->nlen != 1 || !t->val) continue;
+        probe(ix, ix->buckets[key_hash((char) (t->name[0] | 0x80), t->val, t->vlen) & (IDX_BUCKETS - 1)], b);
+    }
+    probe(ix, ix->buckets[kind_hash(ev->kind) & (IDX_BUCKETS - 1)], b);
+    probe(ix, ix->wild, b);
+}
+
+static void query_sender(const char *json, const event_t *event) {
+    if (!query_connection || !event) return;
+    relay_tags_t tags;
+    relay_tags_parse(event, &tags);
+    bool matched = false;
+    for (size_t i = 0; i < query_filters_count && !matched; i++)
+        if (matches_filter(&query_filters[i], event, &tags)) matched = true;
+    relay_tags_free(&tags);
+    if (matched && plugins_can_deliver(event, query_connection))
+        relay_conn_send(query_connection, json, strlen(json));
 }
 
 static void query_events(relay_conn_t *connection, const char *sub,
@@ -339,11 +487,24 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
         nip_plugin_send_status(connection, "CLOSED", sub, false, "error: server unavailable"); return;
     }
     s->connection = connection; s->filters = filters; s->filters_count = filter_count;
+    {
+        json_builder_t jb; json_builder_start(&jb); json_builder_append_string(&jb, sub);
+        const char *j = json_builder_finish(&jb);        /* ["<escaped>"] */
+        size_t jl = strlen(j);
+        s->id_json_len = jl - 2;
+        s->id_json = (char *) malloc(jl);
+        if (s->id_json) { memcpy(s->id_json, j + 1, jl - 2); s->id_json[jl - 2] = '\0'; }
+    }
+    if (!s->id_json) {
+        free(s->id); free(s); release_filters(filters, filter_count);
+        nip_plugin_send_status(connection, "CLOSED", sub, false, "error: server unavailable"); return;
+    }
     s->conn_next = cc->subs; cc->subs = s; cc->count++;
     int shard = connection->shard;
     s->shard_next = shard_subs[shard];
     if (s->shard_next) s->shard_next->shard_prev = s;
     shard_subs[shard] = s;
+    index_add(shard, s);
     query_events(connection, sub, filters, filter_count, false);
 }
 
@@ -391,7 +552,11 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
 
     result = relay_core_commit_event(connection, &event);
     relay_core_send_ok(connection, &event, &result);
-    if (result.accepted && result.should_broadcast) relay_core_broadcast_shard(0, &event);
+    if (result.accepted && result.should_broadcast) {
+        relay_bcast_t *b = relay_bcast_new(&event);       /* takes ownership */
+        if (b) { relay_core_broadcast_shard(0, b); relay_bcast_free(b); }
+        return;
+    }
     event_release(&event);
 }
 
@@ -490,6 +655,7 @@ void relay_core_shutdown(void) {
             shard_subs[i] = s->shard_next;
             subscription_free(s);
         }
+        free(shard_idx[i]); shard_idx[i] = NULL;
     }
 }
 

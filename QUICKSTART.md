@@ -50,7 +50,7 @@ $env:CREATED_AT_UPPER_LIMIT = "900"
 ## Validate A Change
 
 ```powershell
-gcc -std=c99 -Wall -Wextra -Wpedantic -I. -Isrc -Ithirdparty -Ithirdparty/mongoose -fsyntax-only src/main.c src/server.c src/storage.c src/json_util.c src/crypto.c src/nostrogotho.c
+gcc -std=c99 -Wall -Wextra -Wpedantic -I. -Isrc -Ithirdparty -fsyntax-only src/main.c src/server.c src/storage.c src/json_util.c src/crypto.c src/nostrogotho.c
 git diff --check
 ```
 
@@ -170,7 +170,7 @@ nostrogotho/
 ├── examples/
 │   └── example.c         # Detailed usage examples
 ├── nob.c                 # Build bootstrap
-├── src_build/nob_configed.c # Relay build definition
+├── src_build/nob_linux.c    # Relay build definition
 ├── nostr-policy.json     # WebSocket policy
 ├── API_REFERENCE.md      # Full API documentation
 ├── IMPLEMENTATION.md     # Architecture details
@@ -254,11 +254,9 @@ if (ev) {
 
 Set environment variables before running:
 ```bash
-# mongoose logging
-export LLL=65535  # All levels
-
-# Run server with logging
-./nostr_server --log-level 7
+# Build with sanitizers for debugging
+NG_SAN=address ./nob && ./build/main_address
+NG_SAN=thread  ./nob && ./build/main_thread
 ```
 
 ### Check Database

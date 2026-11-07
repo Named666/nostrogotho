@@ -4,7 +4,7 @@
 /* ============================================================================
  * json_lite - tiny, dependency-free JSON token scanner (MIT, in-tree).
  *
- * Replaces the handful of Mongoose JSON helpers the relay used, so the relay
+ * Small allocation-free JSON scanner used across the relay, so the relay
  * core no longer depends on GPL code. Semantics intentionally mirror the
  * previous helpers:
  *   - jl_next(obj, ofs, &key, &val): iterate an object or array. Start with
@@ -40,5 +40,9 @@ bool jl_get_num(jstr_t json, const char *path, double *v);
 
 /* Unescape a quoted JSON string token into a malloc'd C string. */
 char *jl_unquote(jstr_t tok);
+/* Decode quoted string token into out (>= tok.len bytes); (size_t)-1 = invalid. */
+size_t jl_unescape(jstr_t tok, char *out);
+/* Compare a quoted string token with s without allocating (common case). */
+bool jl_tok_eq(jstr_t tok, const char *s);
 
 #endif /* JSON_LITE_H_ */

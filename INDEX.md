@@ -66,7 +66,7 @@ nostrogotho/
 │
 ├── 📁 Third-party (thirdparty/)
 │   ├── sqlite3.c/h            ← SQLite3 source amalgamation
-│   ├── mongoose/              ← WebSocket library (bundled)
+│   ├── uSockets/              ← socket/event loop library (bundled)
 │   └── secp256k1/             ← Schnorr signature library
 │
 └── 📄 Additional Files
@@ -87,7 +87,7 @@ nostrogotho/
 | **nostrogotho.h/c** | Data structures | 229 | `event_alloc`, `filter_alloc`, memory management |
 | **crypto.h/c** | Cryptography | 358 | `sha256`, `signature_verify`, `check_event` |
 | **storage.h/c** | Database | 476 | `insert_record`, `send_records`, SQLite ops |
-| **server.c** | WebSocket + NIP plugins | 295+ | mongoose event handler, event loop, plugin hooks |
+| **server.c** | WebSocket + NIP plugins | 295+ | ngws transport (backend_ngws.c), plugin hooks |
 | **NIP Plugins** | Protocol-specific logic | varies | nip01, nip09, nip11, nip13, nip17, nip26, nip40, nip42, nip45, nip62, nip67 |
 
 ### Total: ~1,400+ lines of C99 code
@@ -178,7 +178,7 @@ gcc -std=c99 -Wall -Wextra -Wpedantic nob.c -o nob.exe
 | **nostrogotho.h/c** | Data structures | 229 | `event_alloc`, `filter_alloc`, memory management |
 | **crypto.h/c** | Cryptography | 358 | `sha256`, `signature_verify`, `check_event` |
 | **storage.h/c** | Database | 476 | `insert_record`, `send_records`, SQLite ops |
-| **server.c** | WebSocket | 295 | mongoose event handler, event loop |
+| **server.c** | WebSocket | 295 | ngws transport (backend_ngws.c) |
 
 ### Total: 1,400+ lines of C99 code
 
@@ -259,7 +259,7 @@ PROJECT_SUMMARY.md
 ✅ **C99 Compliant** - Pure C implementation, no C++ dependencies
 ✅ **Cryptography** - Schnorr signatures, SHA256, delegation verification
 ✅ **Database** - SQLite3 with proper indexing and optimization
-✅ **Server** - Mongoose server
+✅ **Server** - ngws (in-tree, uSockets-based) server
 ✅ **Well-Documented** - Comprehensive API and examples
 ✅ **Production-Ready** - Error handling, memory management, SQL injection protection
 
@@ -334,7 +334,7 @@ perf report
 - [SQLite3 Documentation](https://sqlite.org/docs.html)
 - [OpenSSL EVP](https://www.openssl.org/docs/man1.1.1/man3/EVP_DigestInit.html)
 - [secp256k1](https://github.com/bitcoin-core/secp256k1)
-- [mongoose](https://mongoose.ws/)
+- [uSockets](https://github.com/uNetworking/uSockets)
 
 ### Internal References
 - See API_REFERENCE.md for function signatures

@@ -381,8 +381,8 @@ void json_builder_append_number(json_builder_t *builder, long long value) {
  *
  * '/' is deliberately NOT escaped: it requires no escaping per RFC 8259,
  * the canonical NIP-01 serialization (JSON.stringify) leaves it literal,
- * and emitting "\/" breaks delivery because the bundled Mongoose
- * jl_get_str() returns NULL for strings containing that escape.
+ * and emitting "\/" breaks delivery because older jl_get_str()
+ * versions returned NULL for strings containing that escape.
  *
  * This is the single source of truth for string escaping so that every
  * serialized field (including event `content`) is emitted correctly
@@ -719,7 +719,7 @@ static bool validate_event_tags(jstr_t tags) {
         /* Per-tag element cap must match parse_tags_json() in crypto.c: its
          * scanner aborts (returning NULL) beyond MAX_TAG_ELEMENTS elements,
          * which used to silently skip delegation-tag verification while the
-         * mongoose-based tag lookups still honored the tag. Keep both
+         * json_lite-based tag lookups still honored the tag. Keep both
          * parsers in lockstep so anything accepted here is fully scanned. */
         while ((element_offset = jl_next(tag, element_offset, &element_key, &element)) != 0) {
             char *string;

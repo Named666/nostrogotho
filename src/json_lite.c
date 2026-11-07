@@ -225,3 +225,69 @@ bool jl_get_num(jstr_t json, const char *path, double *v) {
     if (v) *v = d;
     return true;
 }
+
+/* Decode a quoted JSON string token into out (needs tok.len bytes). Returns
+ * decoded length, or (size_t)-1 if tok is not a valid string token. */
+size_t jl_unescape(jstr_t tok, char *out) {
+    if (!tok.buf || tok.len < 2 || tok.buf[0] != '"' || tok.buf[tok.len - 1] != '"') return (size_t) -1;
+    const char *s = tok.buf + 1, *e = tok.buf + tok.len - 1;
+    size_t o = 0;
+    while (s < e) {
+        char c = *s++;
+        if (c != '\\') { out[o++] = c; continue; }
+        if (s >= e) return (size_t) -1;
+        c = *s++;
+        switch (c) {
+        case '"': out[o++] = '"'; break;   case '\\': out[o++] = '\\'; break;
+        case '/': out[o++] = '/'; break;   case 'b': out[o++] = '\b'; break;
+        case 'f': out[o++] = '\f'; break;  case 'n': out[o++] = '\n'; break;
+        case 'r': out[o++] = '\r'; break;  case 't': out[o++] = '\t'; break;
+        case 'u': {
+            unsigned cp = 0;
+            if (e - s < 4) return (size_t) -1;
+            for (int i = 0; i < 4; i++) {
+                char h = *s++; cp <<= 4;
+                if (h >= '0' && h <= '9') cp |= (unsigned) (h - '0');
+                else if (h >= 'a' && h <= 'f') cp |= (unsigned) (h - 'a' + 10);
+                else if (h >= 'A' && h <= 'F') cp |= (unsigned) (h - 'A' + 10);
+                else return (size_t) -1;
+            }
+            if (cp >= 0xD800 && cp <= 0xDBFF && e - s >= 6 && s[0] == '\\' && s[1] == 'u') {
+                unsigned lo = 0; const char *q = s + 2; int ok = 1;
+                for (int i = 0; i < 4; i++) {
+                    char h = *q++; lo <<= 4;
+                    if (h >= '0' && h <= '9') lo |= (unsigned) (h - '0');
+                    else if (h >= 'a' && h <= 'f') lo |= (unsigned) (h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') lo |= (unsigned) (h - 'A' + 10);
+                    else ok = 0;
+                }
+                if (ok && lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); s = q; }
+            }
+            /* UTF-8 encode (at most 4 bytes; a \uXXXX escape is 6 input bytes) */
+            if (cp < 0x80) out[o++] = (char) cp;
+            else if (cp < 0x800) { out[o++] = (char) (0xC0 | (cp >> 6)); out[o++] = (char) (0x80 | (cp & 0x3F)); }
+            else if (cp < 0x10000) { out[o++] = (char) (0xE0 | (cp >> 12)); out[o++] = (char) (0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char) (0x80 | (cp & 0x3F)); }
+            else { out[o++] = (char) (0xF0 | (cp >> 18)); out[o++] = (char) (0x80 | ((cp >> 12) & 0x3F)); out[o++] = (char) (0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char) (0x80 | (cp & 0x3F)); }
+            break;
+        }
+        default: return (size_t) -1;
+        }
+    }
+    return o;
+}
+
+/* Does the quoted string token equal the C string s? No allocation for
+ * tokens without escapes (the common case) or shorter than 1 KiB. */
+bool jl_tok_eq(jstr_t tok, const char *s) {
+    if (!tok.buf || tok.len < 2 || tok.buf[0] != '"') return false;
+    size_t sl = strlen(s);
+    if (!memchr(tok.buf, '\\', tok.len))
+        return tok.len - 2 == sl && memcmp(tok.buf + 1, s, sl) == 0;
+    char stackbuf[1024];
+    char *b = tok.len <= sizeof(stackbuf) ? stackbuf : (char *) malloc(tok.len);
+    if (!b) return false;
+    size_t n = jl_unescape(tok, b);
+    bool eq = n != (size_t) -1 && n == sl && memcmp(b, s, sl) == 0;
+    if (b != stackbuf) free(b);
+    return eq;
+}

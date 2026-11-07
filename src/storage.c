@@ -1121,7 +1121,7 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 json_builder_append_string(&builder, "EVENT");
                 json_builder_append_string(&builder, sub);
                 json_serialize_event(&event, &builder);
-                sender(json_builder_finish(&builder));
+                sender(json_builder_finish(&builder), &event);
             }
             
             sqlite3_finalize(stmt);
@@ -1396,6 +1396,12 @@ static bool storage_exec_sqlite3(const char *sql) {
 }
 static bool storage_begin_sqlite3(void) { return storage_exec_sqlite3("BEGIN IMMEDIATE"); }
 static bool storage_commit_sqlite3(void) { return storage_exec_sqlite3("COMMIT"); }
+static bool storage_rollback_sqlite3(void) {
+    /* COMMIT failed (e.g. SQLITE_BUSY/IOERR/FULL): the transaction may still be
+     * open; roll it back so the writer starts the next batch cleanly. */
+    if (!db_conn || sqlite3_get_autocommit(db_conn)) return true;
+    return storage_exec_sqlite3("ROLLBACK");
+}
 
 void storage_context_init_sqlite3(storage_context_t *ctx) {
     if (!ctx) return;
@@ -1415,4 +1421,5 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->thread_close = storage_thread_close_sqlite3;
     ctx->begin_batch = storage_begin_sqlite3;
     ctx->commit_batch = storage_commit_sqlite3;
+    ctx->rollback_batch = storage_rollback_sqlite3;
 }

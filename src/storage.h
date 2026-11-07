@@ -28,9 +28,9 @@
  *                    Format: ["EVENT", subscription_id, event] or
  *                            ["COUNT", subscription_id, {count: N}]
  * 
- * Note: json_event is valid only for the duration of the callback
+ * Note: json_event and event are valid only for the duration of the callback
  */
-typedef void (*send_records_callback_t)(const char *json_event);
+typedef void (*send_records_callback_t)(const char *json_event, const event_t *event);
 
 /* ============================================================================
  * Storage Context Structure
@@ -202,6 +202,7 @@ typedef struct {
     void (*thread_close)(void);
     bool (*begin_batch)(void);
     bool (*commit_batch)(void);
+    bool (*rollback_batch)(void);   /* after a failed commit */
 } storage_context_t;
 
 /* ============================================================================

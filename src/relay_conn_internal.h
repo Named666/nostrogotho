@@ -9,12 +9,14 @@ typedef struct {
     void (*send)(relay_conn_t *conn, const char *json, size_t len);
     void (*close)(relay_conn_t *conn);
     void (*destroy)(relay_conn_t *conn);   /* last reference dropped */
+    /* optional: zero-copy event delivery; NULL = build string and send() */
+    void (*send_event)(relay_conn_t *conn, const char *sub_json, size_t sub_len, relay_body_t *body);
 } relay_backend_ops_t;
 
 struct relay_conn {
     uint64_t id;
     const relay_backend_ops_t *ops;
-    void *backend;            /* backend-specific (mg_connection*, us socket) */
+    void *backend;            /* backend-specific */
     int shard;                /* worker / loop index owning protocol state */
     atomic_int refs;          /* backend ref + in-flight jobs */
     atomic_bool closed;

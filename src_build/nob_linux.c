@@ -34,11 +34,28 @@ static bool append_nips(Cmd *cmd)
     return true;
 }
 
+/* Optimization profile: NG_OPT env (default "-O3 -march=native -flto");
+ * NG_SAN=address|thread builds a sanitizer variant (-O1 -g). */
+static void opt_flags(Cmd *cmd)
+{
+    const char *san = getenv("NG_SAN");
+    if (san && *san) {
+        nob_cmd_append(cmd, "-O1", "-g", "-fno-omit-frame-pointer", nob_temp_sprintf("-fsanitize=%s", san));
+        return;
+    }
+    const char *opt = getenv("NG_OPT");
+    if (!opt) opt = "-O3 -march=native -flto=auto";
+    char *dup = nob_temp_strdup(opt);
+    for (char *tok = strtok(dup, " "); tok; tok = strtok(NULL, " ")) nob_cmd_append(cmd, tok);
+}
+
 static void common_flags(Cmd *cmd, const char *std)
 {
     nob_cc(cmd);
     nob_cc_flags(cmd);
-    nob_cmd_append(cmd, "-O2", std, "-D_GNU_SOURCE", "-DSECP256K1_STATIC",
+    opt_flags(cmd);
+    nob_cmd_append(cmd, std, "-D_GNU_SOURCE", "-DSECP256K1_STATIC",
+                   "-DLIBUS_NO_SSL",
                    "-DENABLE_MODULE_ECDH=1", "-DENABLE_MODULE_EXTRAKEYS=1",
                    "-DENABLE_MODULE_SCHNORRSIG=1", "-DENABLE_MODULE_MUSIG=1",
                    "-DENABLE_MODULE_ELLSWIFT=1",
@@ -47,44 +64,51 @@ static void common_flags(Cmd *cmd, const char *std)
                    "-DCOMB_BLOCKS=43", "-DCOMB_TEETH=6",
                    "-I"BUILD_FOLDER, "-I.", "-I"SRC_FOLDER,
                    "-I"THIRD_PARTY_FOLDER,
+                   "-I"THIRD_PARTY_FOLDER"usockets/src",
                    "-I"THIRD_PARTY_FOLDER"secp256k1/include",
                    "-I"THIRD_PARTY_FOLDER"secp256k1",
                    "-I"THIRD_PARTY_FOLDER"secp256k1/src");
 }
 
+#define US THIRD_PARTY_FOLDER"usockets/src/"
+#define NGWS_SOURCES \
+    SRC_FOLDER"ngws/ngws.c", SRC_FOLDER"ws_proto.c", \
+    US"bsd.c", US"context.c", US"loop.c", US"socket.c", US"udp.c", US"eventing/epoll_kqueue.c"
+
 #define CORE_SOURCES \
     SRC_FOLDER"main.c", SRC_FOLDER"relay_core.c", SRC_FOLDER"relay_conn.c", \
+    SRC_FOLDER"backend_ngws.c", \
     SRC_FOLDER"json_lite.c", SRC_FOLDER"crypto.c", SRC_FOLDER"storage.c", \
     SRC_FOLDER"nostrogotho.c", SRC_FOLDER"json_util.c", THIRD_PARTY_FOLDER"sqlite3.c", \
     THIRD_PARTY_FOLDER"secp256k1/src/secp256k1.c", \
     THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult.c", \
     THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult_gen.c"
 
-#define US THIRD_PARTY_FOLDER"usockets/src/"
-
 int main(void)
 {
     Cmd cmd = {0};
+    const char *san = getenv("NG_SAN");
+    const char *suffix = san && *san ? nob_temp_sprintf("_%s", san) : "";
 
-    /* build/main: Mongoose backend (GPLv2/commercial), single thread. */
+    /* build/main: the relay (ngws on uSockets, pure C, no TLS). */
     common_flags(&cmd, "-std=gnu11");
-    nob_cmd_append(&cmd, "-I"THIRD_PARTY_FOLDER"mongoose");
-    nob_cc_output(&cmd, BUILD_FOLDER"main");
-    nob_cc_inputs(&cmd, CORE_SOURCES, SRC_FOLDER"backend_mongoose.c",
-                  THIRD_PARTY_FOLDER"mongoose/mongoose.c");
+    nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"main%s", suffix));
+    nob_cc_inputs(&cmd, CORE_SOURCES, NGWS_SOURCES);
     if (!append_nips(&cmd)) return 1;
     nob_cmd_append(&cmd, "-lpthread", "-lm", "-ldl");
     if (!cmd_run(&cmd)) return 1;
 
-    /* build/main_us: uSockets backend (Apache-2.0), no TLS, no mongoose. */
+    /* tools: ngws benchmark server and the ngload load generator */
     common_flags(&cmd, "-std=gnu11");
-    nob_cmd_append(&cmd, "-DLIBUS_NO_SSL", "-I"US);
-    nob_cc_output(&cmd, BUILD_FOLDER"main_us");
-    nob_cc_inputs(&cmd, CORE_SOURCES, SRC_FOLDER"backend_usockets.c", SRC_FOLDER"ws_proto.c",
-                  US"bsd.c", US"context.c", US"loop.c", US"socket.c", US"udp.c",
-                  US"eventing/epoll_kqueue.c");
-    if (!append_nips(&cmd)) return 1;
-    nob_cmd_append(&cmd, "-lpthread", "-lm", "-ldl");
+    nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"ngws_bench_server%s", suffix));
+    nob_cc_inputs(&cmd, "tools/ngws_bench_server.c", NGWS_SOURCES);
+    nob_cmd_append(&cmd, "-lpthread");
+    if (!cmd_run(&cmd)) return 1;
+
+    common_flags(&cmd, "-std=gnu11");
+    nob_cc_output(&cmd, BUILD_FOLDER"ngload");
+    nob_cc_inputs(&cmd, "tools/ngload.c");
+    nob_cmd_append(&cmd, "-lpthread", "-lm");
     if (!cmd_run(&cmd)) return 1;
     return 0;
 }
