@@ -9,3 +9,9 @@ Pinned to the exact commits the previous (dangling, no .gitmodules) gitlinks poi
 | sqlite3.c/.h | (already vendored) | unchanged | 3.8.7.1 | |
 
 thirdparty/nips is still a gitlink to the NIPs spec fork (not needed to build).
+
+## uSockets
+- Upstream: https://github.com/uNetworking/uSockets
+- Commit: 166a04810c9fa970fc22096a7b35b792378364fb
+- License: Apache-2.0 (thirdparty/usockets/LICENSE)
+- Vendored: src/ only; removed sni_tree.cpp and asio.cpp (C++/TLS-only). Built with -DLIBUS_NO_SSL (epoll backend); TLS terminated by nginx.

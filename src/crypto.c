@@ -615,6 +615,42 @@ static tags_array_t *parse_tags_json(const char *json_str) {
 }
 
 
+
+/* canonical_tags_json - re-serialize tags in NIP-01 canonical form (no
+ * whitespace, minimal escaping) so the id is computed over the canonical
+ * serialization rather than the client's raw bytes. Returns malloc'd string
+ * or NULL. */
+static char *canonical_tags_json(const char *raw) {
+    tags_array_t *tags = parse_tags_json(raw);
+    if (!tags) return NULL;
+    size_t cap = 3, len = 0;
+    for (size_t i = 0; i < tags->count; i++)
+        for (size_t j = 0; j < tags->tags[i].count; j++)
+            cap += strlen(tags->tags[i].elements[j]) * 6 + 4;
+    cap += tags->count * 3;
+    char *out = (char *)malloc(cap);
+    if (!out) { tags_array_free(tags); return NULL; }
+    out[len++] = '[';
+    for (size_t i = 0; i < tags->count; i++) {
+        if (i) out[len++] = ',';
+        out[len++] = '[';
+        for (size_t j = 0; j < tags->tags[i].count; j++) {
+            if (j) out[len++] = ',';
+            out[len++] = '"';
+            if (!json_escape_string(tags->tags[i].elements[j], out + len, cap - len)) {
+                free(out); tags_array_free(tags); return NULL;
+            }
+            len += strlen(out + len);
+            out[len++] = '"';
+        }
+        out[len++] = ']';
+    }
+    out[len++] = ']';
+    out[len] = '\0';
+    tags_array_free(tags);
+    return out;
+}
+
 /* ============================================================================
  * Event Validation (NIP-01)
  * ============================================================================ */
@@ -675,12 +711,15 @@ bool check_event(const event_t *ev) {
     }
     
     /* Size the serialization buffer: fixed overhead + tags + escaped content */
-    const char *tags_json = ev->tags_json ? ev->tags_json : "[]";
+    char *canon_tags = ev->tags_json ? canonical_tags_json(ev->tags_json) : NULL;
+    if (ev->tags_json && !canon_tags) { free(escaped_content); return false; }
+    const char *tags_json = canon_tags ? canon_tags : "[]";
     size_t tags_len = strlen(tags_json);
     size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
     char *buffer = (char *)malloc(buffer_cap);
     if (!buffer) {
         free(escaped_content);
+        free(canon_tags);
         return false;
     }
     
@@ -691,6 +730,7 @@ bool check_event(const event_t *ev) {
                           escaped_content);
     free(escaped_content);
     escaped_content = NULL;
+    free(canon_tags);
     
     if (written < 0 || (size_t)written >= buffer_cap) {
         free(buffer);
