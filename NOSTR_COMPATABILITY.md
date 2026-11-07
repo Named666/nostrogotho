@@ -162,12 +162,7 @@
 
 ### What is implemented ✅
 
-- **`nip67_build_eose_response(_ex)(sub_id, has_more[, auth_hint])`** —
-  appends a third-element hint array to `EOSE`:
-  - `["EOSE", sub_id, ["more"]]` when more stored events exist,
-  - `["EOSE", sub_id, ["finish"]]` when complete,
-  - `["EOSE", sub_id, ["auth", ...]]` when unauthenticated results may be
-    auth-gated.
+- **`nip67_build_eose_response(_ex)`** — now emits plain NIP-01 `["EOSE", sub_id]`; the former non-standard hint array was removed.
 - **Integration** — `server.c` `query_events()` calls it after the initial
   query, with `has_more` computed by the storage layer (`send_records` fills
   it).

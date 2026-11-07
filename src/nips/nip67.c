@@ -23,12 +23,11 @@ char *nip67_build_eose_response_ex(const char *sub_id, bool has_more,
     json_builder_start(&builder);
     json_builder_append_string(&builder, "EOSE");
     json_builder_append_string(&builder, sub_id);
-    json_builder_start_array(&builder);
-    if (auth_hint) {
-        json_builder_append_string(&builder, "auth");
-    }
-    json_builder_append_string(&builder, has_more ? "more" : "finish");
-    json_builder_end_array(&builder);
+    /* NIP-01 defines EOSE as exactly ["EOSE",<sub_id>]. The former third
+     * element (completeness hints) is not in any merged NIP and broke strict
+     * clients, so it is no longer sent. Flags kept for API compatibility. */
+    (void) has_more;
+    (void) auth_hint;
 
     const char *result = json_builder_finish(&builder);
     if (!result) return NULL;

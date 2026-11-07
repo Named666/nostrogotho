@@ -272,10 +272,7 @@ static void query_events(struct mg_connection *connection, const char *sub,
             json_builder_t builder;
             json_builder_start(&builder);
             json_builder_append_string(&builder, "EOSE");
-            json_builder_append_string(&builder, sub);
-            json_builder_start_array(&builder);
-            json_builder_append_string(&builder, auth_hint ? "auth" : (has_more ? "more" : "finish"));
-            json_builder_end_array(&builder);
+            json_builder_append_string(&builder, sub);  /* NIP-01: ["EOSE",<sub_id>] */
             response = string_dup(json_builder_finish(&builder));
         }
     }

@@ -18,7 +18,7 @@
  * matching a subscription and may optionally indicate if more events exist
  * beyond the relay's query limit.
  * 
- * Format: ["EOSE", <subscription_id>, [<hint>]]
+ * Format (NIP-01): ["EOSE", <subscription_id>]  (hint array removed: non-standard)
  * 
  * Where hint can be:
  *   - "finish"  -> no more events available (all matched events sent)
@@ -34,11 +34,11 @@
  * 
  * Example:
  *   char *eose = nip67_build_eose_response("my-sub", false);
- *   // eose: ["EOSE","my-sub",["finish"]]
+ *   // eose: ["EOSE","my-sub"]
  *   free(eose);
  *   
  *   char *eose2 = nip67_build_eose_response("big-query", true);
- *   // eose2: ["EOSE","big-query",["more"]]
+ *   // eose2: ["EOSE","big-query"]
  *   free(eose2);
  * 
  * Relay behavior:
