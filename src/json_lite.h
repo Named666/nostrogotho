@@ -15,6 +15,11 @@
  *   - jl_get_tok / jl_get_str / jl_get_num: typed accessors. jl_get_str
  *     returns a malloc'd, unescaped UTF-8 string (handles \uXXXX and
  *     surrogate pairs) or NULL if the token is not a string.
+ *
+ * Contract: pure; no globals, thread-safe. jstr_t values borrow the
+ * caller's buffer (no NUL needed) and stay valid as long as it does. Only
+ * jl_get_str allocates (caller frees). Malformed input yields 0 / -1 /
+ * NULL, never reads past len.
  * ============================================================================ */
 
 #include <stdbool.h>

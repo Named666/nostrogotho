@@ -1130,11 +1130,12 @@ static bool send_records(send_records_callback_t sender, const char *sub,
         }
         
         /* Bind parameters */
-        for (size_t i = 0; i < param_count; i++) {
+        for (size_t i = 0; i < param_count; i++) {       /* param_count <= 256 */
+            int idx = (int) i + 1;
             if (params[i].type == PARAM_TYPE_NUMBER) {
-                sqlite3_bind_int(stmt, i + 1, params[i].value.number);
+                sqlite3_bind_int(stmt, idx, params[i].value.number);
             } else {
-                sqlite3_bind_text(stmt, i + 1, params[i].value.string, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, idx, params[i].value.string, -1, SQLITE_TRANSIENT);
             }
         }
         /* Bind copies the text (SQLITE_TRANSIENT), so owned patterns can be

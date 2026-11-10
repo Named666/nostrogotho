@@ -11,8 +11,20 @@
  * different backends (SQLite3, PostgreSQL, etc.). Events are stored
  * persistently and queried via filters.
  * 
- * All storage operations are synchronous and NOT thread-safe. A mutex
- * should be used at the application level if concurrent access is needed.
+ * Threading contract (SQLite backend):
+ *   - Connections are per thread (thread-local). A thread calls
+ *     thread_open(readonly) once before any other operation and
+ *     thread_close() before it exits. Calls on a thread without its own
+ *     connection fail (false / NULL / -1).
+ *   - Exactly ONE thread (the writer) opens read-write and is the only
+ *     caller of the write functions and begin/commit/rollback_batch.
+ *     Workers open read-only WAL connections for queries; the checkpointer
+ *     opens its own and only calls checkpoint().
+ *   - init/deinit and storage_set_sync_full run single-threaded at
+ *     startup/shutdown.
+ * Ownership: records handed to callbacks are borrowed for the duration of
+ * the callback; functions returning allocated objects say so below.
+ * Errors: bool false / NULL / negative int; details go to stderr.
  * ============================================================================ */
 
 /* ============================================================================

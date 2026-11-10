@@ -16,6 +16,12 @@
  *     are queued to the owning I/O loop.
  *   - The handle stays valid (refcounted) until the backend has delivered
  *     on_disconnect AND every in-flight job referencing it has finished.
+ *   - Slots: relay_conn_slot_alloc at startup only; get/set on the
+ *     connection's shard thread.
+ * Ownership: send copies json; send_event takes its own body reference
+ * when it queues the frame. Sends on a closed connection are dropped
+ * (normal: the client is gone). relay_body_new returns NULL on allocation
+ * failure; the caller then skips that delivery.
  * ============================================================================ */
 
 #include <stdbool.h>

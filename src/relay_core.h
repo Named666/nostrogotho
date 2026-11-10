@@ -15,6 +15,15 @@
  *   writer:  relay_core_commit_event() (kind dispatch, storage writes)
  *   then:    OK to the publisher, and relay_core_broadcast_shard() on every
  *            shard's owner thread.
+ *
+ * Threading: configure / set_* / plugin registration happen single-threaded
+ * before the backend starts; relay_core_shutdown after every thread
+ * stopped. on_open/on_message/on_close/broadcast_shard: the shard's owner
+ * thread only. commit_event / dedupe_settle / run_timers: the writer only.
+ * relay_core_send_ok, relay_bcast_* and relay_tags_*: any thread.
+ * Errors: protocol errors are answered to the client (NOTICE / CLOSED /
+ * OK false) and never returned; allocation failures are answered as
+ * "error: ..." the same way; nothing is dropped silently.
  * ============================================================================ */
 
 #include <stdbool.h>
@@ -76,7 +85,8 @@ void relay_core_send_ok(relay_conn_t *conn, const event_t *event,
  * once and shared read-only by every shard during a broadcast. */
 typedef struct { const char *name; size_t nlen; const char *val; size_t vlen; } relay_tagpair_t;
 typedef struct { relay_tagpair_t *p; size_t n; char *store; } relay_tags_t;
-void relay_tags_parse(const event_t *ev, relay_tags_t *out);
+/* false on allocation failure (out is then empty and needs no free). */
+bool relay_tags_parse(const event_t *ev, relay_tags_t *out);
 void relay_tags_free(relay_tags_t *t);
 
 /* A committed event prepared for fan-out: serialized once (body), tags
@@ -86,7 +96,8 @@ typedef struct relay_bcast {
     relay_body_t *body;
     relay_tags_t tags;
 } relay_bcast_t;
-relay_bcast_t *relay_bcast_new(event_t *ev);    /* takes ownership of ev's heap fields */
+/* Consumes ev's heap fields in every case; NULL on allocation failure. */
+relay_bcast_t *relay_bcast_new(event_t *ev);
 void relay_bcast_free(relay_bcast_t *b);
 void relay_core_broadcast_shard(int shard, const relay_bcast_t *b);
 

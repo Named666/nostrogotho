@@ -13,7 +13,14 @@
  * - Delegation verification (NIP-26)
  * - Proof of work validation (NIP-13)
  * 
- * Hashing uses Windows CNG; signatures use libsecp256k1.
+ * Hashing: in-tree SHA-256 (Windows: CNG); signatures: libsecp256k1.
+ *
+ * Threading: crypto_init / crypto_deinit single-threaded. Everything else
+ * is thread-safe (shared read-only secp256k1 context; per-thread caches
+ * such as the batch-verified set are released by crypto_thread_cleanup()).
+ * Ownership: output buffers are caller-provided unless a function says it
+ * returns a malloc'd string (caller frees).
+ * Errors: bool false / NULL; no partial outputs are guaranteed on failure.
  * ============================================================================ */
 
 /* ============================================================================

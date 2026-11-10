@@ -1,7 +1,10 @@
 #ifndef WS_PROTO_H_
 #define WS_PROTO_H_
 /* Minimal RFC 6455 helpers (in-tree, MIT): SHA-1, base64, accept key,
- * frame header encode and incremental frame parse. */
+ * frame header encode and incremental frame parse.
+ *
+ * Contract: pure functions, no allocation, no globals, thread-safe. Buffers
+ * are caller-owned with the sizes stated per function. */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>

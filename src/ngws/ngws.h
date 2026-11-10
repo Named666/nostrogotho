@@ -13,7 +13,16 @@
  *
  * Writes are corked: ngws_send() appends to the socket's output buffer and the
  * buffer is flushed with one write() at the end of the current loop iteration,
- * so many messages to the same socket in one iteration cost one syscall. */
+ * so many messages to the same socket in one iteration cost one syscall.
+ *
+ * Ownership: data passed to callbacks (message, request) is borrowed until
+ * the callback returns; ngws_send copies. Per-socket user data
+ * (cfg.user_size bytes, ngws_user) and per-loop user pointers belong to the
+ * application. Posted tasks are intrusive: the poster owns the memory until
+ * the task runs.
+ * Errors: ngws_server_create returns NULL; ngws_server_run false if listen
+ * failed; ngws_send reports NGWS_SEND_*; protocol violations close the
+ * socket with the RFC 6455 status code (1002/1007/1009). */
 #ifndef NGWS_H_
 #define NGWS_H_
 #include <stdbool.h>

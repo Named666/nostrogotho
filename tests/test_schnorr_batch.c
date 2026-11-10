@@ -21,7 +21,7 @@ static int fails, checks;
 static void make(secp256k1_context *ctx, int i, unsigned seed) {
     unsigned char sk[32], aux[32];
     for (;;) {
-        for (int k = 0; k < 32; k++) { sk[k] = (unsigned char) (seed * 2654435761u >> (k % 24)) ^ (unsigned char) (k * 131 + i); msg[i][k] = (unsigned char) (seed + k * 7 + i * 13); aux[k] = (unsigned char) (k ^ i); }
+        for (int k = 0; k < 32; k++) { sk[k] = (unsigned char) (seed * 2654435761u >> (k % 24)) ^ (unsigned char) ((unsigned) k * 131u + (unsigned) i); msg[i][k] = (unsigned char) (seed + (unsigned) k * 7u + (unsigned) i * 13u); aux[k] = (unsigned char) ((unsigned) k ^ (unsigned) i); }
         secp256k1_keypair kp; secp256k1_xonly_pubkey x;
         if (secp256k1_keypair_create(ctx, &kp, sk) && secp256k1_keypair_xonly_pub(ctx, &x, NULL, &kp) &&
             secp256k1_xonly_pubkey_serialize(ctx, pk[i], &x) && secp256k1_schnorrsig_sign32(ctx, sig[i], msg[i], &kp, aux)) break;
@@ -42,7 +42,7 @@ static bool via_api(int i) {   /* crypto.c signature_verify (hex), consults the 
     return ok;
 }
 
-static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (double) t.tv_sec + (double) t.tv_nsec / 1e9; }
 
 int main(void) {
     secp256k1_context *ctx = secp256k1_context_create(SECP256K1_CONTEXT_NONE);

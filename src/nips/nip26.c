@@ -48,9 +48,8 @@ bool nip26_check_delegation(const event_t *ev, const char *delegator_pubkey,
             }
             
             if (op_char) {
-                size_t key_len = (op_char == '=') ? (eq_pos - condition) :
-                                 (op_char == '<') ? (lt_pos - condition) :
-                                 (gt_pos - condition);
+                const char *op_pos = (op_char == '=') ? eq_pos : (op_char == '<') ? lt_pos : gt_pos;
+                size_t key_len = (size_t) (op_pos - condition);   /* op_pos found after condition */
                 
                 if (key_len == 4 && strncmp(condition, "kind", 4) == 0 && op_char == '=') {
                     has_kind_condition = true;

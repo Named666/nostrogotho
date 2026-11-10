@@ -327,11 +327,13 @@ static size_t json_escape_string(const char *src, char *dst, size_t dst_size) {
             default:
                 if ((unsigned char)c < 32) {
                     /* Control characters: output as \uXXXX */
-                    char buf[7];
-                    int len = snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)c);
-                    if (out_pos + len >= dst_size) return 0;
-                    memcpy(dst + out_pos, buf, len);
-                    out_pos += len;
+                    static const char hex[] = "0123456789abcdef";
+                    unsigned char uc = (unsigned char)c;
+                    if (out_pos + 6 >= dst_size) return 0;
+                    memcpy(dst + out_pos, "\\u00", 4);
+                    dst[out_pos + 4] = hex[uc >> 4];
+                    dst[out_pos + 5] = hex[uc & 0xf];
+                    out_pos += 6;
                     continue;
                 }
                 escape = NULL;

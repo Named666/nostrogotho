@@ -436,7 +436,7 @@ static double cpu_s(int pid) {
     sscanf(s + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st);
     return (double) (ut + st) / (double) sysconf(_SC_CLK_TCK);
 }
-static double self_cpu_s(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); return u.ru_utime.tv_sec + u.ru_stime.tv_sec + (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6; }
+static double self_cpu_s(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); return (double) (u.ru_utime.tv_sec + u.ru_stime.tv_sec) + (double) (u.ru_utime.tv_usec + u.ru_stime.tv_usec) / 1e6; }
 
 static void load_events(void) {
     FILE *f = fopen(evfile, "r");
@@ -512,7 +512,7 @@ int main(int argc, char **argv) {
         if (o != last) { last = o; stall = now_ns(); }
         if (now_ns() - stall > 15000000000ull) { fprintf(stderr, "connect stalled at %d/%d\n", o, nconns); break; }
     }
-    double connect_s = (now_ns() - t0) / 1e9;
+    double connect_s = (double) (now_ns() - t0) / 1e9;
     if (mode == M_NFAN) usleep(500000 + (useconds_t) nconns * 20);   /* let REQs register */
     long rss1 = server_pid ? rss_kb(server_pid) : -1;
     if (!quiet) fprintf(stderr, "connected %d (failed %d) in %.2fs\n", ng_atomic_load(&total_open), ng_atomic_load(&total_failed), connect_s);
@@ -534,7 +534,7 @@ int main(int argc, char **argv) {
         if (mode == M_NFAN && ng_atomic_load(&ev_next) >= nevents) { usleep(300000); break; }
     }
     ng_atomic_store(&measuring, false);
-    double secs = (now_ns() - w0) / 1e9;
+    double secs = (double) (now_ns() - w0) / 1e9;
     double sc1 = server_pid ? cpu_s(server_pid) : 0, cc1 = self_cpu_s();
     long rss2 = server_pid ? rss_kb(server_pid) : -1;
     ng_atomic_store(&phase, 2);
@@ -553,13 +553,14 @@ int main(int argc, char **argv) {
     printf(" connected=%d dropped=%d", connected, connected - ng_atomic_load(&total_open));
     for (int i = 1; i < 256; i++) { unsigned n = ng_atomic_load(&connect_errno[i]); if (n) printf(" errno_%d=%u", i, n); }
     if (mode != M_HOLD)
-        printf(" secs=%.2f msgs=%llu msgs_s=%.0f MB_s=%.1f", secs, (unsigned long long) msgs, msgs / secs, bytes / secs / 1e6);
+        printf(" secs=%.2f msgs=%llu msgs_s=%.0f MB_s=%.1f", secs, (unsigned long long) msgs, (double) msgs / secs, (double) bytes / secs / 1e6);
     if (mode == M_NPUB || mode == M_NFAN) printf(" ok=%llu rejected=%llu", (unsigned long long) oks, (unsigned long long) fails);
-    if (h->n) printf(" lat_us_p50=%.0f p99=%.0f p999=%.0f max=%.0f", hq(h, .5) / 1e3, hq(h, .99) / 1e3, hq(h, .999) / 1e3, h->max / 1e3);
+    if (h->n) printf(" lat_us_p50=%.0f p99=%.0f p999=%.0f max=%.0f", hq(h, .5) / 1e3, hq(h, .99) / 1e3, hq(h, .999) / 1e3, (double) h->max / 1e3);
     if (server_pid) {
         printf(" srv_rss_base_mb=%.1f srv_rss_conn_mb=%.1f bytes_per_conn=%.0f srv_rss_end_mb=%.1f srv_cpu_pct=%.0f",
-               rss0 / 1024.0, rss1 / 1024.0, (rss1 - rss0) * 1024.0 / (ng_atomic_load(&total_open) ? ng_atomic_load(&total_open) : 1),
-               rss2 / 1024.0, (sc1 - sc0) / secs * 100);
+               (double) rss0 / 1024.0, (double) rss1 / 1024.0,
+               (double) (rss1 - rss0) * 1024.0 / (double) (ng_atomic_load(&total_open) ? ng_atomic_load(&total_open) : 1),
+               (double) rss2 / 1024.0, (sc1 - sc0) / secs * 100);
     }
     printf(" client_cpu_pct=%.0f\n", (cc1 - cc0) / secs * 100);
     fflush(stdout);

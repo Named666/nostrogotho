@@ -4,7 +4,7 @@
 #include "storage.h"
 
 /* Test escape_like with normal input */
-void test_escape_like_normal() {
+static void test_escape_like_normal(void) {
     char *result = escape_like("hello world", 11);
     if (result && strcmp(result, "hello world") == 0) {
         printf("PASS: escape_like normal input\n");
@@ -15,7 +15,7 @@ void test_escape_like_normal() {
 }
 
 /* Test escape_like with special characters */
-void test_escape_like_special() {
+static void test_escape_like_special(void) {
     char *result = escape_like("100%+50%", 8);
     if (result && strcmp(result, "100\\%+50\\%") == 0) {
         printf("PASS: escape_like special chars\n");
@@ -26,7 +26,7 @@ void test_escape_like_special() {
 }
 
 /* Test escape_like with NULL */
-void test_escape_like_null() {
+static void test_escape_like_null(void) {
     char *result = escape_like(NULL, 0);
     if (result == NULL) {
         printf("PASS: escape_like NULL input\n");
@@ -37,7 +37,7 @@ void test_escape_like_null() {
 }
 
 /* Test escape_like with large input (should be capped) */
-void test_escape_like_large() {
+static void test_escape_like_large(void) {
     char *result = escape_like("test", 2000000);  /* > 1MB */
     if (result == NULL) {
         printf("PASS: escape_like large input capped\n");
@@ -48,13 +48,13 @@ void test_escape_like_large() {
 }
 
 /* Test get_event_by_id memory management */
-void test_get_event_by_id_memory() {
+static void test_get_event_by_id_memory(void) {
     /* This requires a running database, so just test the function signature */
     printf("INFO: test_get_event_by_id_memory - requires database\n");
 }
 
 /* Test filter_free doesn't crash */
-void test_filter_free_no_double_free() {
+static void test_filter_free_no_double_free(void) {
     filter_t *f = filter_alloc();
     if (f) {
         f->ids_count = 1;

@@ -15,6 +15,15 @@
  *   - Proper escaping of strings in JSON context
  * 
  * Not a general-purpose JSON library; designed specifically for Nostr.
+ *
+ * Contract: no globals; every function is thread-safe on distinct objects.
+ * Ownership: parse results (json_value_t arrays, filters, events) own their
+ * heap strings; release them with the matching *_free function.
+ * Builder: fixed 64 KiB buffer, no allocation. Appends that do not fit are
+ * dropped (pos never passes the buffer) and json_builder_finish always
+ * returns a NUL-terminated string; callers that can exceed 64 KiB size the
+ * output first (json_serialized_event_size) and use their own buffer.
+ * Errors: parsers return false / 0 and leave outputs freeable.
  * ============================================================================ */
 
 /* Maximum number of elements in a top-level JSON array */

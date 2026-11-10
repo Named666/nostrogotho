@@ -18,6 +18,11 @@
  * - Event validation and cryptographic verification
  * - Event kind processing dispatch system
  * - Plugin-style handlers for different event kinds
+ *
+ * Threading: validation is pure and thread-safe; kind dispatch
+ * (nip01_process_event and the registered handlers) runs on the writer.
+ * Results are returned by value (nip01_process_result_t, response_msg is
+ * an inline buffer); nothing is allocated for the caller.
  * ============================================================================ */
 
 /* ============================================================================

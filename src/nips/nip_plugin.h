@@ -27,6 +27,18 @@
  *
  * Adding a NIP  = drop nipXX.c into src/nips/ (the build tool globs it).
  * Removing one  = delete the file; the relay degrades to plain NIP-01.
+ *
+ * Threading contract for hooks (the relay runs many workers + one writer):
+ *   registration, init           before any thread starts (single-threaded)
+ *   on_connect / on_disconnect / on_message / accept_publish / can_deliver /
+ *   eose_auth_hint / build_count the connection's shard (worker) thread;
+ *                                hooks for different shards run in parallel,
+ *                                so plugin globals need their own locking
+ *                                or per-connection slots (relay_conn_*_slot)
+ *   kind on_event handlers, timer the single writer thread (storage writes)
+ *   info_document                main thread, once, before serving
+ * Ownership: hook arguments are borrowed for the call; build_count returns
+ * a malloc'd string the core frees.
  * ============================================================================
  */
 

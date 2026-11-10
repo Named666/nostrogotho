@@ -207,18 +207,18 @@ static void index_del(int shard, subscription_t *s) {
 }
 
 /* ------------------------------------------------------- event tags ---- */
-void relay_tags_parse(const event_t *ev, relay_tags_t *out) {
+bool relay_tags_parse(const event_t *ev, relay_tags_t *out) {
     memset(out, 0, sizeof(*out));
-    if (!ev->tags_json || !ev->tags_json[0]) return;
+    if (!ev->tags_json || !ev->tags_json[0]) return true;
     jstr_t tags = jl_str(ev->tags_json), k, tag;
     size_t o = 0, cap = 0;
     while ((o = jl_next(tags, o, &k, &tag)) != 0) cap++;
-    if (!cap) return;
+    if (!cap) return true;
     size_t store_len;   /* unescaped names/values never exceed the JSON, + 2 NULs per tag */
-    if (!ng_size_flex(strlen(ev->tags_json) + 1, cap, 2, &store_len)) return;
+    if (!ng_size_flex(strlen(ev->tags_json) + 1, cap, 2, &store_len)) return false;
     out->p = (relay_tagpair_t *) ng_malloc_array(cap, sizeof(relay_tagpair_t));
     out->store = (char *) malloc(store_len);
-    if (!out->p || !out->store) { free(out->p); free(out->store); out->p = NULL; out->store = NULL; return; }
+    if (!out->p || !out->store) { free(out->p); free(out->store); out->p = NULL; out->store = NULL; return false; }
     size_t so = 0; o = 0;
     while ((o = jl_next(tags, o, &k, &tag)) != 0) {
         jstr_t kk, n, v; size_t to = 0;
@@ -236,6 +236,7 @@ void relay_tags_parse(const event_t *ev, relay_tags_t *out) {
         }
         out->n++;
     }
+    return true;
 }
 void relay_tags_free(relay_tags_t *t) { free(t->p); free(t->store); memset(t, 0, sizeof(*t)); }
 
@@ -328,7 +329,7 @@ static bool plugins_can_deliver(const event_t *event, relay_conn_t *connection) 
 
 relay_bcast_t *relay_bcast_new(event_t *ev) {
     relay_bcast_t *b = (relay_bcast_t *) calloc(1, sizeof(*b));
-    if (!b) return NULL;
+    if (!b) { event_release(ev); return NULL; }   /* ev is consumed either way */
     b->ev = *ev;                       /* ownership of tags/content moves */
     static NG_THREAD_LOCAL json_builder_t body;
     json_builder_start(&body);
@@ -336,8 +337,8 @@ relay_bcast_t *relay_bcast_new(event_t *ev) {
     const char *j = json_builder_finish(&body);   /* "[{...}]" */
     size_t jl = strlen(j);
     b->body = jl >= 2 ? relay_body_new(j + 1, jl - 2) : NULL;
-    relay_tags_parse(&b->ev, &b->tags);
-    if (!b->body) { relay_bcast_free(b); return NULL; }
+    bool tags_ok = relay_tags_parse(&b->ev, &b->tags);
+    if (!b->body || !tags_ok) { relay_bcast_free(b); return NULL; }   /* never fan out partial tags */
     return b;
 }
 
@@ -380,7 +381,7 @@ void relay_core_broadcast_shard(int shard, const relay_bcast_t *b) {
 static void query_sender(const char *json, const event_t *event) {
     if (!query_connection || !event) return;
     relay_tags_t tags;
-    relay_tags_parse(event, &tags);
+    if (!relay_tags_parse(event, &tags)) return;   /* OOM: tag filters cannot be evaluated; skip */
     bool matched = false;
     for (size_t i = 0; i < query_filters_count && !matched; i++)
         if (matches_filter(&query_filters[i], event, &tags)) matched = true;

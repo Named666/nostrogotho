@@ -409,7 +409,7 @@ static void json_builder_escape_string(json_builder_t *builder, const char *valu
         if (c == '"' || c == '\\') {
             if (!json_builder_ensure_space(builder, 2)) return;
             builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = c;
+            builder->buffer[builder->pos++] = (char) c;
         } else if (c == '\b') {
             if (!json_builder_ensure_space(builder, 2)) return;
             builder->buffer[builder->pos++] = '\\';
@@ -439,7 +439,7 @@ static void json_builder_escape_string(json_builder_t *builder, const char *valu
             builder->pos += 6;
         } else {
             if (!json_builder_ensure_space(builder, 1)) return;
-            builder->buffer[builder->pos++] = c;
+            builder->buffer[builder->pos++] = (char) c;
         }
     }
 }

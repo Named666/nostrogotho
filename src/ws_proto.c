@@ -36,10 +36,15 @@ void ws_sha1(const unsigned char *data, size_t len, unsigned char out[20]) {
     tail[rem] = 0x80;
     size_t tl = rem + 9 <= 64 ? 64 : 128;
     uint64_t bits = (uint64_t) len * 8;
-    for (int j = 0; j < 8; j++) tail[tl - 1 - j] = (unsigned char) (bits >> (8 * j));
+    for (size_t j = 0; j < 8; j++) tail[tl - 1 - j] = (unsigned char) (bits >> (8 * j));
     sha1_block(h, tail);
     if (tl == 128) sha1_block(h, tail + 64);
-    for (int j = 0; j < 5; j++) { out[4*j] = h[j] >> 24; out[4*j+1] = h[j] >> 16; out[4*j+2] = h[j] >> 8; out[4*j+3] = h[j]; }
+    for (size_t j = 0; j < 5; j++) {
+        out[4*j]     = (unsigned char) (h[j] >> 24);
+        out[4*j + 1] = (unsigned char) (h[j] >> 16);
+        out[4*j + 2] = (unsigned char) (h[j] >> 8);
+        out[4*j + 3] = (unsigned char) h[j];
+    }
 }
 
 size_t ws_base64(const unsigned char *in, size_t len, char *out) {
