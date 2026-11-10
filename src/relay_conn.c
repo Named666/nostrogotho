@@ -1,6 +1,7 @@
 #include "relay_conn_internal.h"
 
 #include <stdlib.h>
+#include "platform/ng_alloc.h"
 #include <string.h>
 
 static ng_atomic_int next_slot;
@@ -37,7 +38,9 @@ void relay_conn_unref(relay_conn_t *conn) {
 }
 
 relay_body_t *relay_body_new(const char *json, size_t len) {
-    relay_body_t *b = (relay_body_t *) malloc(sizeof(*b) + len + 1);
+    size_t sz;   /* header + json + NUL */
+    if (!ng_size_add3(sizeof(relay_body_t), len, 1, &sz)) return NULL;
+    relay_body_t *b = (relay_body_t *) malloc(sz);
     if (!b) return NULL;
     ng_atomic_init(&b->refs, 1);
     b->len = len;
@@ -55,8 +58,9 @@ void relay_body_release(relay_body_t *b) {
 void relay_conn_send_event(relay_conn_t *conn, const char *sub_json, size_t sub_len, relay_body_t *body) {
     if (!conn || ng_atomic_load(&conn->closed)) return;
     if (conn->ops->send_event) { conn->ops->send_event(conn, sub_json, sub_len, body); return; }
-    size_t n = 9 + sub_len + 1 + body->len + 1;
-    char *m = (char *) malloc(n + 1);
+    size_t n;   /* ["EVENT", + sub + , + body + ] */
+    if (!ng_size_add3(sub_len, body->len, 9 + 1 + 1, &n)) return;
+    char *m = (char *) ng_malloc_add(n, 1);
     if (!m) return;
     memcpy(m, "[\"EVENT\",", 9); memcpy(m + 9, sub_json, sub_len); m[9 + sub_len] = ',';
     memcpy(m + 10 + sub_len, body->json, body->len); m[n - 1] = ']'; m[n] = '\0';

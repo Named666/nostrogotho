@@ -13,6 +13,7 @@
 #include <secp256k1.h>
 #include <secp256k1_schnorrsig.h>
 #include "schnorr_batch.h"
+#include "platform/ng_alloc.h"
 
 #ifdef _WIN32
 #ifndef STATUS_SUCCESS
@@ -373,7 +374,7 @@ static size_t json_escape_string(const char *src, char *dst, size_t dst_size) {
 char *bytes_to_hex(const uint8_t *bytes, size_t len) {
     if (!bytes || len == 0) return NULL;
     
-    char *hex = (char *)malloc(len * 2 + 1);
+    char *hex = (char *) ng_malloc_flex(1, len, 2);
     if (!hex) return NULL;
     
     static const char digits[] = "0123456789abcdef";
@@ -642,7 +643,7 @@ static tags_array_t *parse_tags_json(const char *json_str) {
                     if (*p == '"') {
                         /* Unescape into output buffer; output is never longer
                          * than the raw span, so raw_len + 1 always suffices */
-                        char *element = (char *)malloc(raw_len + 1);
+                        char *element = (char *) ng_malloc_add(raw_len, 1);
                         if (element) {
                             size_t out_idx = 0;
                             size_t in_idx = 0;
@@ -703,12 +704,13 @@ static tags_array_t *parse_tags_json(const char *json_str) {
 static char *canonical_tags_json(const char *raw) {
     tags_array_t *tags = parse_tags_json(raw);
     if (!tags) return NULL;
-    size_t cap = 3, len = 0;
-    for (size_t i = 0; i < tags->count; i++)
-        for (size_t j = 0; j < tags->tags[i].count; j++)
-            cap += strlen(tags->tags[i].elements[j]) * 6 + 4;
-    cap += tags->count * 3;
-    char *out = (char *)malloc(cap);
+    size_t cap = 3, len = 0, add;     /* worst case: every byte escaped as \u00XX */
+    bool fits = true;
+    for (size_t i = 0; fits && i < tags->count; i++)
+        for (size_t j = 0; fits && j < tags->tags[i].count; j++)
+            fits = ng_size_flex(4, strlen(tags->tags[i].elements[j]), 6, &add) && ng_size_add(cap, add, &cap);
+    if (fits) fits = ng_size_flex(cap, tags->count, 3, &cap);
+    char *out = fits ? (char *) malloc(cap) : NULL;
     if (!out) { tags_array_free(tags); return NULL; }
     out[len++] = '[';
     for (size_t i = 0; i < tags->count; i++) {
@@ -780,8 +782,9 @@ bool check_event(const event_t *ev) {
     const char *content = ev->content ? ev->content : "";
     size_t content_len = strlen(content);
     
-    size_t escaped_content_cap = content_len * 6 + 1;
-    char *escaped_content = (char *)malloc(escaped_content_cap);
+    size_t escaped_content_cap;
+    if (!ng_size_flex(1, content_len, 6, &escaped_content_cap)) return false;
+    char *escaped_content = (char *) malloc(escaped_content_cap);
     if (!escaped_content) {
         return false;
     }
@@ -795,8 +798,8 @@ bool check_event(const event_t *ev) {
     if (ev->tags_json && !canon_tags) { free(escaped_content); return false; }
     const char *tags_json = canon_tags ? canon_tags : "[]";
     size_t tags_len = strlen(tags_json);
-    size_t buffer_cap = 128 + tags_len + strlen(escaped_content) + 1;
-    char *buffer = (char *)malloc(buffer_cap);
+    size_t buffer_cap;
+    char *buffer = ng_size_add3(128 + 1, tags_len, strlen(escaped_content), &buffer_cap) ? (char *) malloc(buffer_cap) : NULL;
     if (!buffer) {
         free(escaped_content);
         free(canon_tags);

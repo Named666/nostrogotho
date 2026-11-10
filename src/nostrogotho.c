@@ -1,4 +1,5 @@
 #include "nostrogotho.h"
+#include "platform/ng_alloc.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -173,7 +174,7 @@ tag_t *tag_alloc(size_t element_count) {
     tag_t *tag = (tag_t *)malloc(sizeof(tag_t));
     if (!tag) return NULL;
     
-    tag->elements = (char **)malloc(element_count * sizeof(char *));
+    tag->elements = (char **) ng_malloc_array(element_count, sizeof(char *));
     if (!tag->elements) {
         free(tag);
         return NULL;
@@ -233,7 +234,7 @@ tags_array_t *tags_array_alloc(size_t tag_count) {
     tags_array_t *tags = (tags_array_t *)malloc(sizeof(tags_array_t));
     if (!tags) return NULL;
     
-    tags->tags = (tag_t *)malloc(tag_count * sizeof(tag_t));
+    tags->tags = (tag_t *) ng_malloc_array(tag_count, sizeof(tag_t));
     if (!tags->tags) {
         free(tags);
         return NULL;
@@ -284,7 +285,7 @@ char *string_dup(const char *str) {
     if (!str) return NULL;
     
     size_t len = strlen(str);
-    char *dup = (char *)malloc(len + 1);
+    char *dup = (char *) ng_malloc_add(len, 1);
     if (!dup) return NULL;
     
     strcpy(dup, str);

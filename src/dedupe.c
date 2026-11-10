@@ -1,4 +1,5 @@
 #include "dedupe.h"
+#include "platform/ng_alloc.h"
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -57,8 +58,8 @@ void dedupe_init(size_t cap) {
         stripe_t *s = &stripes[k];
         pthread_mutex_init(&s->mu, NULL);
         s->slots = calloc(n, sizeof(slot_t)); s->mask = n - 1; s->used = 0;
-        s->ring = malloc(per * 32); s->ring_cap = per; s->ring_head = s->ring_len = 0;
-        if (!s->slots || !s->ring) { enabled = false; return; }
+        s->ring = ng_malloc_array(per, 32); s->ring_cap = per; s->ring_head = s->ring_len = 0;
+        if (!s->slots || !s->ring) { dedupe_free(); enabled = false; return; }   /* all or nothing */
     }
 }
 

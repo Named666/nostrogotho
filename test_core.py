@@ -75,6 +75,17 @@ async def main():
         m = await until(a, lambda m: m[0] == "COUNT")
         check("COUNT", m == ["COUNT", "c", {"count": 1}], str(m))
 
+        # control bytes survive storage and fan-out (JSON \u00XX escapes)
+        await b.send(json.dumps(["REQ", "ctl", {"kinds": [1], "#t": [tag + "c"]}])); await until(b, lambda m: m[0] == "EOSE")
+        ctl = mk(sk, 1, "ctl\x01\x1f\x7f end", [["t", tag + "c"]])
+        await a.send(json.dumps(["EVENT", ctl]))
+        ok = await until(a, lambda m: m[0] == "OK")
+        live = await until(b, lambda m: m[0] == "EVENT" and m[1] == "ctl")
+        check("control-byte content broadcast intact", ok[2] is True and live[2]["content"] == ctl["content"], repr(live[2]["content"]))
+        await a.send(json.dumps(["REQ", "ctlq", {"ids": [ctl["id"]]}]))
+        m = await until(a, lambda m: m[0] == "EVENT" and m[1] == "ctlq")
+        check("control-byte content stored intact", m[2]["content"] == ctl["content"] and m[2]["id"] == ctl["id"], repr(m[2]["content"]))
+
         # replaceable kind 0
         old = mk(sk, 0, '{"name":"old"}', created_at=int(time.time()) - 10)
         new = mk(sk, 0, '{"name":"new"}')

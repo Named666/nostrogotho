@@ -17,6 +17,7 @@
 #include "nips/nip01.h"
 #include "nips/nip_event.h"
 #include "nips/nip_plugin.h"
+#include "platform/ng_alloc.h"
 
 #define MAX_SUBSCRIPTIONS 20
 #define MAX_FILTERS 10
@@ -172,16 +173,18 @@ static size_t filter_keys(const filter_t *f, uint64_t *keys, size_t cap) {
     return 0;   /* wildcard */
 }
 
-static void index_add(int shard, subscription_t *s) {
+/* Index s under its filters' keys. false on OOM: s is then not indexed
+ * (entries == NULL) and the caller must not keep it. */
+static bool index_add(int shard, subscription_t *s) {
     shard_index_t *ix = index_of(shard);
-    if (!ix) return;
+    if (!ix) return false;
     uint64_t keys[MAX_FILTERS][64]; size_t nk[MAX_FILTERS]; size_t total = 0;
     for (size_t i = 0; i < s->filters_count && i < MAX_FILTERS; i++) {
         nk[i] = filter_keys(&s->filters[i], keys[i], 64);
         total += nk[i] ? nk[i] : 1;
     }
     s->entries = (sub_entry_t *) calloc(total ? total : 1, sizeof(sub_entry_t));
-    if (!s->entries) return;
+    if (!s->entries) return false;
     size_t e = 0;
     for (size_t i = 0; i < s->filters_count && i < MAX_FILTERS; i++) {
         if (!nk[i]) { s->entries[e].sub = s; s->entries[e].filter = &s->filters[i]; entry_link(&ix->wild, &s->entries[e]); e++; continue; }
@@ -193,9 +196,11 @@ static void index_add(int shard, subscription_t *s) {
     }
     s->entries_count = e;
     ix->n_subs++;
+    return true;
 }
 
 static void index_del(int shard, subscription_t *s) {
+    if (!s->entries) return;                 /* never indexed */
     for (size_t i = 0; i < s->entries_count; i++) entry_unlink(&s->entries[i]);
     free(s->entries); s->entries = NULL; s->entries_count = 0;
     if (shard_idx[shard] && shard_idx[shard]->n_subs) shard_idx[shard]->n_subs--;
@@ -209,8 +214,10 @@ void relay_tags_parse(const event_t *ev, relay_tags_t *out) {
     size_t o = 0, cap = 0;
     while ((o = jl_next(tags, o, &k, &tag)) != 0) cap++;
     if (!cap) return;
-    out->p = (relay_tagpair_t *) malloc(cap * sizeof(relay_tagpair_t));
-    out->store = (char *) malloc(strlen(ev->tags_json) + 2 * cap + 1);
+    size_t store_len;   /* unescaped names/values never exceed the JSON, + 2 NULs per tag */
+    if (!ng_size_flex(strlen(ev->tags_json) + 1, cap, 2, &store_len)) return;
+    out->p = (relay_tagpair_t *) ng_malloc_array(cap, sizeof(relay_tagpair_t));
+    out->store = (char *) malloc(store_len);
     if (!out->p || !out->store) { free(out->p); free(out->store); out->p = NULL; out->store = NULL; return; }
     size_t so = 0; o = 0;
     while ((o = jl_next(tags, o, &k, &tag)) != 0) {
@@ -512,12 +519,15 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
         free(s->id); free(s); release_filters(filters, filter_count);
         nip_plugin_send_status(connection, "CLOSED", sub, false, "error: server unavailable"); return;
     }
-    s->conn_next = cc->subs; cc->subs = s; cc->count++;
     int shard = connection->shard;
+    if (!index_add(shard, s)) {
+        subscription_free(s);                    /* owns filters now */
+        nip_plugin_send_status(connection, "CLOSED", sub, false, "error: server unavailable"); return;
+    }
+    s->conn_next = cc->subs; cc->subs = s; cc->count++;
     s->shard_next = shard_subs[shard];
     if (s->shard_next) s->shard_next->shard_prev = s;
     shard_subs[shard] = s;
-    index_add(shard, s);
     query_events(connection, sub, filters, filter_count, false);
 }
 
@@ -629,6 +639,11 @@ void relay_core_on_message(relay_conn_t *connection, char *payload, size_t len) 
 
 void relay_core_on_open(relay_conn_t *connection) {
     connection->core = calloc(1, sizeof(core_conn_t));
+    if (!connection->core) {             /* cannot serve it: say so and close */
+        nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: server unavailable");
+        relay_conn_close(connection);
+        return;
+    }
     log_message(connection, "client connected (websocket open)");
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
         if (plugin->on_connect) plugin->on_connect(connection, plugin->ctx);

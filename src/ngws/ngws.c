@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "libusockets.h"
+#include "../platform/ng_alloc.h"
 #include "../ws_proto.h"
 
 
@@ -147,7 +148,7 @@ static void *arena_alloc(ngws_loop_t *l, size_t n) {
     arena_chunk_t *nc = c ? c->next : l->arena;
     if (nc && nc->cap >= n) { nc->used = n; l->arena_cur = nc; return nc->data; }
     size_t cap = n > ARENA_CHUNK ? n : ARENA_CHUNK;
-    arena_chunk_t *a = (arena_chunk_t *) malloc(sizeof(*a) + cap);
+    arena_chunk_t *a = (arena_chunk_t *) ng_malloc_add(sizeof(*a), cap);
     if (!a) return NULL;
     a->cap = cap; a->used = n;
     if (c) { a->next = c->next; c->next = a; } else { a->next = l->arena; l->arena = a; }
@@ -171,8 +172,9 @@ static void arena_reset(ngws_loop_t *l) {
 static bool node_add(sockx_t *x, const void *p, size_t n) {
     ngws_loop_t *l = x->loop;
     if (l->n_nodes == l->cap_nodes) {
+        if (l->cap_nodes > UINT32_MAX / 2) return false;          /* node index is 32-bit */
         uint32_t nc = l->cap_nodes ? l->cap_nodes * 2 : 4096;
-        ionode_t *nn = (ionode_t *) realloc(l->nodes, nc * sizeof(ionode_t));
+        ionode_t *nn = (ionode_t *) ng_realloc_array(l->nodes, nc, sizeof(ionode_t));
         if (!nn) return false;
         l->nodes = nn; l->cap_nodes = nc;
     }
@@ -197,8 +199,10 @@ static bool obuf_room(sockx_t *x, size_t n) {
     if (pending + n > srv->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&srv->closed_conn_limit, 1, NG_MO_RELAXED); return false; }
     if (x->olen + n <= x->ocap) return true;
     if (x->ooff) { memmove(x->obuf, x->obuf + x->ooff, pending); x->olen = pending; x->ooff = 0; }
-    if (x->olen + n <= x->ocap) return true;
-    size_t nc = x->ocap ? x->ocap * 2 : 4096; while (nc < x->olen + n) nc *= 2;
+    size_t want;
+    if (!ng_size_add(x->olen, n, &want)) return false;
+    if (want <= x->ocap) return true;
+    size_t nc = ng_grow_cap(x->ocap, want, 4096);
     size_t grow = nc - x->ocap;
     if (srv->cfg.max_total_backlog && pending + n > SEND_WATERMARK &&
         ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED) + grow > srv->cfg.max_total_backlog) {
@@ -412,7 +416,7 @@ int ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len) {
 void ngws_loop_defer(ngws_loop_t *l, void (*fn)(void *), void *arg) {
     if (l->n_defer == l->cap_defer) {
         uint32_t nc = l->cap_defer ? l->cap_defer * 2 : 256;
-        defer_t *nd = (defer_t *) realloc(l->defer, nc * sizeof(defer_t));
+        defer_t *nd = l->cap_defer > UINT32_MAX / 2 ? NULL : (defer_t *) ng_realloc_array(l->defer, nc, sizeof(defer_t));
         if (!nd) { fn(arg); return; }      /* cannot defer: caller must not rely on it then */
         l->defer = nd; l->cap_defer = nc;
     }
@@ -622,9 +626,10 @@ static bool msg_append(sockx_t *x, const void *p, size_t n) {
         pool_item_t *it = x->loop->msg_pool; x->loop->msg_pool = it->next; x->loop->n_msg_pool--;
         x->msg = (unsigned char *) it; x->mcap = MSG_CHUNK; x->mlen = 0;
     }
-    if (x->mlen + n > x->mcap) {
-        size_t nc = x->mcap ? x->mcap : (n < MSG_CHUNK ? MSG_CHUNK : 1024);
-        while (nc < x->mlen + n) nc *= 2;
+    if (x->mlen + n > x->mcap) {           /* mlen + n <= max_payload: checked by the caller */
+        size_t want;
+        if (!ng_size_add(x->mlen, n, &want)) return false;
+        size_t nc = ng_grow_cap(x->mcap, want, n < MSG_CHUNK ? MSG_CHUNK : 1024);
         unsigned char *nb = (unsigned char *) realloc(x->msg, nc);
         if (!nb) return false;
         x->msg = nb; x->mcap = nc;
@@ -695,7 +700,9 @@ static void ws_feed(sockx_t *x, unsigned char *data, size_t len) {
     bool owned = false;
     if (x->rlen) {                        /* append to partial frame */
         if (x->rlen + len > x->rcap) {
-            size_t nc = x->rcap ? x->rcap : 4096; while (nc < x->rlen + len) nc *= 2;
+            size_t want;
+            if (!ng_size_add(x->rlen, len, &want)) { ngws_terminate((ngws_socket_t *) x->s); return; }
+            size_t nc = ng_grow_cap(x->rcap, want, 4096);
             size_t fn = frame_need(x, x->rbuf, x->rlen);
             if (fn >= x->rlen + len && fn > x->rcap) nc = fn;
             unsigned char *nb = (unsigned char *) realloc(x->rbuf, nc);
@@ -768,8 +775,8 @@ static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length
     if (x->state == ST_HTTP) {
         const char *b = data; size_t n = (size_t) length;
         {
-            if (x->rlen + n > x->rcap) {
-                size_t nc = x->rcap ? x->rcap : 1024; while (nc < x->rlen + n) nc *= 2;
+            if (x->rlen + n > x->rcap) {        /* header block: bounded by MAX_HTTP_HEADER */
+                size_t nc = ng_grow_cap(x->rcap, x->rlen + n, 1024);
                 unsigned char *nb = (unsigned char *) realloc(x->rbuf, nc);
                 if (!nb) { x->in_data = 0; return us_socket_close(0, s, 0, NULL); }
                 x->rbuf = nb; x->rcap = nc;
@@ -869,7 +876,7 @@ static void shed_sweep(ngws_loop_t *l) {
     if (!cap || ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED) < cap / 4 * 3) return;
     size_t n = 0, k = 0;
     for (sockx_t *x = l->blog; x; x = x->bnext) n++;
-    shed_t *v = n ? (shed_t *) malloc(n * sizeof(*v)) : NULL;
+    shed_t *v = n ? (shed_t *) ng_malloc_array(n, sizeof(*v)) : NULL;
     if (!v) return;
     for (sockx_t *x = l->blog; x; x = x->bnext) {
         size_t p = x->olen - x->ooff + x->qbytes;

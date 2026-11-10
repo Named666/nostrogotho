@@ -2,11 +2,13 @@
 #include "json_util.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
 
 #include "json_lite.h"
 #include "relay_conn.h"
+#include "platform/ng_alloc.h"
 
 /* ============================================================================
  * JSON Parsing Utilities
@@ -86,7 +88,7 @@ static bool skip_json_value(const char **p) {
 
 static char *copy_json_value(const char *start, const char *end) {
     size_t length = (size_t)(end - start);
-    char *copy = (char *)malloc(length + 1);
+    char *copy = (char *) ng_malloc_add(length, 1);
     if (!copy) return NULL;
     memcpy(copy, start, length);
     copy[length] = '\0';
@@ -114,7 +116,7 @@ static char *parse_json_string(const char **p) {
     }
     
     /* Unescape string */
-    char *result = (char *)malloc(len + 1);
+    char *result = (char *) ng_malloc_add(len, 1);
     if (!result) return NULL;
     
     size_t out_idx = 0;
@@ -330,6 +332,23 @@ static bool json_builder_ensure_space(json_builder_t *builder, size_t needed) {
     return builder->pos + needed < sizeof(builder->buffer);
 }
 
+/* printf-append at most `reserve` bytes. The position only advances when
+ * the whole formatted text fits (snprintf returns the untruncated length;
+ * adding that blindly could move pos past the buffer). */
+static void json_builder_appendf(json_builder_t *builder, size_t reserve, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+static void json_builder_appendf(json_builder_t *builder, size_t reserve, const char *fmt, ...) {
+    if (!json_builder_ensure_space(builder, reserve)) return;
+    size_t avail = sizeof(builder->buffer) - builder->pos;
+    if (avail > reserve) avail = reserve;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(&builder->buffer[builder->pos], avail, fmt, ap);
+    va_end(ap);
+    if (n > 0 && (size_t) n < avail) builder->pos += (size_t) n;
+    else builder->buffer[builder->pos] = '\0';
+}
+
 static void json_builder_add_comma(json_builder_t *builder) {
     if (builder->pos > 1 && builder->buffer[builder->pos - 1] != '[' && 
         builder->buffer[builder->pos - 1] != '{' && builder->buffer[builder->pos - 1] != ':') {
@@ -364,12 +383,7 @@ void json_builder_append_bool(json_builder_t *builder, bool value) {
 
 void json_builder_append_number(json_builder_t *builder, long long value) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 32)) {
-        int written = snprintf(&builder->buffer[builder->pos], 32, "%lld", value);
-        if (written > 0) {
-            builder->pos += written;
-        }
-    }
+    json_builder_appendf(builder, 32, "%lld", value);
 }
 
 /* json_builder_escape_string - Append a JSON-escaped string value
@@ -416,9 +430,13 @@ static void json_builder_escape_string(json_builder_t *builder, const char *valu
             if (!json_builder_ensure_space(builder, 2)) return;
             builder->buffer[builder->pos++] = '\\';
             builder->buffer[builder->pos++] = 't';
-        } else if (c < 0x20) {
+        } else if (c < 0x20) {             /* \u00XX: exactly 6 bytes, no NUL */
+            static const char hex[] = "0123456789abcdef";
             if (!json_builder_ensure_space(builder, 6)) return;
-            builder->pos += snprintf(&builder->buffer[builder->pos], 6, "\\u%04x", c);
+            memcpy(&builder->buffer[builder->pos], "\\u00", 4);
+            builder->buffer[builder->pos + 4] = hex[c >> 4];
+            builder->buffer[builder->pos + 5] = hex[c & 15];
+            builder->pos += 6;
         } else {
             if (!json_builder_ensure_space(builder, 1)) return;
             builder->buffer[builder->pos++] = c;
@@ -494,24 +512,17 @@ void json_builder_object_key_string(json_builder_t *builder, const char *key, co
 
 void json_builder_object_key_number(json_builder_t *builder, const char *key, long long value) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 128)) {
-        builder->pos += snprintf(&builder->buffer[builder->pos], 128, "\"%s\":%lld", key, value);
-    }
+    json_builder_appendf(builder, 128, "\"%s\":%lld", key, value);
 }
 
 void json_builder_object_key_bool(json_builder_t *builder, const char *key, bool value) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 128)) {
-        builder->pos += snprintf(&builder->buffer[builder->pos], 128, "\"%s\":%s", 
-                                 key, value ? "true" : "false");
-    }
+    json_builder_appendf(builder, 128, "\"%s\":%s", key, value ? "true" : "false");
 }
 
 void json_builder_object_start_nested(json_builder_t *builder, const char *key) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 128)) {
-        builder->pos += snprintf(&builder->buffer[builder->pos], 128, "\"%s\":{", key);
-    }
+    json_builder_appendf(builder, 128, "\"%s\":{", key);
 }
 
 void json_builder_end_object(json_builder_t *builder) {
@@ -547,7 +558,7 @@ static char *json_raw_string(jstr_t value) {
     char *result = NULL;
 
     if (!value.buf || length > MAX_JSON_STRING_VALUE) return NULL;
-    wrapped = (char *) malloc(length + 3);
+    wrapped = (char *) ng_malloc_add(length, 3);
     if (!wrapped) return NULL;
     wrapped[0] = '[';
     memcpy(wrapped + 1, value.buf, length);
@@ -606,7 +617,7 @@ static bool is_lower_hex(const char *s, size_t len) {
 static bool append_string(char ***items, size_t *count, size_t *capacity, const char *value) {
     if (*count >= *capacity) {
         size_t new_capacity = *capacity == 0 ? 16 : *capacity * 2;
-        char **resized = (char **) realloc(*items, new_capacity * sizeof(**items));
+        char **resized = (char **) ng_realloc_array(*items, new_capacity, sizeof(**items));
         if (!resized) return false;
         *items = resized;
         *capacity = new_capacity;
@@ -694,8 +705,7 @@ static bool append_filter_tag(filter_t *filter, const char *name,
         tag_free(tag);
         return false;
     }
-    resized = (tag_t *) realloc(filter->tags,
-                                 (filter->tags_count + 1) * sizeof(*resized));
+    resized = (tag_t *) ng_realloc_array(filter->tags, filter->tags_count + 1, sizeof(*resized));
     if (!resized) {
         tag_free(tag);
         return false;
@@ -768,8 +778,7 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
                 kind = strtol(number_text, &end, 10);
                 if (*end != '\0' || kind < INT_MIN || kind > INT_MAX) { free(number_text); ok = false; break; }
                 free(number_text);
-                resized = (int *) realloc(filter->kinds,
-                                          (filter->kinds_count + 1) * sizeof(*resized));
+                resized = (int *) ng_realloc_array(filter->kinds, filter->kinds_count + 1, sizeof(*resized));
                 if (!resized) { ok = false; break; }
                 filter->kinds = resized;
                 filter->kinds[filter->kinds_count++] = (int) kind;

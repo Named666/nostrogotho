@@ -221,6 +221,35 @@ static void test_serialized_size_matches(void) {
     printf("%s: json_serialized_event_size matches serialization\n", pass ? "PASS" : "FAIL");
 }
 
+/* Regression: control bytes other than \b\f\n\r\t were written as a
+ * truncated "\u00X" plus an embedded NUL (snprintf size 6 for a 6-char
+ * escape), corrupting stored and broadcast JSON. */
+static void test_builder_control_escape(void) {
+    json_builder_t *b = (json_builder_t *) malloc(sizeof(json_builder_t));
+    json_builder_start(b);
+    json_builder_append_string(b, "a\x01\x1f\x7f\"\\z");
+    const char *r = json_builder_finish(b);
+    int ok = strcmp(r, "[\"a\\u0001\\u001f\x7f\\\"\\\\z\"]") == 0 && strlen(r) == b->pos;
+    printf("%s: builder escapes control bytes as \\u00XX (%s)\n", ok ? "PASS" : "FAIL", r);
+    free(b);
+}
+
+/* Regression: printf-style appends advanced pos by the untruncated length,
+ * so a long key could move pos past the text actually written. */
+static void test_builder_long_key_clamped(void) {
+    json_builder_t *b = (json_builder_t *) malloc(sizeof(json_builder_t));
+    char key[300]; memset(key, 'k', sizeof(key) - 1); key[sizeof(key) - 1] = '\0';
+    json_builder_start(b);
+    json_builder_start_object(b);
+    json_builder_object_key_number(b, key, 1);
+    json_builder_object_key_number(b, "n", 2);
+    json_builder_end_object(b);
+    const char *r = json_builder_finish(b);
+    int ok = strlen(r) == b->pos && strstr(r, "\"n\":2") != NULL && strstr(r, "kkkk") == NULL;
+    printf("%s: oversized printf append is dropped, not overrun (%s)\n", ok ? "PASS" : "FAIL", r);
+    free(b);
+}
+
 int main(void) {
     printf("Running json_util security regression tests...\n");
     test_filter_many_ids();
@@ -230,6 +259,8 @@ int main(void) {
     test_parse_string_array_hex64();
     test_filter_empty_is_match_all();
     test_builder_key_number_format();
+    test_builder_control_escape();
+    test_builder_long_key_clamped();
     printf("json_util security regression tests complete.\n");
     return 0;
 }

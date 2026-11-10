@@ -4,6 +4,7 @@
 #include "nips/nip40.h"
 #include "nips/nip_event.h"
 #include <sqlite3.h>
+#include "platform/ng_alloc.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -184,7 +185,9 @@ char *escape_like(const char *str, size_t len) {
         }
     }
     
-    char *escaped = (char *)malloc(len + count + 1);
+    size_t sz;   /* one '\\' per escaped byte + NUL */
+    if (!ng_size_add3(len, count, 1, &sz)) return NULL;
+    char *escaped = (char *) malloc(sz);
     if (!escaped) return NULL;
     
     size_t out_idx = 0;
@@ -240,13 +243,13 @@ static event_t *get_event_by_id(const char *id) {
             ev->id[MAX_ID_SIZE] = '\0';
             strncpy(ev->pubkey, (const char *)sqlite3_column_text(stmt, 1), MAX_PUBKEY_SIZE);
             ev->pubkey[MAX_PUBKEY_SIZE] = '\0';
-            ev->created_at = (time_t)sqlite3_column_int(stmt, 2);
+            ev->created_at = (time_t) sqlite3_column_int64(stmt, 2);
             ev->kind = sqlite3_column_int(stmt, 3);
             
             const char *tags_json = (const char *)sqlite3_column_text(stmt, 4);
             if (tags_json) {
                 ev->tags_json_len = strlen(tags_json);
-                ev->tags_json = (char *)malloc(ev->tags_json_len + 1);
+                ev->tags_json = (char *) ng_malloc_add(ev->tags_json_len, 1);
                 if (ev->tags_json) {
                     strcpy(ev->tags_json, tags_json);
                 } else {
@@ -259,7 +262,7 @@ static event_t *get_event_by_id(const char *id) {
             const char *content = (const char *)sqlite3_column_text(stmt, 5);
             if (content) {
                 ev->content_len = strlen(content);
-                ev->content = (char *)malloc(ev->content_len + 1);
+                ev->content = (char *) ng_malloc_add(ev->content_len, 1);
                 if (!ev->content) {
                     free(ev->tags_json);
                     sqlite3_finalize(stmt);
@@ -381,7 +384,7 @@ static int replaceable_admit(const event_t *ev, const char *dtag) {
             (at == (sqlite3_int64) ev->created_at && idcmp < 0)) { verdict = 0; break; }
         if (nv == cap) {
             size_t nc = cap ? cap * 2 : 4;
-            void *p = realloc(victims, nc * sizeof(*victims));
+            void *p = ng_realloc_array(victims, nc, sizeof(*victims));
             if (!p) { verdict = -1; break; }
             victims = p; cap = nc;
         }
@@ -441,7 +444,7 @@ static int delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t
     
     sqlite3_bind_int(stmt, 1, kind);
     sqlite3_bind_text(stmt, 2, pubkey, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, (int)created_at);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64) created_at);
     
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
@@ -451,6 +454,49 @@ static int delete_record_by_kind_and_pubkey(int kind, const char *pubkey, time_t
     
     sqlite3_finalize(stmt);
     return sqlite3_changes(db_conn);
+}
+
+/* Growable list of owned hex id strings (NIP-09 delete candidates). */
+static bool ids_push(char ***ids, size_t *n, const char *id) {
+    char **nv = (char **) ng_realloc_array(*ids, *n + 1, sizeof(char *));
+    if (!nv) return false;
+    *ids = nv;
+    if (!(nv[*n] = string_dup(id))) return false;
+    (*n)++;
+    return true;
+}
+static void ids_free(char **ids, size_t n) {
+    for (size_t i = 0; i < n; i++) free(ids[i]);
+    free(ids);
+}
+
+/* DELETE every id in ids (n >= 1) with one statement; consumes ids.
+ * Returns rows deleted, or -1 (SQL error, OOM, or more ids than SQLite
+ * accepts as bound parameters). */
+static int delete_ids(char **ids, size_t n) {
+    if (!n) { free(ids); return 0; }
+    static const char head[] = "DELETE FROM event WHERE id IN (";
+    static const char item[] = "unhex(?),";
+    size_t len;
+    if (!ng_size_flex(sizeof(head) + 1, n, sizeof(item) - 1, &len)) { ids_free(ids, n); return -1; }
+    char *sql = (char *) malloc(len), *w = sql;
+    if (!sql) { ids_free(ids, n); return -1; }
+    memcpy(w, head, sizeof(head) - 1); w += sizeof(head) - 1;
+    for (size_t i = 0; i < n; i++) { memcpy(w, item, sizeof(item) - 1); w += sizeof(item) - 1; }
+    w[-1] = ')'; *w = '\0';                 /* replaces the last ',' */
+    sqlite3_stmt *stmt = NULL;
+    int changes = -1;
+    if (sqlite3_prepare_v2(db_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+    } else {
+        for (size_t i = 0; i < n; i++) sqlite3_bind_text(stmt, (int) i + 1, ids[i], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_DONE) changes = sqlite3_changes(db_conn);
+        else fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
+    }
+    sqlite3_finalize(stmt);
+    free(sql);
+    ids_free(ids, n);
+    return changes;
 }
 
 /* Delete record by kind, pubkey, and delegation tag */
@@ -469,7 +515,7 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
     
     sqlite3_bind_int(stmt, 1, kind);
     sqlite3_bind_text(stmt, 2, pubkey, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 3, (int)created_at);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64) created_at);
     
     const char *target_d = (tag->count >= 2 && tag->elements[1]) ? tag->elements[1] : "";
     size_t ids_count = 0;
@@ -507,15 +553,11 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
         }
         
         if (d_matched && id) {
-            char **new_ids = (char **)realloc(ids, (ids_count + 1) * sizeof(char *));
-            if (!new_ids) {
+            if (!ids_push(&ids, &ids_count, id)) {
                 sqlite3_finalize(stmt);
-                for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-                free(ids);
+                ids_free(ids, ids_count);
                 return -1;
             }
-            ids = new_ids;
-            ids[ids_count++] = string_dup(id);
         }
     }
     
@@ -525,54 +567,7 @@ static int delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubke
         return 0;
     }
     
-    /* Delete the found events. The id list is unbounded (one entry per
-     * matching row), so size the SQL buffer dynamically instead of a fixed
-     * "... IN (?,..." placeholder list that could overflow the stack. */
-    size_t delete_sql_len = strlen("DELETE FROM event WHERE id IN (") +
-                            ids_count * 9 + 2;
-    char *delete_sql = (char *) malloc(delete_sql_len);
-    if (!delete_sql) {
-        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-        free(ids);
-        return -1;
-    }
-    snprintf(delete_sql, delete_sql_len, "DELETE FROM event WHERE id IN (");
-    for (size_t i = 0; i < ids_count; i++) {
-        strcat(delete_sql, "unhex(?)");
-        if (i < ids_count - 1) strcat(delete_sql, ",");
-    }
-    strcat(delete_sql, ")");
-    
-    stmt = NULL;
-    if (sqlite3_prepare_v2(db_conn, delete_sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        free(delete_sql);
-        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-        free(ids);
-        return -1;
-    }
-    
-    for (size_t i = 0; i < ids_count; i++) {
-        sqlite3_bind_text(stmt, i + 1, ids[i], -1, SQLITE_TRANSIENT);
-    }
-    
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        sqlite3_finalize(stmt);
-        free(delete_sql);
-        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-        free(ids);
-        return -1;
-    }
-    
-    sqlite3_finalize(stmt);
-    free(delete_sql);
-    
-    int changes = sqlite3_changes(db_conn);
-    for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-    free(ids);
-    
-    return changes;
+    return delete_ids(ids, ids_count);
 }
 
 /* Delete record by ID, kind, and p-tag */
@@ -611,15 +606,11 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
         }
         
         if (p_matched && found_id) {
-            char **new_ids = (char **)realloc(ids, (ids_count + 1) * sizeof(char *));
-            if (!new_ids) {
+            if (!ids_push(&ids, &ids_count, found_id)) {
                 sqlite3_finalize(stmt);
-                for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-                free(ids);
+                ids_free(ids, ids_count);
                 return -1;
             }
-            ids = new_ids;
-            ids[ids_count++] = string_dup(found_id);
         }
     }
     
@@ -629,54 +620,7 @@ static int delete_record_by_id_and_kind_and_ptag(const char *id, int kind,
         return 0;
     }
     
-    /* Delete the found events. The id list is unbounded (one entry per
-     * matching row), so size the SQL buffer dynamically instead of a fixed
-     * "... IN (?,..." placeholder list that could overflow the stack. */
-    size_t delete_sql_len = strlen("DELETE FROM event WHERE id IN (") +
-                            ids_count * 9 + 2;
-    char *delete_sql = (char *) malloc(delete_sql_len);
-    if (!delete_sql) {
-        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-        free(ids);
-        return -1;
-    }
-    snprintf(delete_sql, delete_sql_len, "DELETE FROM event WHERE id IN (");
-    for (size_t i = 0; i < ids_count; i++) {
-        strcat(delete_sql, "unhex(?)");
-        if (i < ids_count - 1) strcat(delete_sql, ",");
-    }
-    strcat(delete_sql, ")");
-    
-    stmt = NULL;
-    if (sqlite3_prepare_v2(db_conn, delete_sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        free(delete_sql);
-        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-        free(ids);
-        return -1;
-    }
-    
-    for (size_t i = 0; i < ids_count; i++) {
-        sqlite3_bind_text(stmt, i + 1, ids[i], -1, SQLITE_TRANSIENT);
-    }
-    
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
-        sqlite3_finalize(stmt);
-        free(delete_sql);
-        for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-        free(ids);
-        return -1;
-    }
-    
-    sqlite3_finalize(stmt);
-    free(delete_sql);
-    
-    int changes = sqlite3_changes(db_conn);
-    for (size_t i = 0; i < ids_count; i++) free(ids[i]);
-    free(ids);
-    
-    return changes;
+    return delete_ids(ids, ids_count);
 }
 
 /* Delete all events by pubkey up to a timestamp, optionally excluding one
@@ -697,7 +641,7 @@ static int delete_all_events_by_pubkey(const char *pubkey, time_t created_at,
     }
     
     sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 2, (int)created_at);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64) created_at);
     if (exclude_kind) sqlite3_bind_int(stmt, 3, exclude_kind);
     
     if (sqlite3_step(stmt) != SQLITE_DONE) {
@@ -746,7 +690,7 @@ static int purge_expired_sqlite3(time_t now) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(db_conn));
         return -1;
     }
-    sqlite3_bind_int(select, 1, (int) now);
+    sqlite3_bind_int64(select, 1, (sqlite3_int64) now);
 
     int rc;
     int iterations = 0;
@@ -800,8 +744,8 @@ static bool append_tag_like_condition(char *conditions, size_t conditions_size,
     bool ok = name_escaped != NULL && value_escaped != NULL;
 
     for (size_t i = 0; ok && i < sizeof(formats) / sizeof(formats[0]); i++) {
-        size_t length = strlen(formats[i]) + strlen(name_escaped) +
-                        strlen(value_escaped) + 2;
+        size_t length;
+        if (!ng_size_add3(strlen(formats[i]) + 2, strlen(name_escaped), strlen(value_escaped), &length)) { ok = false; break; }
         char *pattern = (char *) malloc(length);
         if (!pattern) { ok = false; break; }
         snprintf(pattern, length, formats[i], name_escaped, value_escaped);

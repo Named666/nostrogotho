@@ -55,6 +55,7 @@
 #include "server.h"
 #include "ws_proto.h"
 #include "ng_config.h"
+#include "platform/ng_alloc.h"
 
 #define MAX_WS_MESSAGE   (5u * 1024 * 1024)
 #define MAX_IO_LOOPS     NG_MAX_IO_LOOPS
@@ -260,19 +261,23 @@ static void outbox_flush(void) {
 static char *outbox_reserve(ng_conn_t *c, uint32_t kind, size_t len, relay_body_t *body) {
     int li = ngws_loop_index(c->loop);
     outbox_t *ob = &tl_outbox[li];
+    if (NG_UNLIKELY(len > (size_t) UINT32_MAX - 8)) return NULL;   /* rec_t.len is 32-bit */
     size_t need = sizeof(rec_t) + ((len + 7) & ~(size_t) 7);
     if (ob->t && ob->t->len + need > ob->cap) {
         if (ob->t->len >= OUTBOX_FLUSH) outbox_flush_loop(li);
         else {
-            size_t nc = ob->cap * 2; while (nc < ob->t->len + need) nc *= 2;
-            outtask_t *nt = (outtask_t *) realloc(ob->t, sizeof(outtask_t) + nc);
+            size_t want, nc, bytes;
+            if (!ng_size_add(ob->t->len, need, &want)) return NULL;
+            nc = ng_grow_cap(ob->cap, want, 16384);
+            if (!ng_size_add(sizeof(outtask_t), nc, &bytes)) return NULL;
+            outtask_t *nt = (outtask_t *) realloc(ob->t, bytes);
             if (!nt) return NULL;
             ob->t = nt; ob->cap = nc;
         }
     }
     if (!ob->t) {
         size_t cap = need > 16384 ? need : 16384;
-        ob->t = (outtask_t *) malloc(sizeof(outtask_t) + cap);
+        ob->t = (outtask_t *) ng_malloc_add(sizeof(outtask_t), cap);
         if (!ob->t) return NULL;
         ob->t->len = 0; ob->cap = cap;
     }
@@ -330,7 +335,7 @@ static NG_THREAD_LOCAL relay_conn_t **tl_unref; static NG_THREAD_LOCAL size_t tl
 static void unref_later(relay_conn_t *rc) {
     if (tl_unref_n == tl_unref_cap) {
         size_t nc = tl_unref_cap ? tl_unref_cap * 2 : 1024;
-        relay_conn_t **nv = (relay_conn_t **) realloc(tl_unref, nc * sizeof(*nv));
+        relay_conn_t **nv = (relay_conn_t **) ng_realloc_array(tl_unref, nc, sizeof(*nv));
         if (!nv) { outbox_flush(); relay_conn_unref(rc); return; }   /* flush first: still ordered */
         tl_unref = nv; tl_unref_cap = nc;
     }
@@ -411,7 +416,7 @@ static void on_http(ngws_socket_t *s, const ngws_http_req_t *req) {
 }
 
 static job_t *job_new(int type, ng_conn_t *c, size_t extra) {
-    job_t *j = (job_t *) malloc(sizeof(*j) + extra);
+    job_t *j = (job_t *) ng_malloc_add(sizeof(*j), extra);
     if (j) { memset(j, 0, sizeof(*j)); j->type = type; j->conn = c; }
     return j;
 }
@@ -505,8 +510,8 @@ static void on_message(ngws_socket_t *ws, char *data, size_t len, int op) {
         return;
     }
     ng_atomic_fetch_add_explicit(&c->pending, 1, NG_MO_RELAXED);
-    job_t *j = job_new(J_MSG, c, len + 1);
-    if (!j) { ng_atomic_fetch_sub(&c->pending, 1); return; }
+    job_t *j = job_new(J_MSG, c, len + 1);      /* len <= max_payload (ngws) */
+    if (!j) { ng_atomic_fetch_sub(&c->pending, 1); shed_inline(ws, data, len); return; }   /* OOM: answer, never drop silently */
     memcpy(j->payload, data, len); j->payload[len] = '\0'; j->len = len;
     relay_conn_retain(&c->base);
     loop_queue_job(c->loop, c->base.shard, j);
@@ -554,8 +559,10 @@ static void preverify_events(job_t *j) {
         size_t o = jl_next(arr, 0, &k, &v0);
         if (!o || !jl_next(arr, o, &k, &ev) || ev.buf[0] != '{') continue;
         if (!pv) {
-            pv = malloc(PREVERIFY_MAX * sizeof(*pv));
-            ps = malloc(PREVERIFY_MAX * sizeof(*ps)); pm = malloc(PREVERIFY_MAX * sizeof(*pm)); pp = malloc(PREVERIFY_MAX * sizeof(*pp));
+            pv = (pv_item_t *) ng_malloc_array(PREVERIFY_MAX, sizeof(*pv));
+            ps = (const uint8_t **) ng_malloc_array(PREVERIFY_MAX, sizeof(*ps));
+            pm = (const uint8_t **) ng_malloc_array(PREVERIFY_MAX, sizeof(*pm));
+            pp = (const uint8_t **) ng_malloc_array(PREVERIFY_MAX, sizeof(*pp));
             if (!pv || !ps || !pm || !pp) { preverify_free(); return; }   /* all or nothing; plain verify still runs */
         }
         int have = 0; jstr_t kk, vv; size_t q = 0;
@@ -768,7 +775,7 @@ static void *writer_thread(void *arg) {
         long long t2 = now_us();
         for (int i = 0; i < n; i++) relay_core_dedupe_settle(&batch[i]->bc->ev, &results[i]);
         stat_batches++; stat_events += (unsigned long long) n;
-        bset_t *set = (bset_t *) malloc(sizeof(*set) + (size_t) n * sizeof(relay_bcast_t *));
+        bset_t *set = (bset_t *) ng_malloc_flex(sizeof(*set), (size_t) n, sizeof(relay_bcast_t *));
         if (set) set->n = 0;
         for (int i = 0; i < n; i++) {
             relay_conn_t *rc = &batch[i]->conn->base;
