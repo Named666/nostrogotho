@@ -58,6 +58,7 @@ typedef struct {
     time_t created_at_lower_limit;
     time_t created_at_upper_limit;
     bool auth_required;
+    bool restricted_writes;     /* writes limited (e.g. ban lists, NIP-43) */
 } relay_config_t;
 
 /* Maximum number of event-kind ranges a single plugin may listen for. */

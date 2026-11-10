@@ -178,6 +178,60 @@ def okreasons():
     r.stop()
 
 
+def nip11_doc(r):
+    head, body = r.http("/", {"Accept": "application/nostr+json"})
+    return head, json.loads(body)
+
+
+@section
+def nip11():
+    """NIP-11 document from nostrogotho.conf + limits (A7)."""
+    r = Relay()
+    head, d = nip11_doc(r)
+    check("NIP-11 served with application/nostr+json", "application/nostr+json" in head.lower(), head.splitlines()[:3])
+    check("software and version present", d.get("software", "").startswith("https://") and d.get("version"), d)
+    lim = d.get("limitation", {})
+    check("limitation reflects runtime limits", lim.get("max_subscriptions") == 100 and lim.get("max_event_tags") == 5000
+          and lim.get("max_content_length") == 256 << 10 and lim.get("max_limit") == 500 and lim.get("default_limit") == 500
+          and lim.get("auth_required") is False and lim.get("created_at_upper_limit") == 900, lim)
+    check("supported_nips does not claim NIP-26", 26 not in d.get("supported_nips", []), d.get("supported_nips"))
+    r.stop()
+    op = Key()
+    conf = (f"relay_name = Test Relay\nrelay_description = A \"quoted\" description\nrelay_pubkey = {op.pk}\n"
+            "relay_contact = mailto:ops@example.com\nrelay_icon = https://example.com/i.png\n"
+            "relay_countries = US, CA\nlanguage_tags = en\nposting_policy = https://example.com/p\n"
+            "relay_url = wss://relay.example.com\nmin_pow_difficulty = 0\nmax_subscriptions = 7\n")
+    r = Relay(conf)
+    _, d = nip11_doc(r)
+    check("configured identity fields", d.get("name") == "Test Relay" and d.get("description") == 'A "quoted" description'
+          and d.get("pubkey") == op.pk and d.get("contact") == "mailto:ops@example.com" and d.get("icon") == "https://example.com/i.png"
+          and d.get("posting_policy") == "https://example.com/p", d)
+    check("comma lists become arrays", d.get("relay_countries") == ["US", "CA"] and d.get("language_tags") == ["en"], d)
+    check("configured limit in limitation", d["limitation"]["max_subscriptions"] == 7, d["limitation"])
+    # NIP-42 with relay_url set
+    k = Key(); w = WS(r.port)
+    m = w.auth(k, "wss://other.example.com")
+    check("AUTH with another relay's URL -> OK false invalid: relay tag", m and m[2] is False and "relay tag" in m[3], m)
+    w2 = WS(r.port); m = w2.auth(k, "WSS://Relay.Example.com/")
+    check("AUTH relay tag compare ignores case and trailing slash", m and m[2] is True, m)
+    w3 = WS(r.port); w3.challenge = "0" * 16; m = w3.auth(k, "wss://relay.example.com")
+    check("AUTH with a wrong challenge -> OK false invalid: challenge", m and m[2] is False and "challenge" in m[3], m)
+    r.stop()
+    try:
+        Relay("relay_pubkey = nothex\n"); started = True
+    except RuntimeError:
+        started = False
+    check("invalid relay_pubkey -> relay refuses to start", not started)
+    # NIP-42 without relay_url: works, warns at startup
+    r = Relay(); w = WS(r.port)
+    m = w.auth(k, "ws://127.0.0.1:%d" % r.port)
+    check("AUTH works without relay_url (any ws(s):// relay tag)", m and m[2] is True, m)
+    w2 = WS(r.port); m = w2.auth(k, "https://not-a-relay")
+    check("AUTH without relay_url still rejects a non-ws relay tag", m and m[2] is False, m)
+    check("startup warns that relay_url is unset", "relay_url is not set" in r.logtext())
+    r.stop()
+
+
 @section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""

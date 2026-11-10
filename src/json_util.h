@@ -232,6 +232,9 @@ void json_builder_object_start_nested(json_builder_t *builder, const char *key);
  */
 void json_builder_end_object(json_builder_t *builder);
 
+/* "key": inside an object; the next append is its value. */
+void json_builder_object_key(json_builder_t *builder, const char *key);
+
 /* Finish building and get the result
  * 
  * Args: builder - Completed builder

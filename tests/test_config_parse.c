@@ -91,11 +91,31 @@ static void test_load(void) {
     CHECK(ng_config_load(&c, path, true, &e) == NG_E_IO && e.line == 0);
 }
 
+static void test_limits_and_info(void) {
+    ng_config_t c, d; ng_config_defaults(&c);
+    CHECK(c.limits.max_event_tags == 5000 && c.limits.max_subscriptions == 100 && !strcmp(c.info.name, "nostrogotho"));
+    CHECK(ng_config_set(&c, "max_event_size", "256K") == NG_OK && c.limits.max_event_size == 256 << 10);
+    CHECK(ng_config_set(&c, "max_filters", "65") == NG_E_RANGE);
+    CHECK(ng_config_set(&c, "max_event_tags", "0") == NG_E_RANGE);
+    CHECK(ng_config_set(&c, "relay_name", "My relay") == NG_OK && !strcmp(c.info.name, "My relay"));
+    char longv[300]; memset(longv, 'a', sizeof longv - 1); longv[sizeof longv - 1] = 0;
+    d = c; CHECK(ng_config_set(&c, "relay_contact", longv) == NG_E_RANGE && !memcmp(&c, &d, sizeof c));
+    CHECK(ng_config_set(&c, "relay_pubkey", "abc") == NG_E_INVALID);
+    CHECK(ng_config_set(&c, "relay_pubkey", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF") == NG_E_INVALID);
+    CHECK(ng_config_set(&c, "relay_pubkey", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == NG_OK && c.info.pubkey[63] == 'f');
+    CHECK(ng_config_set(&c, "relay_pubkey", "") == NG_OK && !c.info.pubkey[0]);
+    CHECK(ng_config_set(&c, "created_at_upper_limit", "0") == NG_OK && c.info.created_at_upper_limit == 0);
+    ng_limits_t l = c.limits; l.max_limit = 100; l.default_limit = 200;
+    ng_limits_apply(&l); CHECK(ng_limits.default_limit == 100);    /* default never above max */
+    ng_limits_defaults(&l); ng_limits_apply(&l);
+}
+
 int main(void) {
     test_parse_line();
     test_parse_size();
     test_keys();
     test_load();
+    test_limits_and_info();
     if (fails) { fprintf(stderr, "%d failure(s)\n", fails); return 1; }
     printf("test_config_parse: all passed\n");
     return 0;

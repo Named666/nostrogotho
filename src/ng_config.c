@@ -32,6 +32,20 @@ void ng_limits_apply(const ng_limits_t *l) {
     if (ng_limits.max_event_size > ng_limits.max_message_length) ng_limits.max_event_size = ng_limits.max_message_length;
 }
 
+ng_relay_info_t ng_relay_info = {
+    .software = NG_SOFTWARE_URL, .version = NG_VERSION, .created_at_upper_limit = 900
+};
+
+void ng_relay_info_defaults(ng_relay_info_t *info) {
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "%s", "nostrogotho");
+    snprintf(info->software, sizeof(info->software), "%s", NG_SOFTWARE_URL);
+    snprintf(info->version, sizeof(info->version), "%s", NG_VERSION);
+    info->created_at_upper_limit = 900;
+}
+
+void ng_relay_info_apply(const ng_relay_info_t *info) { ng_relay_info = *info; }
+
 void ng_config_defaults(ng_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->db_sync = NG_DB_SYNC_FULL;
@@ -41,6 +55,7 @@ void ng_config_defaults(ng_config_t *cfg) {
     cfg->writer_queue_max = 65536;
     cfg->conn_pending_max = 1024;
     ng_limits_defaults(&cfg->limits);
+    ng_relay_info_defaults(&cfg->info);
 }
 
 bool ng_parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
@@ -60,11 +75,11 @@ bool ng_parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
 }
 
 /* Value kinds of the key table. */
-typedef enum { K_SYNC, K_THREADS, K_BACKLOG, K_SIZE, K_INT } kind_t;
+typedef enum { K_SYNC, K_THREADS, K_BACKLOG, K_SIZE, K_INT, K_STR, K_HEX64 } kind_t;
 typedef struct {
     const char *key;
     kind_t kind;
-    size_t lo, hi;
+    size_t lo, hi;           /* K_STR / K_HEX64: hi = buffer size */
     size_t off;              /* offsetof(ng_config_t, field) */
 } cfg_key_t;
 
@@ -88,6 +103,26 @@ static const cfg_key_t keys[] = {
     { "max_subid_length",   K_INT,     1, 1024,                        F(limits.max_subid_length) },
     { "max_limit",          K_INT,     1, 100000,                      F(limits.max_limit) },
     { "default_limit",      K_INT,     1, 100000,                      F(limits.default_limit) },
+    { "relay_url",          K_STR,     0, sizeof(((ng_relay_info_t *) 0)->relay_url), F(info.relay_url) },
+    { "relay_name",         K_STR,     0, sizeof(((ng_relay_info_t *) 0)->name), F(info.name) },
+    { "relay_description",  K_STR,     0, sizeof(((ng_relay_info_t *) 0)->description), F(info.description) },
+    { "relay_pubkey",       K_HEX64,   0, 65, F(info.pubkey) },
+    { "relay_self",         K_HEX64,   0, 65, F(info.self) },
+    { "relay_contact",      K_STR,     0, sizeof(((ng_relay_info_t *) 0)->contact), F(info.contact) },
+    { "relay_icon",         K_STR,     0, sizeof(((ng_relay_info_t *) 0)->icon), F(info.icon) },
+    { "relay_banner",       K_STR,     0, sizeof(((ng_relay_info_t *) 0)->banner), F(info.banner) },
+    { "relay_software",     K_STR,     0, sizeof(((ng_relay_info_t *) 0)->software), F(info.software) },
+    { "relay_version",      K_STR,     0, sizeof(((ng_relay_info_t *) 0)->version), F(info.version) },
+    { "terms_of_service",   K_STR,     0, sizeof(((ng_relay_info_t *) 0)->terms_of_service), F(info.terms_of_service) },
+    { "privacy_policy",     K_STR,     0, sizeof(((ng_relay_info_t *) 0)->privacy_policy), F(info.privacy_policy) },
+    { "posting_policy",     K_STR,     0, sizeof(((ng_relay_info_t *) 0)->posting_policy), F(info.posting_policy) },
+    { "payments_url",       K_STR,     0, sizeof(((ng_relay_info_t *) 0)->payments_url), F(info.payments_url) },
+    { "relay_countries",    K_STR,     0, sizeof(((ng_relay_info_t *) 0)->relay_countries), F(info.relay_countries) },
+    { "language_tags",      K_STR,     0, sizeof(((ng_relay_info_t *) 0)->language_tags), F(info.language_tags) },
+    { "relay_tags",         K_STR,     0, sizeof(((ng_relay_info_t *) 0)->tags), F(info.tags) },
+    { "min_pow_difficulty", K_INT,     0, 256,                         F(info.min_pow_difficulty) },
+    { "created_at_lower_limit", K_INT, 0, (size_t) 1 << 30,            F(info.created_at_lower_limit) },
+    { "created_at_upper_limit", K_INT, 0, (size_t) 1 << 30,            F(info.created_at_upper_limit) },
     { "max_filter_items",   K_INT,     1, 20000,                       F(limits.max_filter_items) },
     { "max_req_authors",    K_INT,     1, 100000,                      F(limits.max_req_authors) },
 };
@@ -112,11 +147,24 @@ ng_status_t ng_config_set(ng_config_t *cfg, const char *key, const char *value) 
         /* fall through */
     case K_INT:
         if (!ng_parse_size(value, k->lo, k->hi, &v)) return NG_E_RANGE;
-        *(int *) (void *) field = (int) v;          /* hi <= 2^24: fits */
+        *(int *) (void *) field = (int) v;          /* hi <= 2^30: fits */
         return NG_OK;
     case K_SIZE:
         if (!ng_parse_size(value, k->lo, k->hi, &v)) return NG_E_RANGE;
         *(size_t *) (void *) field = v;
+        return NG_OK;
+    case K_STR: {
+        size_t n = strlen(value);
+        if (n >= k->hi) return NG_E_RANGE;
+        for (size_t i = 0; i < n; i++) if ((unsigned char) value[i] < 0x20) return NG_E_INVALID;
+        memcpy(field, value, n + 1);
+        return NG_OK;
+    }
+    case K_HEX64:
+        if (*value && strlen(value) != 64) return NG_E_INVALID;
+        for (const char *c = value; *c; c++)
+            if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'f'))) return NG_E_INVALID;
+        memcpy(field, value, strlen(value) + 1);
         return NG_OK;
     }
     return NG_E_UNKNOWN;

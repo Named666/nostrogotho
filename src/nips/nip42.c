@@ -107,15 +107,25 @@ bool nip42_open_challenge(relay_conn_t *connection, char challenge[17]) {
     return true;
 }
 
-bool nip42_authenticate(relay_conn_t *connection, const event_t *event,
-                        const char *service_url, time_t now) {
+const char *nip42_authenticate(relay_conn_t *connection, const event_t *event,
+                               const char *service_url, time_t now) {
     nip42_client_t *client = find_client(connection);
-    if (!client || event->kind != 22242 || !check_event(event) ||
-        llabs((long long) now - (long long) event->created_at) > 600 ||
-        !nip_event_has_tag(event, "challenge", client->challenge) ||
-        !nip_event_has_relay_tag(event, service_url)) return false;
+    if (!client) return "error: connection has no AUTH state";
+    if (event->kind != 22242) return "invalid: AUTH event must be kind 22242";
+    switch (check_event_status(event)) {
+    case CHECK_EVENT_OK: break;
+    case CHECK_EVENT_BAD_ID: return "invalid: event id does not match the event hash";
+    case CHECK_EVENT_BAD_SIG: return "invalid: bad signature";
+    default: return "invalid: malformed event";
+    }
+    if (llabs((long long) now - (long long) event->created_at) > 600)
+        return "invalid: created_at must be within 10 minutes";
+    if (!nip_event_has_tag(event, "challenge", client->challenge))
+        return "invalid: challenge tag does not match";
+    if (!nip_event_has_relay_tag(event, service_url ? service_url : ""))
+        return "invalid: relay tag does not match this relay";
     strcpy(client->pubkey, event->pubkey);
-    return true;
+    return NULL;
 }
 
 /* ============================================================================
@@ -167,23 +177,24 @@ static bool nip42_plugin_on_message(relay_conn_t *connection,
     if (!method || strcmp(method, "AUTH") != 0) return false;
 
     if (count != 2 || values[1].type != JSON_TYPE_OBJECT) {
-        nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: invalid auth");
+        nip_plugin_send_status(connection, "NOTICE", NULL, false, "invalid: AUTH needs one event");
         return true;
     }
 
     event_t event;
     time_t now = time(NULL);
-    if (!json_parse_event(values[1].value.string_val, &event)) {
-        nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: invalid auth");
+    const char *bad = NULL;
+    if (!json_parse_event_why(values[1].value.string_val, &event, &bad)) {
+        char hint[MAX_ID_SIZE + 1];
+        if (json_event_id_hint(values[1].value.string_val, hint))
+            nip_plugin_send_status(connection, "OK", hint, false, bad ? bad : "invalid: malformed event");
+        else
+            nip_plugin_send_status(connection, "NOTICE", NULL, false, bad ? bad : "invalid: malformed event");
         return true;
     }
 
-    if (!nip42_authenticate(connection, &event, nip42_service_url, now)) {
-        nip_plugin_send_status(connection, "OK", event.id, false,
-                               "error: failed to authenticate");
-    } else {
-        nip_plugin_send_status(connection, "OK", event.id, true, "");
-    }
+    const char *why = nip42_authenticate(connection, &event, nip42_service_url, now);
+    nip_plugin_send_status(connection, "OK", event.id, why == NULL, why ? why : "");
     event_release(&event);
     return true;
 }

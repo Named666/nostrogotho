@@ -43,6 +43,34 @@ typedef struct {
     int max_req_authors;        /* max_req_authors: authors summed over a REQ's filters */
 } ng_limits_t;
 
+/* Relay identity and policy (NIP-11 document, NIP-42 relay tag, NIP-62).
+ * Strings are "" when unset; lists are comma-separated. */
+typedef struct {
+    char relay_url[256];        /* relay_url: public ws(s):// URL of this relay */
+    char name[128];             /* relay_name */
+    char description[2048];     /* relay_description */
+    char pubkey[65];            /* relay_pubkey: operator's pubkey (hex) */
+    char self[65];              /* relay_self: the relay's own pubkey (hex) */
+    char contact[256];          /* relay_contact */
+    char icon[512];             /* relay_icon */
+    char banner[512];           /* relay_banner */
+    char software[256];         /* relay_software */
+    char version[64];           /* relay_version */
+    char terms_of_service[512]; /* terms_of_service */
+    char privacy_policy[512];   /* privacy_policy */
+    char posting_policy[512];   /* posting_policy */
+    char payments_url[512];     /* payments_url */
+    char relay_countries[256];  /* relay_countries: e.g. "US,CA" */
+    char language_tags[256];    /* language_tags: e.g. "en,es" */
+    char tags[256];             /* relay_tags: e.g. "sfw-only" */
+    int min_pow_difficulty;     /* min_pow_difficulty: NIP-13 bits, 0 = off */
+    int created_at_lower_limit; /* created_at_lower_limit: max age (s), 0 = off */
+    int created_at_upper_limit; /* created_at_upper_limit: max future (s), 0 = off */
+} ng_relay_info_t;
+
+#define NG_SOFTWARE_URL "https://github.com/Named666/nostrogotho"
+#define NG_VERSION      "0.2.0"
+
 /* The process-wide limits: compiled-in defaults until ng_limits_apply()
  * runs at startup (before any thread starts); read-only afterwards. */
 extern ng_limits_t ng_limits;
@@ -60,7 +88,13 @@ typedef struct {
     int writer_queue_max;       /* writer_queue_max: EVENTs waiting for the writer */
     int conn_pending_max;       /* conn_pending_max: queued messages per connection */
     ng_limits_t limits;         /* protocol limits (see ng_limits_t) */
+    ng_relay_info_t info;       /* identity and policy (see ng_relay_info_t) */
 } ng_config_t;
+
+/* Process-wide relay info, like ng_limits: set once at startup. */
+extern ng_relay_info_t ng_relay_info;
+void ng_relay_info_defaults(ng_relay_info_t *info);
+void ng_relay_info_apply(const ng_relay_info_t *info);
 
 /* Fill *cfg with the defaults (db_sync full, 4M / 1G / 16M budgets,
  * writer queue 65536, 1024 pending per connection, everything else auto). */

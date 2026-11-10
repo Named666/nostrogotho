@@ -506,6 +506,10 @@ static void json_builder_key(json_builder_t *builder, const char *key) {
     json_builder_byte(builder, ':');
 }
 
+void json_builder_object_key(json_builder_t *builder, const char *key) {
+    json_builder_key(builder, key);
+}
+
 void json_builder_append_string(json_builder_t *builder, const char *value) {
     json_builder_add_comma(builder);
     json_builder_quoted(builder, value);

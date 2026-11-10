@@ -1,3 +1,4 @@
+#include <strings.h>
 #include "json_lite.h"
 #include "relay_conn.h"
 #include <stdio.h>
@@ -46,7 +47,8 @@ bool nip_event_has_relay_tag(const event_t *event, const char *relay) {
         bool found = false;
         if (jl_unescape(v, b, &vl)) {
             while (vl && b[vl - 1] == '/') vl--;
-            found = vl == relay_length && memcmp(b, relay, relay_length) == 0;
+            if (relay_length) found = vl == relay_length && strncasecmp(b, relay, relay_length) == 0;
+            else found = (vl > 5 && strncasecmp(b, "ws://", 5) == 0) || (vl > 6 && strncasecmp(b, "wss://", 6) == 0);
         }
         if (b != sb) free(b);
         if (found) return true;

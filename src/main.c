@@ -23,8 +23,9 @@ static bool parse_int(const char *text, int *value) {
 
 /* Runtime config (config.h), loaded before opening any database; the
  * result is handed to storage (durability) and the server (everything else). */
+static ng_config_t cfg;
+
 static bool load_config(const char *path, bool required) {
-    ng_config_t cfg;
     ng_config_error_t err;
     ng_config_defaults(&cfg);
     ng_status_t st = ng_config_load(&cfg, path, required, &err);
@@ -35,10 +36,24 @@ static bool load_config(const char *path, bool required) {
                 ng_status_str(st));
         return false;
     }
+    return true;
+}
+
+/* Environment / command-line values override the config file. */
+static void apply_config(const char *service_url, int min_pow, int lower_limit, int upper_limit) {
+    ng_relay_info_t *info = &cfg.info;
+    if (service_url) snprintf(info->relay_url, sizeof(info->relay_url), "%s", service_url);
+    if (min_pow >= 0) info->min_pow_difficulty = min_pow;
+    if (lower_limit >= 0) info->created_at_lower_limit = lower_limit;
+    if (upper_limit >= 0) info->created_at_upper_limit = upper_limit;
     storage_set_sync_full(cfg.db_sync == NG_DB_SYNC_FULL);
     ng_limits_apply(&cfg.limits);
+    ng_relay_info_apply(info);
     server_set_config(&cfg);
-    return true;
+    if (!info->relay_url[0])
+        fprintf(stderr, "warning: relay_url is not set (nostrogotho.conf or SERVICE_URL): NIP-42 AUTH accepts any "
+                        "ws(s):// relay tag (the per-connection challenge still binds it to this relay) and NIP-62 "
+                        "honors only ALL_RELAYS requests\n");
 }
 
 static void sigint_handler(int sig) {
@@ -76,14 +91,11 @@ int main(int argc, const char **argv) {
     const char *config_path = "nostrogotho.conf";
     bool config_required = false;
     int port = 7447;
-    int min_pow = 0;
-    int lower_limit = 0;
-    int upper_limit = 900;
+    int min_pow = -1, lower_limit = -1, upper_limit = -1;     /* -1: from the config */
 
-    if (!parse_int(getenv("MIN_POW_DIFFICULTY") ? getenv("MIN_POW_DIFFICULTY") : "0", &min_pow) ||
-        !parse_int(getenv("CREATED_AT_LOWER_LIMIT") ? getenv("CREATED_AT_LOWER_LIMIT") : "0", &lower_limit) ||
-        !parse_int(getenv("CREATED_AT_UPPER_LIMIT") ? getenv("CREATED_AT_UPPER_LIMIT") : "900", &upper_limit) ||
-        min_pow < 0 || lower_limit < 0 || upper_limit < 0) {
+    if ((getenv("MIN_POW_DIFFICULTY") && (!parse_int(getenv("MIN_POW_DIFFICULTY"), &min_pow) || min_pow < 0)) ||
+        (getenv("CREATED_AT_LOWER_LIMIT") && (!parse_int(getenv("CREATED_AT_LOWER_LIMIT"), &lower_limit) || lower_limit < 0)) ||
+        (getenv("CREATED_AT_UPPER_LIMIT") && (!parse_int(getenv("CREATED_AT_UPPER_LIMIT"), &upper_limit) || upper_limit < 0))) {
         fprintf(stderr, "Invalid relay security-limit environment variable\n");
         return 1;
     }
@@ -129,13 +141,14 @@ int main(int argc, const char **argv) {
     }
 
     if (!load_config(config_path, config_required)) return 1;
+    apply_config(service_url && *service_url ? service_url : NULL, min_pow, lower_limit, upper_limit);
 
     if (!init_storage(db_path)) {
         return 1;
     }
 
-    server_configure(&storage_ctx, service_url ? service_url : "", min_pow,
-                     (time_t) lower_limit, (time_t) upper_limit);
+    server_configure(&storage_ctx, ng_relay_info.relay_url, ng_relay_info.min_pow_difficulty,
+                     (time_t) ng_relay_info.created_at_lower_limit, (time_t) ng_relay_info.created_at_upper_limit);
     signal(SIGINT, sigint_handler);
     const bool result = server_run(port);
     cleanup();
