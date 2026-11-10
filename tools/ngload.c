@@ -178,10 +178,12 @@ static void send_frame(conn_t *c, int op, const uint8_t *p, size_t n) {
 }
 
 static uint8_t *echo_payload;
+/* CLI tool: allocation failure is fatal (exit 1 with a message). */
+static void *need(void *p) { if (!p) { fputs("ngload: out of memory\n", stderr); exit(1); } return p; }
 static void recycle(thr_t *t, conn_t *c);
 static NG_THREAD_LOCAL uint8_t *tl_echo;
 static void send_echo(conn_t *c) {
-    if (!tl_echo) { tl_echo = malloc((size_t) msgsize + 8); memcpy(tl_echo, echo_payload, (size_t) msgsize); }
+    if (!tl_echo) { tl_echo = need(malloc((size_t) msgsize + 8)); memcpy(tl_echo, echo_payload, (size_t) msgsize); }
     if (msgsize >= 8) { uint64_t ts = now_ns(); memcpy(tl_echo, &ts, 8); }   /* latency stamp */
     send_frame(c, 2, tl_echo, (size_t) msgsize); c->inflight++;
 }
@@ -441,13 +443,13 @@ static double self_cpu_s(void) { struct rusage u; getrusage(RUSAGE_SELF, &u); re
 static void load_events(void) {
     FILE *f = fopen(evfile, "r");
     if (!f) { perror(evfile); exit(1); }
-    size_t cap = 1024; events = malloc(cap * sizeof(char *));
+    size_t cap = 1024; events = need(calloc(cap, sizeof(char *)));
     char *line = NULL; size_t lc = 0; ssize_t n;
     while ((n = getline(&line, &lc, f)) > 0) {
         while (n && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = 0;
         if (!n) continue;
-        if (nevents == cap) { cap *= 2; events = realloc(events, cap * sizeof(char *)); }
-        events[nevents++] = strndup(line, (size_t) n);
+        if (nevents == cap) { cap *= 2; char **ne = need(realloc(events, cap * sizeof(char *))); events = ne; }
+        events[nevents++] = need(strndup(line, (size_t) n));
     }
     free(line); fclose(f);
     ev_sent_ns = calloc(nevents, sizeof(uint64_t));
@@ -482,13 +484,13 @@ int main(int argc, char **argv) {
     struct rlimit rl; getrlimit(RLIMIT_NOFILE, &rl); rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl);
     if ((long) rl.rlim_cur < nconns + 64) fprintf(stderr, "warning: RLIMIT_NOFILE %ld < conns\n", (long) rl.rlim_cur);
     dst.sin_family = AF_INET; dst.sin_port = htons((uint16_t) port); inet_pton(AF_INET, host, &dst.sin_addr);
-    echo_payload = malloc((size_t) msgsize + 1); memset(echo_payload, 'e', (size_t) msgsize);
+    echo_payload = need(malloc((size_t) msgsize + 1)); memset(echo_payload, 'e', (size_t) msgsize);
     if (nthreads > nconns) nthreads = nconns;
 
-    T = calloc((size_t) nthreads, sizeof(thr_t));
-    conn_t *all = calloc((size_t) nconns, sizeof(conn_t));
+    T = need(calloc((size_t) nthreads, sizeof(thr_t)));
+    conn_t *all = need(calloc((size_t) nconns, sizeof(conn_t)));
     /* round-robin conns over threads; publishers are the first npubs conns */
-    int *cnt = calloc((size_t) nthreads, sizeof(int));
+    int *cnt = need(calloc((size_t) nthreads, sizeof(int)));
     for (int i = 0; i < nconns; i++) cnt[i % nthreads]++;
     conn_t *p = all;
     for (int k = 0; k < nthreads; k++) { T[k].idx = k; T[k].c = p; T[k].n = cnt[k]; p += cnt[k]; }
@@ -541,7 +543,7 @@ int main(int argc, char **argv) {
     for (int k = 0; k < nthreads; k++) pthread_join(T[k].th, NULL);
 
     uint64_t msgs = 0, bytes = 0, oks = 0, fails = 0;
-    hist_t *h = calloc(1, sizeof(hist_t));
+    hist_t *h = need(calloc(1, sizeof(hist_t)));
     for (int k = 0; k < nthreads; k++) {
         msgs += T[k].msgs; bytes += T[k].bytes; oks += T[k].oks; fails += T[k].fails;
         for (int i = 0; i < HB; i++) h->b[i] += T[k].hist.b[i];
