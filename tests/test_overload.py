@@ -181,7 +181,7 @@ while True:
     m = probe.recv(5)
     if m is None or m[0] != "EVENT": break
     n += 1
-check("A relay still serves REQ, reply capped by the byte budget", m and m[0] == "EOSE" and 0 < n < 500 and n * 8000 <= 512 * 1024, f"{n} stored events then {m and m[0]}")
+check("A relay still serves REQ, reply capped by the byte budget", m and m[0] == "EOSE" and 0 < n < 500 and n * 8000 <= 512 * 1024 and "more" in m[2], f"{n} stored events then {m and m[0]}")
 alive, st = r.stop()
 check("A relay alive, closed_conn_limit counted", alive and st.get("closed_conn_limit", 0) >= 1, str(st))
 

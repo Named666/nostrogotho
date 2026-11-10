@@ -624,6 +624,38 @@ def nip43():
 
 
 @section
+def nip67():
+    """NIP-67 EOSE completeness hints (step 13)."""
+    r = Relay("default_limit = 2\nmax_limit = 4\n"); w = WS(r.port)
+    _, d = nip11_doc(r)
+    check("NIP-11 declares 67", 67 in d.get("supported_nips", []), d.get("supported_nips"))
+    a = Key()
+    evs = [a.ev("n%d" % i, 1, ca=1700000000 + i) for i in range(4)]
+    for e in evs: w.publish(e)
+    got, end = w.req("all", {"authors": [a.pk], "kinds": [1], "limit": 4})
+    check("limit == stored count -> [\"finish\"]", len(got) == 4 and end[2:] == [["finish"]], (len(got), end))
+    got, end = w.req("cut", {"authors": [a.pk], "kinds": [1], "limit": 3})
+    check("limit below stored count -> [\"more\"]", len(got) == 3 and end[2:] == [["more"]], (len(got), end))
+    got, end = w.req("dflt", {"authors": [a.pk], "kinds": [1]})
+    check("default_limit cap -> [\"more\"]", len(got) == 2 and "more" in end[2], (len(got), end))
+    w.publish(a.ev("n4", 1, ca=1700000004))
+    got, end = w.req("cap", {"authors": [a.pk], "kinds": [1], "limit": 50})
+    check("max_limit cap below the client limit -> [\"more\"]", len(got) == 4 and "more" in end[2], (len(got), end))
+    got, end = w.req("ids", {"ids": [evs[0]["id"]]})
+    check("ids filter -> \"finish\"", len(got) == 1 and "finish" in end[2] and "more" not in end[2], end)
+    got, end = w.req("two", {"ids": [evs[0]["id"]]}, {"authors": [a.pk], "kinds": [1], "limit": 1})
+    check("any filter truncated -> [\"more\"]", "more" in end[2] and "finish" not in end[2], end)
+    got, end = w.req("live", {"authors": [a.pk], "kinds": [1], "limit": 0})
+    check("limit:0 (live only) -> neither hint", end[2] == [], end)
+    got, end = w.req("gw", {"limit": 1, "kinds": [1]})
+    check("no AUTH-gated data -> no \"auth\"", "auth" not in end[2], end)
+    got, end = w.req("kl", {"limit": 10})
+    check("kind-less REQ before AUTH (gift wraps withheld) -> \"auth\", challenge sent earlier",
+          "auth" in end[2] and w.challenge is not None, (end, w.challenge))
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

@@ -93,6 +93,7 @@ static NG_THREAD_LOCAL relay_conn_t *query_connection;
 static NG_THREAD_LOCAL filter_t *query_filters;
 static NG_THREAD_LOCAL size_t query_filters_count;
 static NG_THREAD_LOCAL size_t query_bytes;
+static NG_THREAD_LOCAL bool query_bytes_dropped;   /* NIP-67: budget cut the reply */
 static NG_THREAD_LOCAL bool query_render_failed;   /* a stored row could not be rendered */
 static size_t query_bytes_max;    /* 0 = unlimited */
 void relay_core_set_query_bytes_max(size_t n) { query_bytes_max = n; }
@@ -420,7 +421,7 @@ static void query_sender(const char *json, const event_t *event) {
         /* Byte budget per stored-event reply: a REQ may not queue more than
          * the connection's output budget allows in one burst; the rest is
          * dropped and the reply still ends with EOSE (clients paginate). */
-        if (query_bytes_max && query_bytes + n > query_bytes_max) return;
+        if (query_bytes_max && query_bytes + n > query_bytes_max) { query_bytes_dropped = true; return; }
         query_bytes += n;
         relay_conn_send(query_connection, json, n);
     }
@@ -432,8 +433,10 @@ static void query_sender(const char *json, const event_t *event) {
 static bool query_events(relay_conn_t *connection, const char *sub,
                          filter_t *filters, size_t count, bool do_count) {
     int total_count = 0;
+    bool more = false;
     query_connection = connection;
     query_bytes = 0;
+    query_bytes_dropped = false;
     query_render_failed = false;
     query_filters = filters;
     query_filters_count = count;
@@ -445,7 +448,7 @@ static bool query_events(relay_conn_t *connection, const char *sub,
         st = storage_ctx->count_hll(&filters[0], hll_offset, &total_count, hll);
         have_hll = st == NG_OK;
     } else {
-        st = storage_ctx->send_records(query_sender, sub, filters, count, do_count, &total_count);
+        st = storage_ctx->send_records(query_sender, sub, filters, count, do_count, &total_count, &more);
     }
     query_connection = NULL;
     query_filters = NULL;
@@ -476,14 +479,27 @@ static bool query_events(relay_conn_t *connection, const char *sub,
             json_builder_free(&builder);
         }
     } else {
-        /* Hook kept for its side effect (NIP-17 sends an AUTH challenge). */
+        /* NIP-67 completeness hints. "auth": a plugin sent an AUTH
+         * challenge (before this EOSE) behind which more may be readable.
+         * "more": a filter hit its effective limit (storage saw a row past
+         * it) or the reply byte budget dropped rows. "finish": neither, and
+         * no filter asked for limit 0 (live only). */
+        bool auth = false;
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next)
-            if (plugin->eose_auth_hint && plugin->eose_auth_hint(connection, filters, count, plugin->ctx)) break;
+            if (plugin->eose_auth_hint && plugin->eose_auth_hint(connection, filters, count, plugin->ctx)) { auth = true; break; }
+        bool live_only = false;
+        for (size_t i = 0; i < count; i++) if (filters[i].limit_set && filters[i].limit == 0) live_only = true;
+        more = more || query_bytes_dropped;
         {
             json_builder_t builder;
             json_builder_start(&builder);
             json_builder_append_string(&builder, "EOSE");
             json_builder_append_string(&builder, sub);  /* NIP-01: ["EOSE",<sub_id>] */
+            json_builder_start_array(&builder);
+            if (auth) json_builder_append_string(&builder, "auth");
+            if (more) json_builder_append_string(&builder, "more");
+            else if (!live_only && !query_render_failed) json_builder_append_string(&builder, "finish");
+            json_builder_end_array(&builder);
             const char *j = json_builder_finish(&builder);
             response = j ? string_dup(j) : NULL;
             json_builder_free(&builder);

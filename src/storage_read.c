@@ -91,10 +91,12 @@ event_t *ngdb_get_event_by_id(const char *id) {
  * each filter compiles to one statement. */
 
 /* Stream one compiled query's rows to sender as ["EVENT", sub, {...}]. */
-static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub, int limit) {
+/* The statement is bound with LIMIT limit+1: a row past the limit only
+ * proves there are more (NIP-67) and is not sent. */
+static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub, int limit, bool *more) {
     int rc, fetched = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (++fetched > limit) return true;
+        if (++fetched > limit) { *more = true; return true; }
         event_t event = {0};
         snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
         snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
@@ -128,8 +130,10 @@ static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, cons
  */
 ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
                               const filter_t *filters, size_t filters_count,
-                              bool do_count, int *out_count) {
+                              bool do_count, int *out_count, bool *out_more) {
     if (!ngdb_conn || !sender) return NG_E_INVALID;
+    bool more = false;
+    if (out_more) *out_more = false;
     if (do_count && out_count) *out_count = 0;
     const size_t max_items = (size_t) ng_limits.max_filter_items;
     if (filters_count > (size_t) ng_limits.max_filters) return NG_E_TOOBIG;
@@ -149,7 +153,7 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
                   : filter->limit < ng_limits.max_limit ? filter->limit : ng_limits.max_limit;
 
         sq_query_t q = {0};
-        ng_status_t st = sq_build(&q, filter, do_count, limit);
+        ng_status_t st = sq_build(&q, filter, do_count, limit + 1);
         if (st != NG_OK) {
             sq_free(&q);
             return st;                                  /* TOOBIG: over SQ_MAX_* */
@@ -174,12 +178,13 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
             if (ok) total_count += sqlite3_column_int(stmt, 0);
             else fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
         } else {
-            ok = stream_rows(stmt, sender, sub, limit);
+            ok = stream_rows(stmt, sender, sub, limit, &more);
         }
         sqlite3_finalize(stmt);
         if (!ok) return NG_E_IO;
     }
     if (do_count && out_count) *out_count = total_count;
+    if (out_more) *out_more = more;
     return NG_OK;
 }
 

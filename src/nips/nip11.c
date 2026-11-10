@@ -26,7 +26,7 @@ static char *information_document;
  *   33 addressable (via NIP-01), 40 expiration, 42 auth, 45 COUNT,
  *   29 groups (only with relay_secret_key_file), 43 (nip43 = 1 and a key), 50 search (unless search = 0), 62 vanish, 70 protected events
  *   (via 42). */
-static const int supported_nips[] = {1, 9, 11, 13, 16, 17, 29, 33, 40, 42, 43, 45, 50, 62, 70};
+static const int supported_nips[] = {1, 9, 11, 13, 16, 17, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70};
 #define SUPPORTED_NIPS_COUNT (sizeof(supported_nips) / sizeof(supported_nips[0]))
 
 static void key_str(json_builder_t *b, const char *key, const char *value) {

@@ -254,6 +254,9 @@ typedef struct {
      *              COUNT response.
      *   out_count - when do_count is true, receives the aggregated count.
      *               May be NULL when do_count is false.
+     *   out_more  - streaming only (may be NULL): set true when a filter
+     *               matched more stored events than its effective limit
+     *               (NIP-67 "more"); false when every filter was exhausted.
      * 
      * Returns: NG_OK; NG_E_TOOBIG when the request exceeds the complexity
      * limits (ng_limits, SQ_MAX_*); NG_E_IO on a database error. Rows of
@@ -267,7 +270,7 @@ typedef struct {
      */
     ng_status_t (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
-                        bool do_count, int *out_count);
+                        bool do_count, int *out_count, bool *out_more);
 
     /* NIP-45 HyperLogLog COUNT of one filter: *out_count events and the
      * 256 registers over their pubkeys with the given offset (8..23).

@@ -82,19 +82,17 @@ static bool nip17_plugin_accept_query(relay_conn_t *connection, filter_t *filter
     return true;
 }
 
-/* Before EOSE: when an unauthenticated client subscribes to gift-wrap kinds,
- * more results may exist behind NIP-42 auth. Send a fresh AUTH challenge and
- * ask the server to flag the EOSE with the "auth" hint. */
+/* Before EOSE (NIP-67 "auth" hint): explicit gift-wrap kinds were already
+ * refused by accept_query, so this is a kind-less filter from an
+ * unauthenticated client, from which gift wraps were withheld (can_deliver).
+ * The AUTH challenge NIP-42 sent on connect precedes this EOSE. */
 static bool nip17_plugin_eose_auth_hint(relay_conn_t *connection,
                                         const filter_t *filters, size_t count,
                                         void *ctx) {
     (void) ctx;
     if (nip42_authenticated_pubkey(connection)) return false;
     for (size_t i = 0; i < count; i++) {
-        if (nip17_filter_targets_gift_wraps(&filters[i])) {
-            nip42_send_challenge(connection);
-            return true;
-        }
+        if (filters[i].kinds_count == 0) return true;
     }
     return false;
 }
