@@ -341,6 +341,11 @@ static void outbox_flush_and_unref(void) {
     for (size_t i = 0; i < tl_unref_n; i++) relay_conn_unref(tl_unref[i]);
     tl_unref_n = 0;
 }
+/* Thread exit: flush, then release the deferred-unref buffer itself. */
+static void outbox_thread_done(void) {
+    outbox_flush_and_unref();
+    free(tl_unref); tl_unref = NULL; tl_unref_cap = 0;
+}
 static const relay_backend_ops_t ng_ops = { ngb_send, ngb_close, ngb_destroy, ngb_send_event };
 
 /* -------------------------------------------------------- worker queue --- */
@@ -613,7 +618,7 @@ static void *worker_thread(void *arg) {
         outbox_flush_and_unref();
         crypto_preverified_clear();
     }
-    outbox_flush_and_unref();
+    outbox_thread_done();
     crypto_thread_cleanup();
     preverify_free();
     if (st->thread_close) st->thread_close();
@@ -786,7 +791,7 @@ static void *writer_thread(void *arg) {
         outbox_flush_and_unref();
         stat_us[0] += t1 - t0; stat_us[1] += t2 - t1; stat_us[2] += now_us() - t2;
     }
-    outbox_flush_and_unref();
+    outbox_thread_done();
     if (getenv("NG_WRITER_STATS")) fprintf(stderr, "writer: dispatch %.2fs commit %.2fs post %.2fs\n", stat_us[0]/1e6, stat_us[1]/1e6, stat_us[2]/1e6);
     if (getenv("NG_WRITER_STATS")) fprintf(stderr, "writer: %llu events in %llu batches (avg %.1f)\n",
         stat_events, stat_batches, stat_batches ? (double) stat_events / (double) stat_batches : 0.0);

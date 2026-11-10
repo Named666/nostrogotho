@@ -63,6 +63,7 @@ struct ngws_loop {
     struct us_loop_t *loop;
     struct us_socket_context_t *ctx;
     struct us_listen_socket_t *ls;
+    bool ctx_closed;                    /* loop_stop_listening ran */
     pthread_t th;
     pthread_mutex_t mu;
     ngws_task_t *head, *tail;
@@ -899,6 +900,14 @@ static void loop_post(struct us_loop_t *ul) {
     if (l->n_nodes || l->arena_cur != l->arena || (l->arena && l->arena->used)) arena_reset(l);
 }
 
+/* Close the listener and every socket; the loop then runs out of polls. */
+static void loop_stop_listening(ngws_loop_t *l) {
+    if (!l->ctx || l->ctx_closed) return;
+    if (l->ls) { us_listen_socket_close(0, l->ls); l->ls = NULL; }
+    us_socket_context_close(0, l->ctx);
+    l->ctx_closed = true;
+}
+
 static void wakeup_cb(struct us_loop_t *ul) {
     ngws_loop_t *l = *(ngws_loop_t **) us_loop_ext(ul);
     atomic_store(&l->wake_pending, false);
@@ -907,10 +916,7 @@ static void wakeup_cb(struct us_loop_t *ul) {
     l->head = l->tail = NULL;
     pthread_mutex_unlock(&l->mu);
     while (t) { ngws_task_t *n = t->next; t->run(t, l); t = n; }
-    if (atomic_load(&l->srv->stopping) && l->ctx) {
-        if (l->ls) { us_listen_socket_close(0, l->ls); l->ls = NULL; }
-        us_socket_context_close(0, l->ctx);
-    }
+    if (atomic_load(&l->srv->stopping)) loop_stop_listening(l);
 }
 
 void ngws_loop_post(ngws_loop_t *l, ngws_task_t *t) {
@@ -940,6 +946,11 @@ static void *loop_thread(void *arg) {
     pthread_setname_np(pthread_self(), name);
 #endif
     if (l->srv->cfg.on_loop_start) l->srv->cfg.on_loop_start(l);
+    /* A stop that arrived while later loops were still being created (the
+     * first listeners already accept) skipped them in ngws_server_stop:
+     * stopping was stored before it read the not-yet-set loop pointer, so it
+     * is visible here. Without this check those loops never exited. */
+    if (atomic_load(&l->srv->stopping)) loop_stop_listening(l);
     us_loop_run(l->loop);
     if (l->srv->cfg.on_loop_stop) l->srv->cfg.on_loop_stop(l);
     return NULL;
