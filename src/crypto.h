@@ -212,4 +212,14 @@ bool check_delegation(const event_t *ev, const char *delegator_pubkey,
  */
 int count_leading_zero_bits(const char *hex);
 
+/* Batch Schnorr pre-verification (thread-local, see crypto.c). Returns how
+ * many triples were proven valid and remembered; signature_verify() on this
+ * thread then accepts exactly those bytes without curve work until
+ * crypto_preverified_clear(). Unproven triples are left to the normal path. */
+size_t crypto_batch_verify(const uint8_t *const *sig64, const uint8_t *const *msg32,
+                           const uint8_t *const *pk32, size_t n);
+bool crypto_preverified(const uint8_t sig[64], const uint8_t pk[32], const uint8_t msg[32]);
+void crypto_preverified_clear(void);
+void crypto_thread_cleanup(void);
+
 #endif /* CRYPTO_H_ */

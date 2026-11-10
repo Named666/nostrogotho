@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include <stdint.h>
+#include "crypto.h"
 #include "ngws/ngws.h"
 #include "nips/nip_plugin.h"
 #include "dedupe.h"
@@ -154,13 +155,14 @@ static ngws_server_t *srv;
 static int n_loops;
 static worker_t workers[RELAY_MAX_SHARDS];
 static int n_workers;
+static bool batch_verify = true;        /* NG_BATCH_VERIFY=0 disables (A/B benchmarks) */
 static atomic_ullong next_conn_id = 1;
 static atomic_bool stopping;
 static char *info_doc;
 static size_t info_doc_len;
 static atomic_llong stat_open_conns;
 static atomic_size_t out_task_bytes;    /* posted outbox bytes not yet run by a loop */
-static atomic_ullong stat_shed_loop, stat_shed_core, stat_shed_writer;
+static atomic_ullong stat_shed_loop, stat_shed_core, stat_shed_writer, stat_preverified;
 static atomic_int writer_depth;          /* EVENTs queued for the writer */
 
 static pthread_t writer_th;
@@ -463,7 +465,7 @@ static void shed_inline(ngws_socket_t *ws, const char *data, size_t len) {
 
 /* Worker-side admission (relay_core hook), checked before any expensive
  * work: signature verification for EVENT, the query for REQ/COUNT. */
-static bool core_admit(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
+static bool admit_quiet(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
     ng_conn_t *c = (ng_conn_t *) rc;
     size_t total = atomic_load_explicit(&out_task_bytes, memory_order_relaxed) + (srv ? ngws_server_backlog_bytes(srv) : 0);
     bool ok = total < opt.total_out_max / 10 * 9;   /* 90%: shedding (75%, ngws) did not keep up */
@@ -473,6 +475,10 @@ static bool core_admit(relay_conn_t *rc, relay_admit_kind_t kind, const char **w
     if (ok && kind == RELAY_ADMIT_EVENT && atomic_load_explicit(&writer_depth, memory_order_relaxed) >= opt.writer_queue_max) {
         ok = false; *why = overload_msg;
     }
+    return ok;
+}
+static bool core_admit(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
+    bool ok = admit_quiet(rc, kind, why);
     if (!ok) atomic_fetch_add_explicit(&stat_shed_core, 1, memory_order_relaxed);
     return ok;
 }
@@ -514,6 +520,51 @@ static void on_close(ngws_socket_t *ws, int code) {
 }
 
 /* -------------------------------------------------------------- workers -- */
+/* Batch signature pre-verification for one job list (worker thread).
+ * Pipelined publishers and many connections per shard deliver several EVENTs
+ * per wakeup; their (sig, pubkey, claimed id) triples are verified together
+ * (crypto_batch_verify, shared multi-scalar multiplication). The normal
+ * per-message path then runs unchanged: it recomputes the id from the
+ * serialization and calls signature_verify, which skips curve work only for
+ * byte-identical triples proven here. Messages the admission check would
+ * reject are skipped, so overload does not buy extra crypto. */
+#define PREVERIFY_MAX 1024
+static bool hex_field(jstr_t v, size_t nbytes, uint8_t *out) {
+    size_t got;
+    return v.len == 2 * nbytes + 2 && v.buf[0] == '"' && hex_to_bytes(v.buf + 1, 2 * nbytes, out, nbytes, &got) && got == nbytes;
+}
+typedef struct { uint8_t sig[64], pk[32], id[32]; } pv_item_t;
+static __thread pv_item_t *pv;
+static __thread const uint8_t **ps, **pm, **pp;
+static void preverify_free(void) { free(pv); free(ps); free(pm); free(pp); pv = NULL; ps = pm = pp = NULL; }
+static void preverify_events(job_t *j) {
+    size_t n = 0;
+    for (; j && n < PREVERIFY_MAX; j = j->next) {
+        if (j->type != J_MSG || j->len < 16 || atomic_load_explicit(&j->conn->base.closed, memory_order_relaxed)) continue;
+        const char *d = j->payload; size_t len = j->len;
+        while (len && (*d == ' ' || *d == '\t' || *d == '\r' || *d == '\n')) { d++; len--; }
+        if (len < 10 || memcmp(d, "[\"EVENT\"", 8) != 0) continue;
+        jstr_t arr = jl_str_n(d, len), k, v0, ev;
+        size_t o = jl_next(arr, 0, &k, &v0);
+        if (!o || !jl_next(arr, o, &k, &ev) || ev.buf[0] != '{') continue;
+        if (!pv) {
+            pv = malloc(PREVERIFY_MAX * sizeof(*pv));
+            ps = malloc(PREVERIFY_MAX * sizeof(*ps)); pm = malloc(PREVERIFY_MAX * sizeof(*pm)); pp = malloc(PREVERIFY_MAX * sizeof(*pp));
+            if (!pv || !ps || !pm || !pp) { preverify_free(); return; }   /* all or nothing; plain verify still runs */
+        }
+        int have = 0; jstr_t kk, vv; size_t q = 0;
+        while (have != 7 && (q = jl_next(ev, q, &kk, &vv)) != 0) {
+            if (kk.len == 4 && memcmp(kk.buf, "\"id\"", 4) == 0) have |= hex_field(vv, 32, pv[n].id) ? 1 : 0;
+            else if (kk.len == 8 && memcmp(kk.buf, "\"pubkey\"", 8) == 0) have |= hex_field(vv, 32, pv[n].pk) ? 2 : 0;
+            else if (kk.len == 5 && memcmp(kk.buf, "\"sig\"", 5) == 0) have |= hex_field(vv, 64, pv[n].sig) ? 4 : 0;
+        }
+        if (have != 7) continue;
+        const char *why;
+        if (!admit_quiet(&j->conn->base, RELAY_ADMIT_EVENT, &why)) continue;
+        ps[n] = pv[n].sig; pm[n] = pv[n].id; pp[n] = pv[n].pk; n++;
+    }
+    if (n >= 2) atomic_fetch_add_explicit(&stat_preverified, crypto_batch_verify(ps, pm, pp, n), memory_order_relaxed);
+}
 
 static void bset_unref(bset_t *s) {
     if (atomic_fetch_sub(&s->refs, 1) == 1) {
@@ -537,6 +588,7 @@ static void *worker_thread(void *arg) {
         wk->head = wk->tail = NULL;
         pthread_mutex_unlock(&wk->mu);
         if (!j && atomic_load(&stopping)) break;
+        if (batch_verify) preverify_events(j);
         while (j) {
             job_t *next = j->next;
             relay_conn_t *rc = j->conn ? &j->conn->base : NULL;
@@ -559,8 +611,11 @@ static void *worker_thread(void *arg) {
             j = next;
         }
         outbox_flush_and_unref();
+        crypto_preverified_clear();
     }
     outbox_flush_and_unref();
+    crypto_thread_cleanup();
+    preverify_free();
     if (st->thread_close) st->thread_close();
     return NULL;
 }
@@ -818,6 +873,7 @@ bool server_run(int port) {
     relay_core_set_publisher(publish_to_writer);
     relay_core_set_admission(core_admit);
     relay_core_set_query_bytes_max(opt.conn_out_max / 2);
+    { const char *bv = getenv("NG_BATCH_VERIFY"); batch_verify = !(bv && strcmp(bv, "0") == 0); }
 
     for (int i = 0; i < n_workers; i++) {
         workers[i].idx = i;
@@ -858,9 +914,9 @@ bool server_run(int port) {
     if (srv) {
         ngws_stats_t ns; ngws_server_stats(srv, &ns);
         fprintf(stderr, "overload: shed_inline=%llu shed_admission=%llu shed_writer_full=%llu "
-                "closed_conn_limit=%llu closed_total_limit=%llu\n",
+                "closed_conn_limit=%llu closed_total_limit=%llu batch_verified=%llu\n",
                 (unsigned long long) atomic_load(&stat_shed_loop), (unsigned long long) atomic_load(&stat_shed_core),
-                (unsigned long long) atomic_load(&stat_shed_writer), ns.closed_conn_limit, ns.closed_total_limit);
+                (unsigned long long) atomic_load(&stat_shed_writer), ns.closed_conn_limit, ns.closed_total_limit, (unsigned long long) atomic_load(&stat_preverified));
     }
     relay_core_shutdown();
     return ok;

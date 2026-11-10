@@ -11,6 +11,7 @@
 #endif
 #include <secp256k1.h>
 #include <secp256k1_schnorrsig.h>
+#include "schnorr_batch.h"
 
 #ifdef _WIN32
 #ifndef STATUS_SUCCESS
@@ -181,6 +182,81 @@ void crypto_deinit(void) {
         secp256k1_context_destroy(verify_ctx);
         verify_ctx = NULL;
     }
+}
+
+/* ============================================================================
+ * Batch pre-verification (per thread)
+ *
+ * crypto_batch_verify() checks many (sig, key, msg) triples with one
+ * multi-scalar multiplication (schnorr_batch.c). Triples proven valid are
+ * remembered in a small thread-local table until crypto_preverified_clear();
+ * signature_verify() consults it first, so the normal per-event validation
+ * path (id hash, then signature) stays the single source of truth and only
+ * skips curve work already done for exactly these bytes. A failed batch is
+ * split in halves (down to 4) so a few bad signatures do not make the whole
+ * batch fall back to individual checks.
+ * ============================================================================ */
+#define PV_SLOTS 4096                         /* power of two, > 2 * max batch */
+#define PV_MAX_BATCH 256
+typedef struct { uint8_t sig[64], pk[32], msg[32]; unsigned gen; } pv_slot_t;
+static __thread pv_slot_t *pv_tab;
+static __thread unsigned pv_gen = 1, pv_count;
+static __thread ng_batch_scratch_t *pv_scratch;
+
+static size_t pv_hash(const uint8_t *sig) { uint64_t h; memcpy(&h, sig + 32, 8); return (size_t) (h * 0x9E3779B97F4A7C15ull >> 52) & (PV_SLOTS - 1); }
+
+bool crypto_preverified(const uint8_t sig[64], const uint8_t pk[32], const uint8_t msg[32]) {
+    if (!pv_tab || !pv_count) return false;
+    for (size_t i = pv_hash(sig), k = 0; k < PV_SLOTS; i = (i + 1) & (PV_SLOTS - 1), k++) {
+        pv_slot_t *e = &pv_tab[i];
+        if (e->gen != pv_gen) return false;
+        if (memcmp(e->sig, sig, 64) == 0 && memcmp(e->pk, pk, 32) == 0 && memcmp(e->msg, msg, 32) == 0) return true;
+    }
+    return false;
+}
+
+static void pv_add(const uint8_t *sig, const uint8_t *pk, const uint8_t *msg) {
+    if (pv_count >= PV_SLOTS / 2) return;     /* keep probing short; caller verifies normally */
+    for (size_t i = pv_hash(sig);; i = (i + 1) & (PV_SLOTS - 1)) {
+        pv_slot_t *e = &pv_tab[i];
+        if (e->gen != pv_gen) { memcpy(e->sig, sig, 64); memcpy(e->pk, pk, 32); memcpy(e->msg, msg, 32); e->gen = pv_gen; pv_count++; return; }
+    }
+}
+
+void crypto_preverified_clear(void) {
+    if (!pv_count) return;
+    pv_count = 0;
+    if (++pv_gen == 0) { if (pv_tab) memset(pv_tab, 0, PV_SLOTS * sizeof(*pv_tab)); pv_gen = 1; }
+}
+
+static size_t pv_verify(const uint8_t *const *sig, const uint8_t *const *msg, const uint8_t *const *pk, size_t n) {
+    if (n == 0) return 0;
+    if (n < 2) return 0;                       /* single: the normal path verifies it */
+    if (ng_schnorrsig_verify_batch(verify_ctx, pv_scratch, sig, msg, pk, n)) {
+        for (size_t i = 0; i < n; i++) pv_add(sig[i], pk[i], msg[i]);
+        return n;
+    }
+    if (n <= 4) return 0;
+    size_t h = n / 2;
+    return pv_verify(sig, msg, pk, h) + pv_verify(sig + h, msg + h, pk + h, n - h);
+}
+
+size_t crypto_batch_verify(const uint8_t *const *sig64, const uint8_t *const *msg32,
+                           const uint8_t *const *pk32, size_t n) {
+    if (!verify_ctx || n < 2) return 0;
+    if (!pv_tab && !(pv_tab = (pv_slot_t *) calloc(PV_SLOTS, sizeof(*pv_tab)))) return 0;
+    if (!pv_scratch && !(pv_scratch = ng_batch_scratch_create(verify_ctx, PV_MAX_BATCH))) return 0;
+    size_t ok = 0;
+    for (size_t i = 0; i < n; i += PV_MAX_BATCH) {
+        size_t k = n - i < PV_MAX_BATCH ? n - i : PV_MAX_BATCH;
+        ok += pv_verify(sig64 + i, msg32 + i, pk32 + i, k);
+    }
+    return ok;
+}
+
+void crypto_thread_cleanup(void) {
+    if (pv_scratch) { ng_batch_scratch_destroy(verify_ctx, pv_scratch); pv_scratch = NULL; }
+    free(pv_tab); pv_tab = NULL; pv_count = 0;
 }
 
 /* ============================================================================
@@ -461,6 +537,8 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex, const uint8_t
         return false;
     }
     
+    if (crypto_preverified(sig_bytes, pubkey_bytes, digest)) return true;
+
     /* Parse x-only public key */
     secp256k1_xonly_pubkey xonly_pubkey;
     if (!secp256k1_xonly_pubkey_parse(verify_ctx, &xonly_pubkey, pubkey_bytes)) {

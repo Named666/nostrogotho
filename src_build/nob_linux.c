@@ -96,7 +96,7 @@ static void pgo_flags(Cmd *cmd)
     SRC_FOLDER"backend_ngws.c", SRC_FOLDER"dedupe.c", \
     SRC_FOLDER"json_lite.c", SRC_FOLDER"crypto.c", SRC_FOLDER"storage.c", \
     SRC_FOLDER"nostrogotho.c", SRC_FOLDER"json_util.c", THIRD_PARTY_FOLDER"sqlite3.c", \
-    THIRD_PARTY_FOLDER"secp256k1/src/secp256k1.c", \
+    SRC_FOLDER"schnorr_batch.c", /* includes the vendored secp256k1.c TU */ \
     THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult.c", \
     THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult_gen.c"
 
