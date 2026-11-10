@@ -32,19 +32,6 @@ static bool nip17_filter_targets_gift_wraps(const filter_t *filter) {
     return false;
 }
 
-/* Send a fresh NIP-42 challenge (the client may have ignored the first). */
-static void nip17_send_challenge(relay_conn_t *connection) {
-    char challenge[17];
-    if (!nip42_open_challenge(connection, challenge)) return;
-    json_builder_t builder;
-    json_builder_start(&builder);
-    json_builder_append_string(&builder, "AUTH");
-    json_builder_append_string(&builder, challenge);
-    const char *j = json_builder_finish(&builder);
-    nip_plugin_send_json(connection, j ? j : "[\"NOTICE\",\"error: server out of memory\"]");
-    json_builder_free(&builder);
-}
-
 /* The filter's "#p" values are exactly [pubkey]. */
 static bool nip17_filter_only_p(const filter_t *filter, const char *pubkey) {
     bool found = false;
@@ -70,7 +57,7 @@ static bool nip17_plugin_accept_query(relay_conn_t *connection, filter_t *filter
          * recipient's own wraps are delivered (can_deliver). */
         for (size_t i = 0; i < count && !me; i++) {
             if (!nip17_filter_targets_gift_wraps(&filters[i])) continue;
-            nip17_send_challenge(connection);
+            nip42_send_challenge(connection);
             snprintf(reason, reason_size, "auth-required: we can't serve DMs to unauthenticated users");
             return false;
         }
@@ -83,7 +70,7 @@ static bool nip17_plugin_accept_query(relay_conn_t *connection, filter_t *filter
             continue;
         }
         if (!me) {
-            nip17_send_challenge(connection);
+            nip42_send_challenge(connection);
             snprintf(reason, reason_size, "auth-required: cannot count other people's DMs");
             return false;
         }
@@ -105,7 +92,7 @@ static bool nip17_plugin_eose_auth_hint(relay_conn_t *connection,
     if (nip42_authenticated_pubkey(connection)) return false;
     for (size_t i = 0; i < count; i++) {
         if (nip17_filter_targets_gift_wraps(&filters[i])) {
-            nip17_send_challenge(connection);
+            nip42_send_challenge(connection);
             return true;
         }
     }

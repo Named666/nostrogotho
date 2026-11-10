@@ -15,6 +15,8 @@
 #include "nip42.h"
 #include "nip_event.h"
 #include "nip_plugin.h"
+#include "../json_lite.h"
+#include "../json_util.h"
 
 typedef struct nip42_client {
     char challenge[17];
@@ -147,23 +149,61 @@ static void nip42_plugin_init(const relay_config_t *config, void *ctx) {
              config->service_url ? config->service_url : "");
 }
 
-/* "-" tag policy from NIP-42: an event tagged "-" requires an authenticated
- * connection whose pubkey matches the event author. */
+void nip42_send_challenge(relay_conn_t *connection) {
+    char challenge[17];
+    if (!nip42_open_challenge(connection, challenge)) return;
+    json_builder_t builder;
+    json_builder_start(&builder);
+    json_builder_append_string(&builder, "AUTH");
+    json_builder_append_string(&builder, challenge);
+    const char *j = json_builder_finish(&builder);
+    nip_plugin_send_json(connection, j ? j : "[\"NOTICE\",\"error: server out of memory\"]");
+    json_builder_free(&builder);
+}
+
+/* The JSON text t (a tags array) contains the tag ["-"] (whitespace allowed). */
+static bool tags_text_protected(const char *t, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (t[i] != '[') continue;
+        size_t j = i + 1;
+        while (j < n && (t[j] == ' ' || t[j] == '\t' || t[j] == '\n' || t[j] == '\r')) j++;
+        if (j + 3 > n || memcmp(t + j, "\"-\"", 3) != 0) continue;
+        j += 3;
+        while (j < n && (t[j] == ' ' || t[j] == '\t' || t[j] == '\n' || t[j] == '\r')) j++;
+        if (j < n && t[j] == ']') return true;
+    }
+    return false;
+}
+
+/* NIP-70: a repost (kind 6 / 16) whose content embeds a protected event. */
+static bool embeds_protected(const event_t *event) {
+    if ((event->kind != 6 && event->kind != 16) || !event->content || !event->content_len) return false;
+    jstr_t tags = jl_get_tok(jl_str(event->content), "$.tags");
+    return tags.buf && tags_text_protected(tags.buf, tags.len);
+}
+
+/* NIP-70 protected events: an event tagged ["-"] is accepted only from an
+ * authenticated (NIP-42) connection whose pubkey is the event author. */
 static bool nip42_plugin_accept_publish(relay_conn_t *connection,
                                         const event_t *event,
                                         char *reason, size_t reason_size,
                                         void *ctx) {
     (void) ctx;
+    if (embeds_protected(event)) {
+        snprintf(reason, reason_size, "blocked: reposts must not embed a protected event");
+        return false;
+    }
     if (!nip_event_has_tag(event, "-", NULL)) return true;
 
     const char *auth_pubkey = nip42_authenticated_pubkey(connection);
     if (!auth_pubkey) {
-        snprintf(reason, reason_size, "auth-required: authentication required");
+        nip42_send_challenge(connection);
+        snprintf(reason, reason_size, "auth-required: this event may only be published by its author");
         return false;
     }
     if (strcmp(auth_pubkey, event->pubkey) != 0) {
         snprintf(reason, reason_size,
-                 "restricted: authenticated pubkey does not match event author");
+                 "restricted: this event may only be published by its author");
         return false;
     }
     return true;

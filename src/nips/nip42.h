@@ -12,6 +12,9 @@ bool nip42_open(relay_conn_t *connection, char challenge[17]);
 /* Generate a fresh challenge for an already-tracked connection (NIP-67 auth
  * hint path). Returns false when the connection has no client record. */
 bool nip42_open_challenge(relay_conn_t *connection, char challenge[17]);
+/* nip42_open_challenge + send ["AUTH", <challenge>] (used with auth-required:
+ * answers, since the client may have ignored the first challenge). */
+void nip42_send_challenge(relay_conn_t *connection);
 /* Discard all authentication state when a connection closes. */
 void nip42_close(relay_conn_t *connection);
 /* Return the authenticated pubkey for a connection, or NULL when unauthenticated. */

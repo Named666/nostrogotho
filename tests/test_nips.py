@@ -444,6 +444,32 @@ def ratelimit():
 
 
 @section
+def nip70():
+    """NIP-70 protected events, declared in NIP-11 with 13 and 40 (step 9)."""
+    r = Relay(); w = WS(r.port); k = Key(); other = Key()
+    _, d = nip11_doc(r)
+    sn = d.get("supported_nips", [])
+    check("NIP-11 declares 13, 40 and 70", all(n in sn for n in (13, 40, 70)), sn)
+    ev = k.ev("members only", 1, [["-"]])
+    w.challenge = None
+    m = w.publish(ev)
+    check("unauthenticated -> OK false auth-required: + a fresh AUTH challenge",
+          m[2] is False and m[3].startswith("auth-required:") and w.challenge, m)
+    m = w.auth(other, "ws://127.0.0.1")
+    m = w.publish(ev)
+    check("authenticated as someone else -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    w2 = WS(r.port); w2.auth(k, "ws://127.0.0.1")
+    m = w2.publish(ev)
+    check("authenticated as the author -> accepted", m[2] is True, m)
+    rp = other.ev(json.dumps(ev), 6, [["e", ev["id"]], ["p", k.pk]])
+    m = w2.publish(rp)
+    check("repost embedding a protected event -> blocked:", m[2] is False and m[3].startswith("blocked:"), m)
+    m = w2.publish(other.ev("", 6, [["e", ev["id"]], ["p", k.pk]]))
+    check("repost without the embedded event is fine", m[2] is True, m)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()
