@@ -3,9 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-#include <ctype.h>
-#include <errno.h>
 
+#include "ng_config.h"
 #include "crypto.h"
 #include "server.h"
 #include "storage.h"
@@ -22,44 +21,23 @@ static bool parse_int(const char *text, int *value) {
     return true;
 }
 
-/* Small key=value runtime config; loaded before opening any database. */
+/* Runtime config (config.h), loaded before opening any database; the
+ * result is handed to storage (durability) and the server (everything else). */
 static bool load_config(const char *path, bool required) {
-    FILE *file = fopen(path, "r");
-    if (!file) {
-        if (!required && errno == ENOENT) return true;
-        perror(path);
+    ng_config_t cfg;
+    ng_config_error_t err;
+    ng_config_defaults(&cfg);
+    ng_status_t st = ng_config_load(&cfg, path, required, &err);
+    if (st == NG_E_IO && err.line == 0) { perror(path); return false; }
+    if (st != NG_OK) {
+        fprintf(stderr, "%s:%u: invalid config line%s%s%s: %s (see nostrogotho.conf for keys and values)\n",
+                path, err.line, err.key[0] ? " (key '" : "", err.key, err.key[0] ? "')" : "",
+                ng_status_str(st));
         return false;
     }
-    char line[256];
-    unsigned number = 0;
-    bool ok = true;
-    while (fgets(line, sizeof(line), file)) {
-        number++;
-        if (!strchr(line, '\n') && !feof(file)) { ok = false; break; }
-        char *comment = strchr(line, '#');
-        if (comment) *comment = '\0';
-        char *key = line;
-        while (isspace((unsigned char)*key)) key++;
-        if (!*key) continue;
-        char *eq = strchr(key, '=');
-        if (!eq) { ok = false; break; }
-        char *end = eq;
-        while (end > key && isspace((unsigned char)end[-1])) end--;
-        *end = '\0';
-        char *value = eq + 1;
-        while (isspace((unsigned char)*value)) value++;
-        end = value + strlen(value);
-        while (end > value && isspace((unsigned char)end[-1])) end--;
-        *end = '\0';
-        if (strcmp(key, "db_sync") == 0 ? !storage_set_db_sync(value) : !server_config_set(key, value)) {
-            ok = false;
-            break;
-        }
-    }
-    if (ferror(file)) ok = false;
-    fclose(file);
-    if (!ok) fprintf(stderr, "%s:%u: invalid config line (see nostrogotho.conf for keys and values)\n", path, number);
-    return ok;
+    storage_set_sync_full(cfg.db_sync == NG_DB_SYNC_FULL);
+    server_set_config(&cfg);
+    return true;
 }
 
 static void sigint_handler(int sig) {

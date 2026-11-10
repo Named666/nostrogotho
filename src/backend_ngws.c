@@ -54,9 +54,10 @@
 #include "relay_core.h"
 #include "server.h"
 #include "ws_proto.h"
+#include "ng_config.h"
 
 #define MAX_WS_MESSAGE   (5u * 1024 * 1024)
-#define MAX_IO_LOOPS     64
+#define MAX_IO_LOOPS     NG_MAX_IO_LOOPS
 #define WRITER_BATCH     8192   /* hard cap; NG_BATCH_MAX tunes below it */
 #define OUTBOX_FLUSH     (256u * 1024)
 /* Default I/O loop count for n usable CPUs (io_threads = auto): one per CPU.
@@ -78,18 +79,13 @@ typedef struct {
 } ng_conn_t;
 
 /* ------------------------------------------------------- runtime options --
- * Set from nostrogotho.conf (server_config_set) before server_run(). The
- * NG_IO_THREADS / NG_WORKERS environment variables still override the thread
- * counts (benchmark scripts). Byte values accept K/M/G (binary) suffixes. */
-static struct {
-    int io_threads, workers;            /* 0 = auto */
-    size_t conn_out_max;                /* per-connection output backlog, then close */
-    size_t total_out_max;               /* process-wide output budget */
-    size_t worker_queue_max;            /* queued inbound bytes per worker */
-    int writer_queue_max;               /* EVENTs waiting for the writer */
-    int conn_pending_max;               /* queued messages per connection */
-    int listen_backlog;                 /* 0 = net.core.somaxconn */
-} opt = { 0, 0, 4u << 20, 1u << 30, 16u << 20, 65536, 1024, 0 };
+ * Copied from the parsed config (server_set_config) before server_run();
+ * read-only afterwards, so every thread may read it without
+ * synchronization. NG_IO_THREADS / NG_WORKERS (environment) still override
+ * the thread counts for benchmark scripts. */
+static ng_config_t opt = {
+    NG_DB_SYNC_FULL, 0, 0, 0, (size_t) 4 << 20, (size_t) 1 << 30, (size_t) 16 << 20, 65536, 1024
+};
 
 enum { J_OPEN, J_MSG, J_CLOSE, J_BSET };
 typedef struct job {
@@ -146,6 +142,10 @@ typedef struct {
  * taken in bulk: consecutive records of one body (a broadcast walks all of a
  * shard's subscribers for one event) cost one atomic add, not one each. */
 typedef struct { outtask_t *t; size_t cap; relay_body_t *rbody; int rn; } outbox_t;
+
+/* Worker and loop sets are tracked in 64-bit masks. */
+NG_STATIC_ASSERT(NG_MAX_WORKERS == RELAY_MAX_SHARDS, workers_are_shards);
+NG_STATIC_ASSERT(RELAY_MAX_SHARDS <= 64 && MAX_IO_LOOPS <= 64, masks_fit_64_bits);
 
 #ifndef SMALL_EVENT_COPY
 #define SMALL_EVENT_COPY 2048   /* event bodies up to this size are copied per subscriber */
@@ -474,8 +474,8 @@ static void shed_inline(ngws_socket_t *ws, const char *data, size_t len) {
 static bool admit_quiet(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
     ng_conn_t *c = (ng_conn_t *) rc;
     size_t total = ng_atomic_load_explicit(&out_task_bytes, NG_MO_RELAXED) + (srv ? ngws_server_backlog_bytes(srv) : 0);
-    bool ok = total < opt.total_out_max / 10 * 9;   /* 90%: shedding (75%, ngws) did not keep up */
-    if (ok && ng_atomic_load_explicit(&c->out_buffered, NG_MO_RELAXED) > opt.conn_out_max / 2) {
+    bool ok = total < opt.total_outbound_max / 10 * 9;   /* 90%: shedding (75%, ngws) did not keep up */
+    if (ok && ng_atomic_load_explicit(&c->out_buffered, NG_MO_RELAXED) > opt.conn_outbound_max / 2) {
         ok = false; *why = "error: output backlog too large, read faster";   /* slow reader */
     } else if (!ok) *why = overload_msg;
     if (ok && kind == RELAY_ADMIT_EVENT && ng_atomic_load_explicit(&writer_depth, NG_MO_RELAXED) >= opt.writer_queue_max) {
@@ -826,39 +826,7 @@ static void *checkpoint_thread(void *arg) {
 }
 
 /* ----------------------------------------------------------------- run --- */
-static bool parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
-    char *end; errno = 0;
-    unsigned long long x = strtoull(v, &end, 10);
-    if (end == v || errno || *v == '-') return false;
-    unsigned long long m = 1;
-    if (*end == 'K' || *end == 'k') { m = 1ull << 10; end++; }
-    else if (*end == 'M' || *end == 'm') { m = 1ull << 20; end++; }
-    else if (*end == 'G' || *end == 'g') { m = 1ull << 30; end++; }
-    if (*end || x > (unsigned long long) hi / m || x * m < lo) return false;
-    *out = (size_t) (x * m);
-    return true;
-}
-
-bool server_config_set(const char *key, const char *value) {
-    size_t v;
-    if (strcmp(key, "io_threads") == 0 || strcmp(key, "workers") == 0) {
-        if (!(strcmp(value, "auto") == 0 ? (v = 0, true) : parse_size(value, 1, strcmp(key, "workers") == 0 ? RELAY_MAX_SHARDS : MAX_IO_LOOPS, &v))) return false;
-        if (key[0] == 'i') opt.io_threads = (int) v; else opt.workers = (int) v;
-        return true;
-    }
-    if (strcmp(key, "conn_outbound_max") == 0) return parse_size(value, 64u << 10, (size_t) 1 << 32, &opt.conn_out_max);
-    if (strcmp(key, "total_outbound_max") == 0) return parse_size(value, 256u << 10, (size_t) 1 << 40, &opt.total_out_max);
-    if (strcmp(key, "worker_queue_max") == 0) return parse_size(value, 64u << 10, (size_t) 1 << 36, &opt.worker_queue_max);
-    if (strcmp(key, "writer_queue_max") == 0) { if (!parse_size(value, 1, 1u << 24, &v)) return false; opt.writer_queue_max = (int) v; return true; }
-    if (strcmp(key, "listen_backlog") == 0) {
-        if (strcmp(value, "auto") == 0) { opt.listen_backlog = 0; return true; }
-        if (!parse_size(value, 1, 1u << 20, &v)) return false;
-        opt.listen_backlog = (int) v; return true;
-    }
-    if (strcmp(key, "conn_pending_max") == 0) { if (!parse_size(value, 1, 1u << 20, &v)) return false; opt.conn_pending_max = (int) v; return true; }
-    return false;
-}
-
+void server_set_config(const ng_config_t *cfg) { opt = *cfg; }
 
 bool server_run(int port) {
     if (!relay_core_storage() || port < 1 || port > 65535) return false;
@@ -878,7 +846,7 @@ bool server_run(int port) {
     signal(SIGPIPE, SIG_IGN);
     relay_core_set_publisher(publish_to_writer);
     relay_core_set_admission(core_admit);
-    relay_core_set_query_bytes_max(opt.conn_out_max / 2);
+    relay_core_set_query_bytes_max(opt.conn_outbound_max / 2);
     { const char *bv = getenv("NG_BATCH_VERIFY"); batch_verify = !(bv && strcmp(bv, "0") == 0); }
 
     for (int i = 0; i < n_workers; i++) {
@@ -894,8 +862,8 @@ bool server_run(int port) {
     cfg.port = port;
     cfg.loops = n_loops;
     cfg.max_payload = MAX_WS_MESSAGE;
-    cfg.max_backpressure = opt.conn_out_max;
-    cfg.max_total_backlog = opt.total_out_max;
+    cfg.max_backpressure = opt.conn_outbound_max;
+    cfg.max_total_backlog = opt.total_outbound_max;
     cfg.listen_backlog = opt.listen_backlog;
     cfg.idle_timeout = (unsigned) env_int("NG_IDLE_TIMEOUT", 120);
     cfg.handshake_timeout = 16;

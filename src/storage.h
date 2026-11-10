@@ -244,8 +244,9 @@ typedef struct {
  *   storage_context_init_sqlite3(&ctx);
  *   ctx.init("file:nostrogotho.sqlite");
  */
-/* Startup-only setting, before init/threads; accepts full or normal. */
-bool storage_set_db_sync(const char *mode);
+/* Writer durability: true = PRAGMA synchronous=FULL (default), false =
+ * NORMAL. Startup only: call before init() and before any thread runs. */
+void storage_set_sync_full(bool full);
 
 void storage_context_init_sqlite3(storage_context_t *ctx);
 

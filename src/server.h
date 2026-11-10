@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 
+#include "ng_config.h"
 #include "storage.h"
 
 void server_configure(storage_context_t *storage, const char *relay_url,
@@ -12,9 +13,9 @@ void server_configure(storage_context_t *storage, const char *relay_url,
 /* Enable or disable console debug logging (connect/disconnect/event traces). */
 void server_set_debug(bool enabled);
 
-/* Runtime option from nostrogotho.conf (see nostrogotho.conf for keys).
- * Returns false for an unknown key or invalid value. Call before server_run. */
-bool server_config_set(const char *key, const char *value);
+/* Runtime options parsed from nostrogotho.conf (config.h); copied. Call
+ * before server_run (not thread-safe with a running server). */
+void server_set_config(const ng_config_t *cfg);
 
 /* Run the relay listener until it is stopped or its event loop exits. */
 bool server_run(int port);

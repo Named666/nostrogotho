@@ -59,12 +59,7 @@ static void ps_finalize_all(void) {
 static char db_dsn[1024];
 static const char *db_sync = "FULL";
 
-bool storage_set_db_sync(const char *mode) {
-    if (strcmp(mode, "full") == 0) db_sync = "FULL";
-    else if (strcmp(mode, "normal") == 0) db_sync = "NORMAL";
-    else return false;
-    return true;
-}
+void storage_set_sync_full(bool full) { db_sync = full ? "FULL" : "NORMAL"; }
 
 /* Parameter types for bound SQL statements.
  * PARAM_TYPE_OWNED_STRING marks heap-allocated (string_dup'd) values that
