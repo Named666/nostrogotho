@@ -583,8 +583,14 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
     event_t event;
     char reject_reason[256] = {0};
 
-    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event(values[1].value.string_val, &event)) {
-        nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: invalid event");
+    const char *bad = NULL;
+    if (count != 2 || values[1].type != JSON_TYPE_OBJECT || !json_parse_event_why(values[1].value.string_val, &event, &bad)) {
+        /* NIP-01: answer OK false when the event names an id, else NOTICE. */
+        char hint[MAX_ID_SIZE + 1];
+        if (count == 2 && values[1].type == JSON_TYPE_OBJECT && json_event_id_hint(values[1].value.string_val, hint))
+            nip_plugin_send_status(connection, "OK", hint, false, bad ? bad : "invalid: malformed event");
+        else
+            nip_plugin_send_status(connection, "NOTICE", NULL, false, bad ? bad : "invalid: malformed event");
         return;
     }
     log_message(connection, "event kind=%d id=%.*s pubkey=%.*s created_at=%lld",

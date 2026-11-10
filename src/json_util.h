@@ -296,6 +296,11 @@ bool json_parse_filter_why(const char *json_str, filter_t *filter, const char **
  *       freeing via event_free()
  */
 bool json_parse_event(const char *json_str, event_t *event);
+/* As json_parse_event; on failure *why (if why) is a static NIP-01 reason. */
+bool json_parse_event_why(const char *json_str, event_t *event, const char **why);
+/* The event's "id" when it is 64 lowercase hex (to address an OK false to
+ * an event that failed to parse). */
+bool json_event_id_hint(const char *json_str, char out[MAX_ID_SIZE + 1]);
 
 /* ============================================================================
  * Event Serialization

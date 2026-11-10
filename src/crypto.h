@@ -160,6 +160,15 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
  */
 bool check_event(const event_t *ev);
 
+/* check_event with the failure class (NIP-01 OK reasons). */
+typedef enum {
+    CHECK_EVENT_OK = 0,
+    CHECK_EVENT_BAD_ID,      /* id is not the hash of the canonical form */
+    CHECK_EVENT_BAD_SIG,     /* schnorr signature does not verify */
+    CHECK_EVENT_ERROR        /* malformed fields or out of memory */
+} check_event_status_t;
+check_event_status_t check_event_status(const event_t *ev);
+
 /* ============================================================================
  * Proof of Work (NIP-13)
  * ============================================================================ */

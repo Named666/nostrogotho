@@ -94,10 +94,19 @@ nip01_process_result_t nip01_precheck_event(
     }
 
     /* Step 2: Validate event (ID, signature) */
-    if (!nip01_validate_event(event)) {
+    switch (check_event_status(event)) {
+    case CHECK_EVENT_OK: break;
+    case CHECK_EVENT_BAD_ID:
         result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "invalid: event id or signature is invalid");
+        snprintf(result.response_msg, sizeof(result.response_msg), "invalid: event id does not match the event hash");
+        return result;
+    case CHECK_EVENT_BAD_SIG:
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg), "invalid: bad signature");
+        return result;
+    default:
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg), "invalid: malformed event");
         return result;
     }
     

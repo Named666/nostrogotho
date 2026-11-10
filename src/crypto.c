@@ -652,8 +652,8 @@ static char *canonical_tags_json(const char *raw) {
  * 
  * Fails gracefully with detailed logging on any step failure.
  */
-bool check_event(const event_t *ev) {
-    if (!ev) return false;
+check_event_status_t check_event_status(const event_t *ev) {
+    if (!ev) return CHECK_EVENT_ERROR;
     
     /* Build the event hash input: [0, pubkey, created_at, kind, tags, content]
      * Content and pubkey must be JSON-escaped for proper serialization.
@@ -667,7 +667,7 @@ bool check_event(const event_t *ev) {
     
     /* Escape pubkey for JSON (64 hex chars -> 129-byte stack buffer, safe) */
     if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
-        return false;
+        return CHECK_EVENT_ERROR;
     }
     
     /* Escape content for JSON - heap allocated, sized for worst-case escaping */
@@ -675,14 +675,14 @@ bool check_event(const event_t *ev) {
     size_t content_len = strlen(content);
     
     size_t escaped_content_cap;
-    if (!ng_size_flex(1, content_len, 6, &escaped_content_cap)) return false;
+    if (!ng_size_flex(1, content_len, 6, &escaped_content_cap)) return CHECK_EVENT_ERROR;
     char *escaped_content = (char *) malloc(escaped_content_cap);
     if (!escaped_content) {
-        return false;
+        return CHECK_EVENT_ERROR;
     }
     if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
         free(escaped_content);
-        return false;
+        return CHECK_EVENT_ERROR;
     }
     
     /* Size the serialization buffer: fixed overhead + tags + escaped content */
@@ -690,7 +690,7 @@ bool check_event(const event_t *ev) {
     const char *tags_json = "[]";
     if (ev->tags_json) {
         if (tags_json_is_canonical(ev->tags_json, strlen(ev->tags_json))) tags_json = ev->tags_json;
-        else if (!(canon_tags = canonical_tags_json(ev->tags_json))) { free(escaped_content); return false; }
+        else if (!(canon_tags = canonical_tags_json(ev->tags_json))) { free(escaped_content); return CHECK_EVENT_ERROR; }
         else tags_json = canon_tags;
     }
     size_t tags_len = strlen(tags_json);
@@ -699,7 +699,7 @@ bool check_event(const event_t *ev) {
     if (!buffer) {
         free(escaped_content);
         free(canon_tags);
-        return false;
+        return CHECK_EVENT_ERROR;
     }
     
     int written = snprintf(buffer, buffer_cap,
@@ -713,7 +713,7 @@ bool check_event(const event_t *ev) {
     
     if (written < 0 || (size_t)written >= buffer_cap) {
         free(buffer);
-        return false;
+        return CHECK_EVENT_ERROR;
     }
     
     /* Compute SHA256 hash */
@@ -724,19 +724,23 @@ bool check_event(const event_t *ev) {
     
     /* Convert digest to hex and compare with event ID */
     char *id_hex = bytes_to_hex(digest, 32);
-    if (!id_hex) return false;
+    if (!id_hex) return CHECK_EVENT_ERROR;
     
     bool id_matches = (strcmp(id_hex, ev->id) == 0);
     free(id_hex);
     
-    if (!id_matches) return false;
+    if (!id_matches) return CHECK_EVENT_BAD_ID;
     
     /* Verify signature */
     if (!signature_verify(ev->sig, ev->pubkey, digest)) {
-        return false;
+        return CHECK_EVENT_BAD_SIG;
     }
     
-    return true;
+    return CHECK_EVENT_OK;
+}
+
+bool check_event(const event_t *ev) {
+    return check_event_status(ev) == CHECK_EVENT_OK;
 }
 
 /* ============================================================================

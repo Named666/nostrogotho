@@ -870,6 +870,21 @@ bool json_parse_filter_why(const char *json_str, filter_t *filter, const char **
 }
 
 bool json_parse_event(const char *json_str, event_t *event) {
+    return json_parse_event_why(json_str, event, NULL);
+}
+
+bool json_event_id_hint(const char *json_str, char out[MAX_ID_SIZE + 1]) {
+    if (!json_str) return false;
+    char *id = jl_get_str(jl_str(json_str), "$.id");
+    bool ok = id && strlen(id) == MAX_ID_SIZE && is_lower_hex(id, MAX_ID_SIZE);
+    if (ok) memcpy(out, id, MAX_ID_SIZE + 1);
+    free(id);
+    return ok;
+}
+
+bool json_parse_event_why(const char *json_str, event_t *event, const char **why) {
+    const char *dummy;
+    if (!why) why = &dummy;
     jstr_t json;
     jstr_t tags;
     char *id, *pubkey, *content, *sig;
@@ -882,14 +897,22 @@ bool json_parse_event(const char *json_str, event_t *event) {
     content = jl_get_str(json, "$.content");
     sig = jl_get_str(json, "$.sig");
     tags = jl_get_tok(json, "$.tags");
-    if (!id || !pubkey || !content || !sig || !tags.buf ||
-        strlen(id) != MAX_ID_SIZE || strlen(pubkey) != MAX_PUBKEY_SIZE ||
-        strlen(sig) != MAX_SIG_SIZE ||
-        !is_lower_hex(id, MAX_ID_SIZE) || !is_lower_hex(pubkey, MAX_PUBKEY_SIZE) ||
-        !is_lower_hex(sig, MAX_SIG_SIZE) ||
-        !jl_get_num(json, "$.created_at", &created_at) ||
-        !jl_get_num(json, "$.kind", &kind) || created_at != (double)(time_t)created_at || kind != (int) kind ||
-        !validate_event_tags(tags)) {
+    *why = NULL;
+    if (!id || strlen(id) != MAX_ID_SIZE || !is_lower_hex(id, MAX_ID_SIZE))
+        *why = "invalid: id must be 64-character lowercase hex";
+    else if (!pubkey || strlen(pubkey) != MAX_PUBKEY_SIZE || !is_lower_hex(pubkey, MAX_PUBKEY_SIZE))
+        *why = "invalid: pubkey must be 64-character lowercase hex";
+    else if (!sig || strlen(sig) != MAX_SIG_SIZE || !is_lower_hex(sig, MAX_SIG_SIZE))
+        *why = "invalid: sig must be 128-character lowercase hex";
+    else if (!content)
+        *why = "invalid: content must be a string";
+    else if (!jl_get_num(json, "$.created_at", &created_at) || created_at != (double)(time_t)created_at)
+        *why = "invalid: created_at must be an integer";
+    else if (!jl_get_num(json, "$.kind", &kind) || kind != (int) kind || kind < 0 || kind > 65535)
+        *why = "invalid: kind must be an integer 0-65535";
+    else if (!tags.buf || !validate_event_tags(tags))
+        *why = "invalid: tags must be an array of arrays of strings";
+    if (*why) {
         free(id); free(pubkey); free(content); free(sig);
         return false;
     }
@@ -905,6 +928,7 @@ bool json_parse_event(const char *json_str, event_t *event) {
     free(id); free(pubkey); free(sig);
     if (!event->tags_json) {
         event_release(event);
+        *why = "error: out of memory";
         return false;
     }
     return true;

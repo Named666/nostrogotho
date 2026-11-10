@@ -149,6 +149,36 @@ def complexity():
 
 
 @section
+def okreasons():
+    """Invalid events answer OK false with NIP-01 prefixes (A4)."""
+    r = Relay(); w = WS(r.port); k = Key()
+    def pub(ev):
+        w.send_raw(json.dumps(["EVENT", ev])); return w.recv()
+    ev = k.ev("sig"); ev["sig"] = ("0" if ev["sig"][0] != "0" else "1") + ev["sig"][1:]
+    m = pub(ev); check("bad signature -> OK false invalid: bad signature", m and m[0] == "OK" and m[1] == ev["id"] and m[2] is False and m[3] == "invalid: bad signature", m)
+    ev = k.ev("id"); ev["content"] = "tampered"
+    m = pub(ev); check("wrong id -> OK false invalid: event id ...", m and m[0] == "OK" and m[2] is False and m[3].startswith("invalid: event id"), m)
+    ev = k.ev("kind"); ev["kind"] = 70000
+    m = pub(ev); check("kind 70000 -> OK false invalid: kind", m and m[0] == "OK" and m[1] == ev["id"] and m[3].startswith("invalid: kind"), m)
+    ev = k.ev("tags"); ev["tags"] = [["t", 5]]
+    m = pub(ev); check("non-string tag element -> OK false invalid: tags", m and m[0] == "OK" and m[3].startswith("invalid: tags"), m)
+    ev = k.ev("pk"); ev["pubkey"] = "XYZ"
+    m = pub(ev); check("malformed pubkey -> OK false invalid: pubkey", m and m[0] == "OK" and m[3].startswith("invalid: pubkey"), m)
+    ev = k.ev("noid"); del ev["id"]
+    m = pub(ev); check("no id -> NOTICE invalid:", m and m[0] == "NOTICE" and m[1].startswith("invalid:"), m)
+    ok = k.ev("dup"); w.publish(ok); m = w.publish(ok)
+    check("duplicate -> OK true duplicate:", m and m[2] is True and m[3].startswith("duplicate:"), m)
+    victim = k.ev("to delete"); w.publish(victim); w.publish(k.ev("", 5, [["e", victim["id"]]]))
+    m = w.publish(victim)
+    check("deleted event republished -> OK false blocked:", m and m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(k.ev("protected", 1, [["-"]]))
+    check("protected event unauthenticated -> OK false auth-required:", m and m[2] is False and m[3].startswith("auth-required:"), m)
+    m = w.publish(k.ev("future", ca=int(time.time()) + 3600))
+    check("created_at too far in the future -> OK false invalid:", m and m[2] is False and m[3].startswith("invalid:"), m)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()
