@@ -247,8 +247,6 @@ No case moved beyond run-to-run noise (4M fan-out p99 ranges: base
   modules; `storage.c` (1468 lines) and `relay_core.c` keep long
   functions and owner-thread-only shard tables (documented in
   relay_core.h).
-- `tools/bench/ngws_wslay_variant.c` (not built) kept as the record of
-  the wslay comparison.
 - Strict flags apply in every build of our code; `-Werror` only with
   `NG_WERROR=1`.
 - cppcheck findings in test code (unchecked malloc) left as is.

@@ -130,6 +130,8 @@ events, fresh DB, 3 reps. Latency = EVENT sent → OK (after COMMIT).
 Broadcast p50 latency ≈ 6.6-7 ms for all three. Codec decision: the native
 `src/ws_proto.c` codec (zero-copy, 8-byte unmask) matched or beat wslay
 everywhere and used far less CPU on large frames, so wslay was not kept.
+The wslay variant used for this table (`tools/bench/ngws_wslay_variant.c`)
+was deleted later; it is in git history before the 5.4 clean-up commits.
 
 ## Relay (Nostr): before vs after
 
