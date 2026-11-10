@@ -181,3 +181,48 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
     if (do_count && out_count) *out_count = total_count;
     return NG_OK;
 }
+
+/* NIP-45 HyperLogLog over the pubkeys of the events one filter counts:
+ * register = pubkey[offset], value = leading zero bits from byte
+ * offset + 1 on, plus one; each register keeps its maximum. */
+ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, uint8_t hll[256]) {
+    if (!ngdb_conn || !filter || offset < 0 || offset > 30 || !out_count || !hll) return NG_E_INVALID;
+    const size_t max_items = (size_t) ng_limits.max_filter_items;
+    if (filter->ids_count > max_items || filter->authors_count > max_items ||
+        filter->kinds_count > max_items || filter->tags_count > max_items) return NG_E_TOOBIG;
+    memset(hll, 0, 256);
+    *out_count = 0;
+    sq_query_t q = {0};
+    ng_status_t st = sq_build_mode(&q, filter, SQ_MODE_PUBKEYS, 0);
+    if (st != NG_OK) { sq_free(&q); return st; }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        sq_free(&q);
+        return NG_E_IO;
+    }
+    for (size_t i = 0; i < q.n; i++) {
+        int idx = (int) i + 1;
+        if (q.params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q.params[i].num);
+        else sqlite3_bind_text(stmt, idx, q.params[i].text, -1, SQLITE_TRANSIENT);
+    }
+    sq_free(&q);
+    int rc, n = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const uint8_t *pk = (const uint8_t *) sqlite3_column_blob(stmt, 1);
+        if (!pk || sqlite3_column_bytes(stmt, 1) != 32) continue;
+        n++;
+        unsigned zeros = 0;
+        for (int b = offset + 1; b < 32; b++) {
+            if (pk[b] == 0) { zeros += 8; continue; }
+            for (int bit = 7; bit >= 0 && !(pk[b] >> bit & 1); bit--) zeros++;
+            break;
+        }
+        uint8_t v = (uint8_t) (zeros + 1);
+        if (v > hll[pk[offset]]) hll[pk[offset]] = v;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn)); return NG_E_IO; }
+    *out_count = n;
+    return NG_OK;
+}

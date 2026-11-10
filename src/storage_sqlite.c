@@ -343,6 +343,7 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->delete_record_by_id_and_kind_and_ptag = ngdb_delete_record_by_id_and_kind_and_ptag;
     ctx->delete_all_events_by_pubkey = ngdb_delete_all_events_by_pubkey;
     ctx->send_records = ngdb_send_records;
+    ctx->count_hll = ngdb_count_hll;
     ctx->purge_expired = ngdb_purge_expired;
     ctx->thread_open = storage_thread_open_sqlite3;
     ctx->thread_close = storage_thread_close_sqlite3;

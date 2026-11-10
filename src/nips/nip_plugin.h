@@ -1,6 +1,7 @@
 #ifndef NIP_PLUGIN_H_
 #define NIP_PLUGIN_H_
 
+#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <time.h>
@@ -114,14 +115,25 @@ typedef struct nip_plugin {
     bool (*can_deliver)(const event_t *event, relay_conn_t *connection,
                         void *ctx);
 
+    /* Query policy for REQ (is_count false) and COUNT, before any stored
+     * event is read. May narrow filters (e.g. hide_gift_wraps). Return
+     * false and fill `reason` (NIP-01 prefix) to answer CLOSED. */
+    bool (*accept_query)(relay_conn_t *connection, filter_t *filters, size_t count,
+                         bool is_count, char *reason, size_t reason_size, void *ctx);
+
+    /* NIP-45 HyperLogLog: the register offset (8..23) for a COUNT's
+     * filters, or -1 when the request is not eligible. */
+    int (*count_hll_offset)(const filter_t *filters, size_t count, void *ctx);
+
     /* Called when a REQ finishes. May emit its own protocol traffic (e.g.
      * NIP-17 sends a fresh AUTH challenge for gift-wrap subscriptions) and
      * returns true to make the EOSE carry the "auth" completeness hint. */
     bool (*eose_auth_hint)(relay_conn_t *connection,
                            const filter_t *filters, size_t count, void *ctx);
 
-    /* Build the ["COUNT", ...] response (malloc'd, caller frees). */
-    char *(*build_count)(const char *sub, unsigned long count, void *ctx);
+    /* Build the ["COUNT", ...] response (malloc'd, caller frees). hll is
+     * the 256 NIP-45 registers or NULL. */
+    char *(*build_count)(const char *sub, unsigned long count, const uint8_t *hll, void *ctx);
 
     /* Periodic maintenance, driven every timer_interval_ms inside the
      * event loop (e.g. NIP-40 expired-event GC). */

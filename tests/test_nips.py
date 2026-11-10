@@ -232,6 +232,51 @@ def nip11():
     r.stop()
 
 
+def hll_expect(pubkeys, value):
+    import hashlib as _h
+    if len(value) == 64: off = int(value[32], 16) + 8
+    else: off = int(_h.sha256(value.encode()).hexdigest()[32], 16) + 8
+    regs = [0] * 256
+    for pk in pubkeys:
+        b = bytes.fromhex(pk); z = 0
+        for x in b[off + 1:]:
+            if x == 0: z += 8; continue
+            z += 8 - x.bit_length(); break
+        regs[b[off]] = max(regs[b[off]], z + 1)
+    return bytes(regs).hex()
+
+
+@section
+def nip45():
+    """NIP-45 COUNT: gift-wrap gating like REQ, HyperLogLog (step 4)."""
+    r = Relay(); w = WS(r.port); me = Key(); other = Key(); target = Key()
+    followers = [Key() for _ in range(40)]
+    for f in followers: w.publish(f.ev("", 3, [["p", target.pk]]))
+    _, end = w.req("f", {"kinds": [3], "#p": [target.pk]}, verb="COUNT")
+    want = hll_expect([f.pk for f in followers], target.pk)
+    check("follower COUNT -> count 40 + hll", end and end[0] == "COUNT" and end[2].get("count") == 40, end)
+    check("hll matches the NIP-45 algorithm", end and end[2].get("hll") == want, (end and end[2].get("hll", "")[:40], want[:40]))
+    _, end = w.req("t", {"kinds": [1], "#t": ["nostr"]}, verb="COUNT")
+    check("non-hex tag value -> hll from sha256 offset", end and len(end[2].get("hll", "")) == 512 and end[2]["count"] == 0, end)
+    _, end = w.req("two", {"kinds": [3], "#p": [target.pk]}, {"kinds": [7]}, verb="COUNT")
+    check("two filters -> plain count, no hll", end and end[2].get("count") == 40 and "hll" not in end[2], end)
+    for rcpt in (me, me, other):
+        w.publish(Key().ev("wrapped", 1059, [["p", rcpt.pk]]))
+    _, end = w.req("dm", {"kinds": [1059], "#p": [me.pk]}, verb="COUNT")
+    check("COUNT kind 1059 unauthenticated -> CLOSED auth-required:", end and end[0] == "CLOSED" and end[2].startswith("auth-required:"), end)
+    _, end = w.req("all", {}, verb="COUNT")
+    check("COUNT without kinds does not count gift wraps", end and end[0] == "COUNT" and end[2]["count"] == 40, end)
+    m = w.auth(me, "ws://127.0.0.1")
+    check("AUTH ok", m and m[2] is True, m)
+    _, end = w.req("dm2", {"kinds": [1059], "#p": [me.pk]}, verb="COUNT")
+    check("authenticated recipient counts own gift wraps", end and end[0] == "COUNT" and end[2]["count"] == 2, end)
+    _, end = w.req("dm3", {"kinds": [1059], "#p": [other.pk]}, verb="COUNT")
+    check("counting someone else's gift wraps -> CLOSED restricted:", end and end[0] == "CLOSED" and end[2].startswith("restricted:"), end)
+    _, end = w.req("dm4", {"kinds": [1059]}, verb="COUNT")
+    check("kind 1059 COUNT without #p -> CLOSED restricted:", end and end[0] == "CLOSED" and end[2].startswith("restricted:"), end)
+    r.stop()
+
+
 @section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""

@@ -318,6 +318,24 @@ static bool plugins_accept_publish(relay_conn_t *connection, const event_t *even
     return true;
 }
 
+static bool plugins_accept_query(relay_conn_t *connection, filter_t *filters, size_t count,
+                                 bool is_count, char *reason, size_t reason_size) {
+    for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
+        if (plugin->accept_query &&
+            !plugin->accept_query(connection, filters, count, is_count, reason, reason_size, plugin->ctx)) {
+            if (!reason[0]) snprintf(reason, reason_size, "restricted: query not allowed");
+            return false;
+        }
+    }
+    return true;
+}
+
+static int plugins_count_hll_offset(const filter_t *filters, size_t count) {
+    for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next)
+        if (plugin->count_hll_offset) return plugin->count_hll_offset(filters, count, plugin->ctx);
+    return -1;
+}
+
 static bool plugins_can_deliver(const event_t *event, relay_conn_t *connection) {
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
         if (plugin->can_deliver && !plugin->can_deliver(event, connection, plugin->ctx)) return false;
@@ -406,8 +424,16 @@ static bool query_events(relay_conn_t *connection, const char *sub,
     query_render_failed = false;
     query_filters = filters;
     query_filters_count = count;
-    ng_status_t st = storage_ctx->send_records(query_sender, sub, filters, count, do_count,
-                                               &total_count);
+    uint8_t hll[256];
+    bool have_hll = false;
+    int hll_offset = do_count && storage_ctx->count_hll ? plugins_count_hll_offset(filters, count) : -1;
+    ng_status_t st;
+    if (hll_offset >= 0 && count == 1) {
+        st = storage_ctx->count_hll(&filters[0], hll_offset, &total_count, hll);
+        have_hll = st == NG_OK;
+    } else {
+        st = storage_ctx->send_records(query_sender, sub, filters, count, do_count, &total_count);
+    }
     query_connection = NULL;
     query_filters = NULL;
     query_filters_count = 0;
@@ -422,7 +448,7 @@ static bool query_events(relay_conn_t *connection, const char *sub,
     char *response = NULL;
     if (do_count) {
         for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
-            if (plugin->build_count) { response = plugin->build_count(sub, (unsigned long) total_count, plugin->ctx); break; }
+            if (plugin->build_count) { response = plugin->build_count(sub, (unsigned long) total_count, have_hll ? hll : NULL, plugin->ctx); break; }
         }
         if (!response) {
             json_builder_t builder;
@@ -514,6 +540,11 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     if (admission && !admission(connection, RELAY_ADMIT_REQ, &why)) {
         release_filters(filters, filter_count);
         nip_plugin_send_status(connection, "CLOSED", sub, false, why); return;
+    }
+    char reason[256] = {0};
+    if (!plugins_accept_query(connection, filters, filter_count, do_count, reason, sizeof(reason))) {
+        release_filters(filters, filter_count);
+        nip_plugin_send_status(connection, "CLOSED", sub, false, reason); return;
     }
     if (do_count) {
         (void) query_events(connection, sub, filters, filter_count, true);

@@ -115,6 +115,7 @@ typedef struct {
     time_t until;
     int limit;              /* meaningful only when limit_set */
     bool limit_set;         /* "limit" present; limit:0 = no stored events */
+    bool hide_gift_wraps;   /* relay policy: exclude kinds 1059/21059 (COUNT) */
     
     char *search;
 } filter_t;

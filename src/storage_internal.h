@@ -56,5 +56,6 @@ event_t *ngdb_get_event_by_id(const char *id);
 ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
                        const filter_t *filters, size_t filters_count,
                        bool do_count, int *out_count);
+ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, uint8_t hll[256]);
 
 #endif /* STORAGE_INTERNAL_H_ */

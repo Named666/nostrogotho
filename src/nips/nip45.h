@@ -2,6 +2,8 @@
 #define NIP45_H_
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
 #include "nostrogotho.h"
 
 /* ============================================================================
@@ -35,6 +37,10 @@
  * Note: This module is typically used in conjunction with storage layer
  * COUNT queries which provide the count value.
  */
-char *nip45_build_count_response(const char *sub_id, unsigned long count);
+char *nip45_build_count_response(const char *sub_id, unsigned long count, const uint8_t *hll);
+
+/* NIP-45 HyperLogLog register offset (8..23) for a COUNT's filters, -1 when
+ * not eligible (exactly one filter with one tag attribute of one value). */
+int nip45_hll_offset(const filter_t *filters, size_t count);
 
 #endif /* NIP45_H_ */

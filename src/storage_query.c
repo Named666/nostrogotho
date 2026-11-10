@@ -154,6 +154,11 @@ static void sq_tag_match(sq_query_t *q, const char *alias, const tag_t *tag) {
  * ev) key), the others are EXISTS point lookups on the same key. kinds and
  * the time window are checked on the tag row itself before the join. */
 ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit) {
+    return sq_build_mode(q, f, do_count ? SQ_MODE_COUNT : SQ_MODE_ROWS, limit);
+}
+
+ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int limit) {
+    bool do_count = mode == SQ_MODE_COUNT;
     q->status = NG_OK;
     size_t drive = f->tags_count;
     for (size_t t = 0; t < f->tags_count; t++) {
@@ -167,6 +172,7 @@ ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit)
     char buf[96];
 
     if (do_count) sq_sql(q, multi ? "SELECT COUNT(DISTINCT e.seq) FROM " : "SELECT COUNT(*) FROM ");
+    else if (mode == SQ_MODE_PUBKEYS) sq_sql(q, multi ? "SELECT DISTINCT e.seq, e.pubkey FROM " : "SELECT e.seq, e.pubkey FROM ");
     else sq_sql(q, multi ? "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM " : "SELECT " SQ_EVENT_COLUMNS " FROM ");
     sq_sql(q, tagged ? "tag t JOIN event e ON e.seq = t.ev" : "event e");
     const char *sep = " WHERE ";
@@ -192,6 +198,10 @@ ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit)
         if (f->kinds_count > 1) { sq_list(q, "?", f->kinds_count); sq_sql(q, ")"); }
         for (size_t i = 0; i < f->kinds_count; i++) sq_int(q, f->kinds[i]);
     }
+    if (f->hide_gift_wraps) {
+        snprintf(buf, sizeof(buf), "%skind NOT IN (1059, 21059)", tc);
+        NEXT(); sq_sql(q, buf);
+    }
     if (f->since > 0) {
         snprintf(buf, sizeof(buf), "%screated_at >= %lld", tc, (long long) f->since);
         NEXT(); sq_sql(q, buf);
@@ -213,7 +223,7 @@ ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit)
         sq_owned(q, like_pattern("%", f->search, NULL, NULL, "%"));
     }
 #undef NEXT
-    if (!do_count) {
+    if (mode == SQ_MODE_ROWS) {
         /* NIP-01: newest first; equal created_at by lowest id first. */
         sq_sql(q, tagged && !multi ? " ORDER BY t.created_at DESC, e.id ASC LIMIT ?"
                                    : " ORDER BY e.created_at DESC, e.id ASC LIMIT ?");

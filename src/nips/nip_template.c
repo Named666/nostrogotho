@@ -140,11 +140,21 @@ static bool nip_xx_eose_auth_hint(relay_conn_t *connection,
 }
 
 
-static char *nip_xx_build_count(const char *sub, unsigned long count, void *ctx) {
+static char *nip_xx_build_count(const char *sub, unsigned long count, const uint8_t *hll, void *ctx) {
     (void) sub;
     (void) count;
+    (void) hll;
     (void) ctx;
     return NULL;
+}
+
+/* Query policy for REQ / COUNT: return false with a NIP-01 reason to
+ * answer CLOSED (e.g. NIP-17 gift wraps need auth). */
+static bool nip_xx_accept_query(relay_conn_t *connection, filter_t *filters, size_t count,
+                                bool is_count, char *reason, size_t reason_size, void *ctx) {
+    (void) connection; (void) filters; (void) count; (void) is_count;
+    (void) reason; (void) reason_size; (void) ctx;
+    return true;
 }
 
 /* Periodic maintenance, driven every timer_interval_ms inside the event
@@ -185,6 +195,7 @@ static nip_plugin_t nip_xx_plugin = {
     .accept_publish = nip_xx_accept_publish,
     .can_deliver = nip_xx_can_deliver,
     .eose_auth_hint = nip_xx_eose_auth_hint,
+    .accept_query = nip_xx_accept_query,
     .build_count = nip_xx_build_count,
     .timer = nip_xx_timer,
     .timer_interval_ms = 0,        /* 0 = no periodic timer */

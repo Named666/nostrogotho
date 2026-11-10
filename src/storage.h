@@ -4,6 +4,7 @@
 #include "nostrogotho.h"
 #include "ng_status.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 /* ============================================================================
  * STORAGE.H - Event Storage Backend Interface
@@ -242,6 +243,12 @@ typedef struct {
     ng_status_t (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
                         bool do_count, int *out_count);
+
+    /* NIP-45 HyperLogLog COUNT of one filter: *out_count events and the
+     * 256 registers over their pubkeys with the given offset (8..23).
+     * NG_OK / NG_E_TOOBIG / NG_E_IO like send_records. */
+    ng_status_t (*count_hll)(const filter_t *filter, int offset,
+                             int *out_count, uint8_t hll[256]);
 
     /* Multi-threaded backends: per-thread connection management and write
      * batching (BEGIN IMMEDIATE ... COMMIT). Only the single writer thread

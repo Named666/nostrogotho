@@ -61,6 +61,12 @@ bool sq_is_hex64(const char *s, size_t len);
  * a single letter) or NG_E_NOMEM. q must be sq_free'd in every case. */
 ng_status_t sq_build(sq_query_t *q, const filter_t *filter, bool do_count, int limit);
 
+/* SQ_MODE_ROWS / SQ_MODE_COUNT are sq_build(.., false / true, ..);
+ * SQ_MODE_PUBKEYS selects (seq, pubkey blob) of every matching event, no
+ * ORDER BY / LIMIT (NIP-45 HyperLogLog). */
+typedef enum { SQ_MODE_ROWS, SQ_MODE_COUNT, SQ_MODE_PUBKEYS } sq_mode_t;
+ng_status_t sq_build_mode(sq_query_t *q, const filter_t *filter, sq_mode_t mode, int limit);
+
 void sq_free(sq_query_t *q);
 
 #endif /* STORAGE_QUERY_H_ */
