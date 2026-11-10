@@ -69,6 +69,19 @@ typedef struct {
     int created_at_upper_limit; /* created_at_upper_limit: max future (s), 0 = off */
 } ng_relay_info_t;
 
+/* Rate limits (0 = off) and ban lists; see ratelimit.h. */
+typedef struct {
+    int event_ip_per_min;       /* rate_events_per_min_ip */
+    int event_ip_burst;         /* rate_events_burst_ip */
+    int event_pubkey_per_min;   /* rate_events_per_min_pubkey */
+    int event_pubkey_burst;     /* rate_events_burst_pubkey */
+    int req_ip_per_min;         /* rate_reqs_per_min_ip: REQ + COUNT */
+    int req_ip_burst;           /* rate_reqs_burst_ip */
+    char banned_pubkeys[480];   /* banned_pubkeys: hex, comma separated */
+    char banned_ips[480];       /* banned_ips: comma separated */
+    char ban_file[256];         /* ban_file: "pubkey <hex>" / "ip <addr>" lines */
+} ng_policy_t;
+
 #define NG_SOFTWARE_URL "https://github.com/Named666/nostrogotho"
 #define NG_VERSION      "0.2.0"
 
@@ -90,6 +103,7 @@ typedef struct {
     int conn_pending_max;       /* conn_pending_max: queued messages per connection */
     ng_limits_t limits;         /* protocol limits (see ng_limits_t) */
     ng_relay_info_t info;       /* identity and policy (see ng_relay_info_t) */
+    ng_policy_t policy;         /* rate limits and bans (see ng_policy_t) */
 } ng_config_t;
 
 /* Process-wide relay info, like ng_limits: set once at startup. */

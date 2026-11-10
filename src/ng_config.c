@@ -57,6 +57,9 @@ void ng_config_defaults(ng_config_t *cfg) {
     cfg->conn_pending_max = 1024;
     ng_limits_defaults(&cfg->limits);
     ng_relay_info_defaults(&cfg->info);
+    cfg->policy.event_ip_burst = 60;
+    cfg->policy.event_pubkey_burst = 30;
+    cfg->policy.req_ip_burst = 60;
 }
 
 bool ng_parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
@@ -127,6 +130,15 @@ static const cfg_key_t keys[] = {
     { "max_filter_items",   K_INT,     1, 20000,                       F(limits.max_filter_items) },
     { "max_req_authors",    K_INT,     1, 100000,                      F(limits.max_req_authors) },
     { "search",             K_INT,     0, 1,                           F(limits.search) },
+    { "rate_events_per_min_ip",     K_INT, 0, 10000000, F(policy.event_ip_per_min) },
+    { "rate_events_burst_ip",       K_INT, 1, 1000000,  F(policy.event_ip_burst) },
+    { "rate_events_per_min_pubkey", K_INT, 0, 10000000, F(policy.event_pubkey_per_min) },
+    { "rate_events_burst_pubkey",   K_INT, 1, 1000000,  F(policy.event_pubkey_burst) },
+    { "rate_reqs_per_min_ip",       K_INT, 0, 10000000, F(policy.req_ip_per_min) },
+    { "rate_reqs_burst_ip",         K_INT, 1, 1000000,  F(policy.req_ip_burst) },
+    { "banned_pubkeys",     K_STR,     0, sizeof(((ng_policy_t *) 0)->banned_pubkeys), F(policy.banned_pubkeys) },
+    { "banned_ips",         K_STR,     0, sizeof(((ng_policy_t *) 0)->banned_ips), F(policy.banned_ips) },
+    { "ban_file",           K_STR,     0, sizeof(((ng_policy_t *) 0)->ban_file), F(policy.ban_file) },
 };
 #undef F
 

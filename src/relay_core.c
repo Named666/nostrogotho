@@ -19,6 +19,7 @@
 #include "nips/nip_plugin.h"
 #include "platform/ng_alloc.h"
 #include "ng_config.h"
+#include "ratelimit.h"
 
 /* Protocol limits: ng_limits (ng_config.h, nostrogotho.conf). */
 
@@ -53,7 +54,15 @@ typedef struct subscription {
 typedef struct {
     subscription_t *subs;
     int count;
+    unsigned char ipkey[16];   /* rate-limit key of the peer (ratelimit.h) */
+    size_t ipkey_len;          /* 0: unknown peer, never IP-limited */
 } core_conn_t;
+
+/* One unit of rate class c for this connection's peer IP. */
+static bool ip_allow(relay_conn_t *connection, rl_class_t c) {
+    const core_conn_t *cc = (const core_conn_t *) connection->core;
+    return !rl_enabled(c) || !cc || !cc->ipkey_len || rl_allow(c, cc->ipkey, cc->ipkey_len);
+}
 
 /* Per-shard subscription index. Each filter is indexed under the keys of its
  * most selective exact-match field (ids > authors > single-letter tag values >
@@ -543,6 +552,10 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     if (!sub || !*sub || strlen(sub) > (size_t) ng_limits.max_subid_length) {
         nip_plugin_send_status(connection, "CLOSED", sub, false, "invalid: subscription id must be 1 to max_subid_length characters"); return;
     }
+    if (!ip_allow(connection, RL_REQ_IP)) {
+        nip_plugin_send_status(connection, "CLOSED", sub, false, "rate-limited: too many requests from your IP, slow down");
+        return;
+    }
     const char *bad = count < 3 ? "invalid: no filters" : collect_filters(values, count, &filters, &filter_count);
     if (bad) { nip_plugin_send_status(connection, "CLOSED", sub, false, bad); return; }
     const char *why = NULL;
@@ -644,12 +657,31 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
         return;
     }
 
+    /* Cheap refusals first: before the id hash and the signature check. */
+    if (rl_pubkey_banned(event.pubkey)) {
+        nip_plugin_send_status(connection, "OK", event.id, false, "blocked: this pubkey is banned from this relay");
+        event_release(&event);
+        return;
+    }
+    if (!ip_allow(connection, RL_EVENT_IP)) {
+        nip_plugin_send_status(connection, "OK", event.id, false, "rate-limited: too many events from your IP, slow down");
+        event_release(&event);
+        return;
+    }
+
     /* Ephemeral kinds are never stored, so they are exempt from dedupe. */
     bool guarded = !(event.kind >= 20000 && event.kind < 30000);
 
     /* CPU-bound, stateless: id hash, schnorr signature, size, timestamps. */
     nip01_process_result_t result = nip01_precheck_event(&event, ng_limits.max_content_length,
         created_at_lower_limit, created_at_upper_limit, min_pow_difficulty);
+    /* Per pubkey only once the signature proved the author (a forger must
+     * not be able to spend someone else's budget). */
+    if (result.accepted && !rl_allow(RL_EVENT_PUBKEY, event.pubkey, 64)) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg), "%s",
+                 "rate-limited: too many events from this pubkey, slow down");
+    }
     if (result.accepted && !plugins_accept_publish(connection, &event, reject_reason, sizeof(reject_reason))) {
         result.accepted = false;
         snprintf(result.response_msg, sizeof(result.response_msg), "%s", reject_reason);
@@ -721,9 +753,16 @@ void relay_core_on_open(relay_conn_t *connection) {
         relay_conn_close(connection);
         return;
     }
+    core_conn_t *cc = (core_conn_t *) connection->core;
+    cc->ipkey_len = rl_peer_key(connection->peer, cc->ipkey);
     log_message(connection, "client connected (websocket open)");
     for (nip_plugin_t *plugin = nip_plugins(); plugin; plugin = plugin->next) {
         if (plugin->on_connect) plugin->on_connect(connection, plugin->ctx);
+    }
+    /* After on_connect so every plugin sees the usual connect/disconnect pair. */
+    if (rl_peer_banned(connection->peer)) {
+        nip_plugin_send_status(connection, "NOTICE", NULL, false, "blocked: your IP is banned from this relay");
+        relay_conn_close(connection);
     }
 }
 

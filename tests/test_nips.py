@@ -401,6 +401,49 @@ def nip50():
 
 
 @section
+def ratelimit():
+    """Per-IP / per-pubkey GCRA rate limits and ban lists (step 8)."""
+    import os, tempfile
+    conf = ("rate_events_per_min_ip = 60\nrate_events_burst_ip = 5\n"
+            "rate_events_per_min_pubkey = 60\nrate_events_burst_pubkey = 2\n"
+            "rate_reqs_per_min_ip = 60\nrate_reqs_burst_ip = 3\n")
+    r = Relay(conf); a = WS(r.port); b = WS(r.port); k1 = Key(); k2 = Key()
+    res = [a.publish(k1.ev("x%d" % i)) for i in range(3)]
+    check("per pubkey: burst 2, then rate-limited:", [m[2] for m in res] == [True, True, False] and res[2][3].startswith("rate-limited:"), res[2])
+    res = [b.publish(k2.ev("y%d" % i)) for i in range(2)]
+    check("another pubkey has its own budget", all(m[2] for m in res), res)
+    m = b.publish(Key().ev("z"))
+    check("per IP (shared by all connections): burst 5, then rate-limited:", m[2] is False and m[3].startswith("rate-limited:") and "IP" in m[3], m)
+    ends = [a.req("q%d" % i, {"kinds": [1], "limit": 1})[1] for i in range(4)]
+    check("REQ per IP: burst 3, then CLOSED rate-limited:", [e[0] for e in ends] == ["EOSE"] * 3 + ["CLOSED"] and ends[3][2].startswith("rate-limited:"), ends)
+    time.sleep(1.1)
+    m = a.publish(Key().ev("later"))
+    check("budget refills over time", m[2] is True, m)
+    r.stop()
+    bad = Key()
+    d = tempfile.mkdtemp()
+    bf = os.path.join(d, "bans.txt")
+    open(bf, "w").write("# test\npubkey %s\n" % bad.pk)
+    r = Relay("ban_file = %s\n" % bf); w = WS(r.port)
+    m = w.publish(bad.ev("hi"))
+    check("banned pubkey -> OK false blocked:", m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(Key().ev("hi"))
+    check("others unaffected; limits off by default", m[2] is True, m)
+    r.stop()
+    r = Relay("banned_ips = 127.0.0.1\n"); w = WS(r.port)
+    m = w.recv()
+    while m and m[0] == "AUTH": m = w.recv()
+    check("banned IP -> NOTICE blocked: and close", m and m[0] == "NOTICE" and m[1].startswith("blocked:"), m)
+    r.stop()
+    open(bf, "w").write("bogus line\n")
+    try:
+        Relay("ban_file = %s\n" % bf); ok = False
+    except RuntimeError as e:
+        ok = "invalid ban entry" in str(e)
+    check("an invalid ban file stops startup with its line number", ok)
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

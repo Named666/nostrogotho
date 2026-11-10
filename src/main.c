@@ -8,6 +8,7 @@
 #include "crypto.h"
 #include "server.h"
 #include "storage.h"
+#include "ratelimit.h"
 
 static storage_context_t storage_ctx = {0};
 
@@ -57,6 +58,26 @@ static void apply_config(const char *service_url, int min_pow, int lower_limit, 
                         "honors only ALL_RELAYS requests\n");
 }
 
+/* Rate limits and bans (ratelimit.h). */
+static bool apply_policy(void) {
+    const ng_policy_t *p = &cfg.policy;
+    rl_config_t rc;
+    memset(&rc, 0, sizeof(rc));
+    rc.per_min[RL_EVENT_IP] = p->event_ip_per_min;         rc.burst[RL_EVENT_IP] = p->event_ip_burst;
+    rc.per_min[RL_EVENT_PUBKEY] = p->event_pubkey_per_min; rc.burst[RL_EVENT_PUBKEY] = p->event_pubkey_burst;
+    rc.per_min[RL_REQ_IP] = p->req_ip_per_min;             rc.burst[RL_REQ_IP] = p->req_ip_burst;
+    rc.banned_pubkeys = p->banned_pubkeys;
+    rc.banned_ips = p->banned_ips;
+    rc.ban_file = p->ban_file;
+    unsigned line = 0;
+    ng_status_t st = rl_configure(&rc, &line);
+    if (st == NG_OK) return true;
+    if (st == NG_E_IO) perror(p->ban_file);
+    else if (line) fprintf(stderr, "%s:%u: invalid ban entry (expected \"pubkey <hex>\" or \"ip <address>\")\n", p->ban_file, line);
+    else fprintf(stderr, "invalid banned_pubkeys / banned_ips entry: %s\n", ng_status_str(st));
+    return false;
+}
+
 static void sigint_handler(int sig) {
     (void)sig;
     server_stop();
@@ -83,6 +104,7 @@ static void cleanup(void) {
     if (storage_ctx.deinit) {
         storage_ctx.deinit();
     }
+    rl_shutdown();
     crypto_deinit();
 }
 
@@ -143,6 +165,7 @@ int main(int argc, const char **argv) {
 
     if (!load_config(config_path, config_required)) return 1;
     apply_config(service_url && *service_url ? service_url : NULL, min_pow, lower_limit, upper_limit);
+    if (!apply_policy()) return 1;
 
     if (!init_storage(db_path)) {
         return 1;

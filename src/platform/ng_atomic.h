@@ -10,6 +10,7 @@
  *   ng_atomic_store[_explicit](p, v[, mo])
  *   ng_atomic_fetch_add/sub[_explicit](p, v[, mo])   returns the old value
  *   ng_atomic_exchange(p, v)          seq_cst, returns the old value
+ *   ng_atomic_cas_weak_explicit(p, &expected, v, mo_ok, mo_fail)
  *   ng_atomic_init(p, v)              plain store; only before the object
  *                                     is visible to another thread
  * p is a pointer to one of the ng_atomic_* types below.
@@ -44,5 +45,9 @@ typedef struct { unsigned long long v; } ng_atomic_ullong;
 #define ng_atomic_fetch_sub_explicit(p, x, mo) __atomic_fetch_sub(&(p)->v, (x), mo)
 #define ng_atomic_fetch_sub(p, x)              ng_atomic_fetch_sub_explicit(p, x, NG_MO_SEQ_CST)
 #define ng_atomic_exchange(p, x)               __atomic_exchange_n(&(p)->v, (x), NG_MO_SEQ_CST)
+/* Weak CAS: if *p == *expected store x and return true, else load *p into
+ * *expected and return false (may fail spuriously: call in a loop). */
+#define ng_atomic_cas_weak_explicit(p, expected, x, mo_ok, mo_fail) \
+    __atomic_compare_exchange_n(&(p)->v, (expected), (x), true, mo_ok, mo_fail)
 
 #endif /* NG_ATOMIC_H_ */
