@@ -225,14 +225,14 @@ bool relay_tags_parse(const event_t *ev, relay_tags_t *out) {
         if ((to = jl_next(tag, 0, &kk, &n)) == 0) continue;
         if (jl_next(tag, to, &kk, &v) == 0) { v.buf = NULL; v.len = 0; }
         if (!n.buf || n.buf[0] != '"') continue;
-        size_t nl = jl_unescape(n, out->store + so);
-        if (nl == (size_t) -1) continue;
+        size_t nl;
+        if (!jl_unescape(n, out->store + so, &nl)) continue;
         relay_tagpair_t *tp = &out->p[out->n];
         tp->name = out->store + so; tp->nlen = nl; so += nl; out->store[so++] = '\0';
         tp->val = NULL; tp->vlen = 0;
         if (v.buf && v.buf[0] == '"') {
-            size_t vl = jl_unescape(v, out->store + so);
-            if (vl != (size_t) -1) { tp->val = out->store + so; tp->vlen = vl; so += vl; out->store[so++] = '\0'; }
+            size_t vl;
+            if (jl_unescape(v, out->store + so, &vl)) { tp->val = out->store + so; tp->vlen = vl; so += vl; out->store[so++] = '\0'; }
         }
         out->n++;
     }

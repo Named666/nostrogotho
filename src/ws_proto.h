@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "ng_status.h"
 
 void ws_sha1(const unsigned char *data, size_t len, unsigned char out[20]);
 size_t ws_base64(const unsigned char *in, size_t len, char *out); /* NUL-terminates */
@@ -28,9 +29,13 @@ typedef struct {
     unsigned char mask[4];
 } ws_frame_t;
 
-/* Parse a frame header from buf. Returns 1 when a complete header is present
- * (fills f), 0 if more bytes are needed, -1 on protocol error. */
-int ws_parse_header(const unsigned char *buf, size_t n, ws_frame_t *f);
+/* Parse a frame header from buf[0..n).
+ *   NG_OK        complete header; f filled
+ *   NG_E_AGAIN   more bytes needed
+ *   NG_E_INVALID protocol error (RSV bits, reserved opcode, control frame
+ *                over 125 bytes or fragmented, 64-bit length MSB set)
+ * f is fully written only on NG_OK. */
+ng_status_t ws_parse_header(const unsigned char *buf, size_t n, ws_frame_t *f);
 #include <stdbool.h>
 bool ws_utf8_valid(const unsigned char *s, size_t n);
 void ws_unmask(unsigned char *p, size_t n, const unsigned char mask[4]);

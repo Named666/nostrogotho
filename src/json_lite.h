@@ -45,8 +45,9 @@ bool jl_get_num(jstr_t json, const char *path, double *v);
 
 /* Unescape a quoted JSON string token into a malloc'd C string. */
 char *jl_unquote(jstr_t tok);
-/* Decode quoted string token into out (>= tok.len bytes); (size_t)-1 = invalid. */
-size_t jl_unescape(jstr_t tok, char *out);
+/* Decode quoted string token into out (>= tok.len bytes). false = not a
+ * valid string token (*out_len untouched). */
+bool jl_unescape(jstr_t tok, char *out, size_t *out_len);
 /* Compare a quoted string token with s without allocating (common case). */
 bool jl_tok_eq(jstr_t tok, const char *s);
 

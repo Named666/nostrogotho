@@ -42,9 +42,9 @@ bool nip_event_has_relay_tag(const event_t *event, const char *relay) {
         char sb[1024];
         char *b = v.len <= sizeof(sb) ? sb : (char *) malloc(v.len);
         if (!b) continue;
-        size_t vl = jl_unescape(v, b);
+        size_t vl;
         bool found = false;
-        if (vl != (size_t) -1) {
+        if (jl_unescape(v, b, &vl)) {
             while (vl && b[vl - 1] == '/') vl--;
             found = vl == relay_length && memcmp(b, relay, relay_length) == 0;
         }

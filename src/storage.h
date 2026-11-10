@@ -42,7 +42,20 @@
  * 
  * Note: json_event and event are valid only for the duration of the callback
  */
-enum { STORE_ERROR = -1, STORE_DUPLICATE = 0, STORE_INSERTED = 1, STORE_DELETED = 2 };
+/* Outcome of insert_event. */
+typedef enum {
+    STORAGE_PUT_INSERTED,    /* stored */
+    STORAGE_PUT_DUPLICATE,   /* id already stored (UNIQUE index is authoritative) */
+    STORAGE_PUT_TOMBSTONED,  /* a NIP-09 tombstone from the same author blocks it */
+    STORAGE_PUT_FAILED       /* database error (details on stderr) */
+} storage_put_t;
+
+/* Outcome of replaceable_admit. */
+typedef enum {
+    STORAGE_ADMIT_NEWEST,    /* newest version: older ones were deleted, store it */
+    STORAGE_ADMIT_STALE,     /* a newer (or tie-winning) version is stored; drop it */
+    STORAGE_ADMIT_FAILED     /* database error or OOM */
+} storage_admit_t;
 
 typedef void (*send_records_callback_t)(const char *json_event, const event_t *event);
 
@@ -103,19 +116,18 @@ typedef struct {
     bool (*insert_record)(const event_t *ev);
 
     /* insert_event - insert with a precise outcome (writer thread only).
-     * Returns STORE_INSERTED, STORE_DUPLICATE (id already stored; the
-     * UNIQUE index on event.id is authoritative), STORE_DELETED (a NIP-09
-     * tombstone from the same author blocks re-insertion) or STORE_ERROR. */
-    int (*insert_event)(const event_t *ev);
+     * See storage_put_t. */
+    storage_put_t (*insert_event)(const event_t *ev);
 
     /* replaceable_admit - NIP-01 replaceable / addressable admission.
      * dtag is NULL for replaceable kinds, the "d" value ("" if absent) for
      * addressable ones. If a stored version for the same key is newer (or
-     * same created_at and lower id), returns 0 and deletes nothing. Otherwise
-     * deletes every stored version for the key and returns 1. -1 on error.
+     * same created_at and lower id), returns STORAGE_ADMIT_STALE and deletes
+     * nothing. Otherwise deletes every stored version for the key and
+     * returns STORAGE_ADMIT_NEWEST. STORAGE_ADMIT_FAILED on error.
      * Writer thread only; runs inside the batch transaction so two versions
      * in one batch resolve in order and only the winner survives. */
-    int (*replaceable_admit)(const event_t *ev, const char *dtag);
+    storage_admit_t (*replaceable_admit)(const event_t *ev, const char *dtag);
 
     /* add_tombstone - remember that `pubkey` deleted event `id` (NIP-09), so
      * the event can never be re-inserted by that author. */
@@ -123,24 +135,26 @@ typedef struct {
     
     /* ====================================================================
      * Event Deletion Operations
+     * All deletion functions return true on success (false = database error
+     * or OOM) and store the number of rows deleted in *deleted when it is
+     * not NULL (*deleted is untouched on failure).
      * ==================================================================== */
     
     /* delete_record_by_id_and_pubkey - Delete a specific event (NIP-09)
      * Args: id - event ID, pubkey - author pubkey
-     * Returns: number of records deleted (0 or 1), or -1 on error
      * Used for NIP-09 deletion events
      */
-    int (*delete_record_by_id_and_pubkey)(const char *id, const char *pubkey);
+    bool (*delete_record_by_id_and_pubkey)(const char *id, const char *pubkey, size_t *deleted);
     
     /* delete_record_by_kind_and_pubkey - Delete replaceable events (NIP-09, NIP-16)
      * Args:
      *   kind - event kind (0, 3, or 10000-20000 range)
      *   pubkey - author pubkey
      *   created_at - delete events with created_at < this timestamp
-     * Returns: number of records deleted, or -1 on error
      * Used for replaceable events where newer overwrites older
      */
-    int (*delete_record_by_kind_and_pubkey)(int kind, const char *pubkey, time_t created_at);
+    bool (*delete_record_by_kind_and_pubkey)(int kind, const char *pubkey, time_t created_at,
+                                             size_t *deleted);
     
     /* delete_record_by_kind_and_pubkey_and_dtag - Delete addressable events (NIP-09, NIP-33)
      * Args:
@@ -148,34 +162,32 @@ typedef struct {
      *   pubkey - author pubkey
      *   tag - tag to match (usually ["d", "identifier"])
      *   created_at - delete events with created_at < this timestamp
-     * Returns: number of records deleted, or -1 on error
      * Used for parameterized replaceable events
      */
-    int (*delete_record_by_kind_and_pubkey_and_dtag)(int kind, const char *pubkey,
-                                                     const tag_t *tag, time_t created_at);
+    bool (*delete_record_by_kind_and_pubkey_and_dtag)(int kind, const char *pubkey,
+                                                      const tag_t *tag, time_t created_at,
+                                                      size_t *deleted);
     
     /* delete_record_by_id_and_kind_and_ptag - Delete gift-wrap events (NIP-09, NIP-17)
      * Args:
      *   id - event ID to match
      *   kind - event kind (1059, 21059 for gift wraps)
      *   tag - p-tag to match (usually ["p", pubkey])
-     * Returns: number of records deleted, or -1 on error
      * Used for gift wrap deletion (only sender/recipient can delete)
      */
-    int (*delete_record_by_id_and_kind_and_ptag)(const char *id, int kind,
-                                                 const tag_t *tag);
+    bool (*delete_record_by_id_and_kind_and_ptag)(const char *id, int kind,
+                                                  const tag_t *tag, size_t *deleted);
     
     /* delete_all_events_by_pubkey - Delete all events by author up to a time
      * Args:
      *   pubkey - author pubkey
      *   created_at - delete events with created_at <= this timestamp
      *   exclude_kind - if non-zero, events of this kind are kept (0 = delete all)
-     * Returns: number of records deleted, or -1 on error
      * Generic primitive; the NIP-62 plugin passes its own kind to keep the
      * vanish request itself from being deleted.
      */
-    int (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at,
-                                       int exclude_kind);
+    bool (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at,
+                                        int exclude_kind, size_t *deleted);
     
     /* purge_expired - Delete NIP-40 expired events (background GC)
      * 
@@ -186,12 +198,11 @@ typedef struct {
      * 
      * Args: now - reference timestamp (time(NULL)); events expiring on or
      *             before this instant are removed.
-     * Returns: number of rows deleted, or -1 on error. May be NULL if the
-     *          backend does not implement expiration GC.
-     * 
-     * Thread safety: same as the rest of the storage context (NOT thread-safe).
+     * Returns: true on success (*deleted = rows removed), false on error.
+     *          The pointer may be NULL if the backend has no expiration GC.
+     * Writer thread only (plugin timers run there).
      */
-    int (*purge_expired)(time_t now);
+    bool (*purge_expired)(time_t now, size_t *deleted);
     
     /* ====================================================================
      * Event Query and Streaming
@@ -235,8 +246,8 @@ typedef struct {
     bool (*commit_batch)(void);
     bool (*rollback_batch)(void);   /* after a failed commit */
     /* Checkpointer thread: PASSIVE WAL checkpoint on this thread's own
-     * connection (never blocks the writer). Returns WAL frames left. */
-    int (*checkpoint)(void);
+     * connection (never blocks the writer). false on error. */
+    bool (*checkpoint)(void);
 } storage_context_t;
 
 /* ============================================================================

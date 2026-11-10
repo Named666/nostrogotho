@@ -226,16 +226,17 @@ bool jl_get_num(jstr_t json, const char *path, double *v) {
     return true;
 }
 
-/* Decode a quoted JSON string token into out (needs tok.len bytes). Returns
- * decoded length, or (size_t)-1 if tok is not a valid string token. */
-size_t jl_unescape(jstr_t tok, char *out) {
-    if (!tok.buf || tok.len < 2 || tok.buf[0] != '"' || tok.buf[tok.len - 1] != '"') return (size_t) -1;
+/* Decode a quoted JSON string token into out (needs tok.len bytes). true
+ * and *out_len = decoded length; false if tok is not a valid string token
+ * (out then holds unspecified bytes, *out_len is untouched). */
+bool jl_unescape(jstr_t tok, char *out, size_t *out_len) {
+    if (!tok.buf || tok.len < 2 || tok.buf[0] != '"' || tok.buf[tok.len - 1] != '"') return false;
     const char *s = tok.buf + 1, *e = tok.buf + tok.len - 1;
     size_t o = 0;
     while (s < e) {
         char c = *s++;
         if (c != '\\') { out[o++] = c; continue; }
-        if (s >= e) return (size_t) -1;
+        if (s >= e) return false;
         c = *s++;
         switch (c) {
         case '"': out[o++] = '"'; break;   case '\\': out[o++] = '\\'; break;
@@ -244,13 +245,13 @@ size_t jl_unescape(jstr_t tok, char *out) {
         case 'r': out[o++] = '\r'; break;  case 't': out[o++] = '\t'; break;
         case 'u': {
             unsigned cp = 0;
-            if (e - s < 4) return (size_t) -1;
+            if (e - s < 4) return false;
             for (int i = 0; i < 4; i++) {
                 char h = *s++; cp <<= 4;
                 if (h >= '0' && h <= '9') cp |= (unsigned) (h - '0');
                 else if (h >= 'a' && h <= 'f') cp |= (unsigned) (h - 'a' + 10);
                 else if (h >= 'A' && h <= 'F') cp |= (unsigned) (h - 'A' + 10);
-                else return (size_t) -1;
+                else return false;
             }
             if (cp >= 0xD800 && cp <= 0xDBFF && e - s >= 6 && s[0] == '\\' && s[1] == 'u') {
                 unsigned lo = 0; const char *q = s + 2; int ok = 1;
@@ -270,10 +271,11 @@ size_t jl_unescape(jstr_t tok, char *out) {
             else { out[o++] = (char) (0xF0 | (cp >> 18)); out[o++] = (char) (0x80 | ((cp >> 12) & 0x3F)); out[o++] = (char) (0x80 | ((cp >> 6) & 0x3F)); out[o++] = (char) (0x80 | (cp & 0x3F)); }
             break;
         }
-        default: return (size_t) -1;
+        default: return false;
         }
     }
-    return o;
+    *out_len = o;
+    return true;
 }
 
 /* Does the quoted string token equal the C string s? No allocation for
@@ -286,8 +288,8 @@ bool jl_tok_eq(jstr_t tok, const char *s) {
     char stackbuf[1024];
     char *b = tok.len <= sizeof(stackbuf) ? stackbuf : (char *) malloc(tok.len);
     if (!b) return false;
-    size_t n = jl_unescape(tok, b);
-    bool eq = n != (size_t) -1 && n == sl && memcmp(b, s, sl) == 0;
+    size_t n;
+    bool eq = jl_unescape(tok, b, &n) && n == sl && memcmp(b, s, sl) == 0;
     if (b != stackbuf) free(b);
     return eq;
 }

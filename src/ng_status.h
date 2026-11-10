@@ -6,8 +6,12 @@
  *                  single failure path (most of the code).
  *   - pointer:     NULL = failed (allocation or invalid input).
  *   - ng_status_t: NG_OK (0) or a negative NG_E_* code when callers act on
- *                  the reason (config errors, parsers with distinct
- *                  "need more bytes" / "invalid" outcomes).
+ *                  the reason (config errors, ws_parse_header's
+ *                  NG_E_AGAIN / NG_E_INVALID, json_builder overflow).
+ *   - a named enum when the outcome is not an error but one of several
+ *     normal results (storage_put_t, storage_admit_t).
+ *   - counts are returned through a size_t out-parameter next to a bool,
+ *     never as "count or -1".
  * Functions never return a mix of these, and failures never leave a
  * half-updated output: outputs are written only on NG_OK / true.
  */

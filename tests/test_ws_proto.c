@@ -53,9 +53,9 @@ static void test_parse_lengths(void) {
         unsigned char h[14]; ws_frame_t f;
         size_t hn = client_header(h, 1, WS_OP_TEXT, lens[i]);
         for (size_t split = 0; split < hn; split++)              /* every incomplete prefix */
-            CHECK(ws_parse_header(h, split, &f) == 0);
+            CHECK(ws_parse_header(h, split, &f) == NG_E_AGAIN);
         memset(&f, 0, sizeof(f));
-        CHECK(ws_parse_header(h, hn, &f) == 1);
+        CHECK(ws_parse_header(h, hn, &f) == NG_OK);
         CHECK(f.fin && f.opcode == WS_OP_TEXT && f.masked && f.len == lens[i] && f.header_len == hn);
         CHECK(memcmp(f.mask, "\x11\x22\x33\x44", 4) == 0);
         CHECK(hn == (lens[i] < 126 ? 6u : lens[i] <= 0xFFFF ? 8u : 14u));
@@ -66,7 +66,7 @@ static void test_parse_lengths(void) {
         unsigned char h[10]; ws_frame_t f;
         size_t hn = ws_frame_header(h, WS_OP_TEXT, slens[i]);
         CHECK(hn == (slens[i] < 126 ? 2u : slens[i] <= 0xFFFF ? 4u : 10u));
-        CHECK(ws_parse_header(h, hn, &f) == 1 && !f.masked && f.len == slens[i] && f.header_len == hn && f.fin);
+        CHECK(ws_parse_header(h, hn, &f) == NG_OK && !f.masked && f.len == slens[i] && f.header_len == hn && f.fin);
     }
 }
 
@@ -75,24 +75,24 @@ static void test_parse_errors(void) {
     size_t hn;
     /* 64-bit length with the MSB set */
     hn = client_header(h, 1, WS_OP_BIN, 0x8000000000000000ull);
-    CHECK(ws_parse_header(h, hn, &f) == -1);
+    CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID);
     /* RSV1/2/3 */
     for (int r = 0x10; r <= 0x40; r <<= 1) {
         hn = client_header(h, 1, WS_OP_TEXT, 5); h[0] |= (unsigned char) r;
-        CHECK(ws_parse_header(h, hn, &f) == -1);
+        CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID);
     }
     /* control frames: payload <= 125 and FIN required */
-    hn = client_header(h, 1, WS_OP_PING, 125); CHECK(ws_parse_header(h, hn, &f) == 1);
-    hn = client_header(h, 1, WS_OP_PING, 126); CHECK(ws_parse_header(h, hn, &f) == -1);
-    hn = client_header(h, 0, WS_OP_PING, 5);   CHECK(ws_parse_header(h, hn, &f) == -1);
-    hn = client_header(h, 0, WS_OP_CLOSE, 2);  CHECK(ws_parse_header(h, hn, &f) == -1);
-    hn = client_header(h, 1, WS_OP_PONG, 0);   CHECK(ws_parse_header(h, hn, &f) == 1);
+    hn = client_header(h, 1, WS_OP_PING, 125); CHECK(ws_parse_header(h, hn, &f) == NG_OK);
+    hn = client_header(h, 1, WS_OP_PING, 126); CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID);
+    hn = client_header(h, 0, WS_OP_PING, 5);   CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID);
+    hn = client_header(h, 0, WS_OP_CLOSE, 2);  CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID);
+    hn = client_header(h, 1, WS_OP_PONG, 0);   CHECK(ws_parse_header(h, hn, &f) == NG_OK);
     /* reserved opcodes 3..7 and 11..15 */
-    for (int op = 3; op <= 7; op++) { hn = client_header(h, 1, op, 1); CHECK(ws_parse_header(h, hn, &f) == -1); }
-    for (int op = 11; op <= 15; op++) { hn = client_header(h, 1, op, 1); CHECK(ws_parse_header(h, hn, &f) == -1); }
+    for (int op = 3; op <= 7; op++) { hn = client_header(h, 1, op, 1); CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID); }
+    for (int op = 11; op <= 15; op++) { hn = client_header(h, 1, op, 1); CHECK(ws_parse_header(h, hn, &f) == NG_E_INVALID); }
     /* continuation and non-FIN data frames are fine at this layer */
-    hn = client_header(h, 0, WS_OP_TEXT, 3); CHECK(ws_parse_header(h, hn, &f) == 1 && !f.fin);
-    hn = client_header(h, 1, WS_OP_CONT, 3); CHECK(ws_parse_header(h, hn, &f) == 1 && f.opcode == WS_OP_CONT);
+    hn = client_header(h, 0, WS_OP_TEXT, 3); CHECK(ws_parse_header(h, hn, &f) == NG_OK && !f.fin);
+    hn = client_header(h, 1, WS_OP_CONT, 3); CHECK(ws_parse_header(h, hn, &f) == NG_OK && f.opcode == WS_OP_CONT);
 }
 
 static void test_utf8(void) {

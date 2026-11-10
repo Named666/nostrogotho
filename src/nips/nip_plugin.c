@@ -87,11 +87,14 @@ nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage
     if (!storage || !storage->insert_record) {
         return nip_plugin_reject("error: storage unavailable");
     }
-    int rc = storage->insert_event ? storage->insert_event(event)
-                                   : (storage->insert_record(event) ? STORE_INSERTED : STORE_DUPLICATE);
-    if (rc == STORE_INSERTED) return nip_plugin_accept();
-    if (rc == STORE_DUPLICATE) return nip_plugin_duplicate("duplicate: already have this event");
-    if (rc == STORE_DELETED) return nip_plugin_reject("blocked: this event was deleted by its author");
+    storage_put_t rc = storage->insert_event ? storage->insert_event(event)
+                       : (storage->insert_record(event) ? STORAGE_PUT_INSERTED : STORAGE_PUT_DUPLICATE);
+    switch (rc) {
+    case STORAGE_PUT_INSERTED:   return nip_plugin_accept();
+    case STORAGE_PUT_DUPLICATE:  return nip_plugin_duplicate("duplicate: already have this event");
+    case STORAGE_PUT_TOMBSTONED: return nip_plugin_reject("blocked: this event was deleted by its author");
+    case STORAGE_PUT_FAILED:     break;
+    }
     return nip_plugin_reject("error: failed to store event");
 }
 

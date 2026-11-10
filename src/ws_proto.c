@@ -83,27 +83,29 @@ size_t ws_frame_header(unsigned char *h, int opcode, size_t n) {
     return 10;
 }
 
-int ws_parse_header(const unsigned char *b, size_t n, ws_frame_t *f) {
-    if (n < 2) return 0;
-    f->fin = (b[0] & 0x80) != 0;
-    if (b[0] & 0x70) return -1;                 /* RSV bits: no extensions negotiated */
-    f->opcode = b[0] & 0x0F;
-    f->masked = (b[1] & 0x80) != 0;
+ng_status_t ws_parse_header(const unsigned char *b, size_t n, ws_frame_t *f) {
+    if (n < 2) return NG_E_AGAIN;
+    if (b[0] & 0x70) return NG_E_INVALID;       /* RSV bits: no extensions negotiated */
+    bool fin = (b[0] & 0x80) != 0;
+    int opcode = b[0] & 0x0F;
+    bool masked = (b[1] & 0x80) != 0;
     uint64_t len = b[1] & 0x7F;
     size_t h = 2;
-    if (len == 126) { if (n < 4) return 0; len = (uint64_t) b[2] << 8 | b[3]; h = 4; }
+    if (len == 126) { if (n < 4) return NG_E_AGAIN; len = (uint64_t) b[2] << 8 | b[3]; h = 4; }
     else if (len == 127) {
-        if (n < 10) return 0;
+        if (n < 10) return NG_E_AGAIN;
         len = 0; for (int i = 0; i < 8; i++) len = len << 8 | b[2 + i];
-        if (len >> 63) return -1;
+        if (len >> 63) return NG_E_INVALID;
         h = 10;
     }
-    if (f->masked) { if (n < h + 4) return 0; memcpy(f->mask, b + h, 4); h += 4; }
-    if (f->opcode >= 8 && (!f->fin || len > 125)) return -1;   /* control frame rules */
-    if ((f->opcode > 2 && f->opcode < 8) || f->opcode > 10) return -1;
+    if (masked && n < h + 4) return NG_E_AGAIN;
+    if (opcode >= 8 && (!fin || len > 125)) return NG_E_INVALID;   /* control frame rules */
+    if ((opcode > 2 && opcode < 8) || opcode > 10) return NG_E_INVALID;
+    f->fin = fin; f->opcode = opcode; f->masked = masked;
+    if (masked) { memcpy(f->mask, b + h, 4); h += 4; }
     f->len = len;
     f->header_len = h;
-    return 1;
+    return NG_OK;
 }
 
 void ws_unmask(unsigned char *p, size_t n, const unsigned char m[4]) {

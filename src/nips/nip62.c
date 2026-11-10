@@ -33,10 +33,8 @@ static nip01_process_result_t nip62_listener(
         /* Delete all of the author's events except the vanish request itself
          * (kind 62). The exclusion is a NIP-62 policy decision, so it lives
          * here in the plugin — the storage layer stays generic. */
-        int deleted = storage->delete_all_events_by_pubkey(event->pubkey,
-                                                           event->created_at,
-                                                           event->kind);
-        if (deleted < 0) {
+        if (!storage->delete_all_events_by_pubkey(event->pubkey, event->created_at,
+                                                  event->kind, NULL)) {
             return nip_plugin_reject("error: failed to vanish events");
         }
     }

@@ -178,7 +178,7 @@ nip01_process_result_t nip01_process_event(
 
 static bool nip01_replace_event(const event_t *event, storage_context_t *storage) {
     return storage->delete_record_by_kind_and_pubkey(event->kind, event->pubkey,
-                                                     event->created_at) >= 0;
+                                                     event->created_at, NULL);
 }
 
 static nip01_process_result_t nip01_replaceable_listener(
@@ -195,9 +195,9 @@ static nip01_process_result_t nip01_replaceable_listener(
     }
 
     if (storage->replaceable_admit) {
-        int v = storage->replaceable_admit(event, NULL);
-        if (v < 0) return nip_plugin_reject("error: failed to replace event");
-        if (v == 0) return nip_plugin_duplicate("duplicate: have this or a newer version");
+        storage_admit_t v = storage->replaceable_admit(event, NULL);
+        if (v == STORAGE_ADMIT_FAILED) return nip_plugin_reject("error: failed to replace event");
+        if (v == STORAGE_ADMIT_STALE) return nip_plugin_duplicate("duplicate: have this or a newer version");
     } else if (!nip01_replace_event(event, storage)) {
         return nip_plugin_reject("error: failed to replace event");
     }
@@ -244,7 +244,7 @@ static bool nip01_replace_addressable_event(const event_t *event,
     tag_t dtag = {(char *[]) {"d", dvalue ? dvalue : ""}, 2, 2};
     bool replaced = storage->delete_record_by_kind_and_pubkey_and_dtag(
                         event->kind, event->pubkey, &dtag,
-                        event->created_at) >= 0;
+                        event->created_at, NULL);
     free(dvalue);
     return replaced;
 }
@@ -264,10 +264,10 @@ static nip01_process_result_t nip01_addressable_listener(
 
     if (storage->replaceable_admit) {
         char *d = nip_event_d_value(event);
-        int v = storage->replaceable_admit(event, d ? d : "");
+        storage_admit_t v = storage->replaceable_admit(event, d ? d : "");
         free(d);
-        if (v < 0) return nip_plugin_reject("error: failed to replace event");
-        if (v == 0) return nip_plugin_duplicate("duplicate: have this or a newer version");
+        if (v == STORAGE_ADMIT_FAILED) return nip_plugin_reject("error: failed to replace event");
+        if (v == STORAGE_ADMIT_STALE) return nip_plugin_duplicate("duplicate: have this or a newer version");
     } else if (!nip01_replace_addressable_event(event, storage)) {
         return nip_plugin_reject("error: failed to replace event");
     }

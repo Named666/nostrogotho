@@ -66,9 +66,10 @@ void nip40_garbage_collect(void *arg) {
     storage_context_t *storage = (storage_context_t *) arg;
     if (!storage || !storage->purge_expired) return;
 
-    int deleted = storage->purge_expired(time(NULL));
-    if (deleted > 0) fprintf(stdout, "[NIP-40 GC] deleted %d expired event(s)\n", deleted);
-    else if (deleted < 0) fprintf(stderr, "NIP-40 GC: purge failed\n");
+    size_t deleted = 0;
+    bool ok = storage->purge_expired(time(NULL), &deleted);
+    if (deleted > 0) fprintf(stdout, "[NIP-40 GC] deleted %zu expired event(s)\n", deleted);
+    if (!ok) fprintf(stderr, "NIP-40 GC: purge failed\n");
 }
 
 /* ============================================================================

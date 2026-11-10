@@ -93,7 +93,7 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
     int kind;
     char pubkey[MAX_PUBKEY_SIZE + 1];
     const char *d_identifier;
-    int result;
+    bool ok;
 
     if (!parse_a_tag(a, &kind, pubkey, sizeof(pubkey), &d_identifier)) {
         return true;  /* Malformed "a" tag — nothing to act on. */
@@ -109,16 +109,16 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
 
     if (*d_identifier == '\0') {
         /* Replaceable event (e.g. kind 0, 3, 10000-20000). */
-        result = storage->delete_record_by_kind_and_pubkey(kind, pubkey,
-                                                           event->created_at);
+        ok = storage->delete_record_by_kind_and_pubkey(kind, pubkey,
+                                                       event->created_at, NULL);
     } else {
         /* Addressable event (kind 30000-40000) with a "d" identifier. */
         char *elements[2] = {"d", (char *)d_identifier};
         tag_t dtag = {elements, 2, 2};
-        result = storage->delete_record_by_kind_and_pubkey_and_dtag(
-            kind, pubkey, &dtag, event->created_at);
+        ok = storage->delete_record_by_kind_and_pubkey_and_dtag(
+            kind, pubkey, &dtag, event->created_at, NULL);
     }
-    return result >= 0;
+    return ok;
 }
 
 /* Return true when `event` (the deletion author) is authorized to delete
@@ -137,8 +137,8 @@ static bool deletion_authorized(const event_t *event, const event_t *target) {
 static bool delete_e_target(const event_t *event, storage_context_t *storage,
                             const char *id) {
     event_t *target = storage->get_event_by_id(id);
-    int result;
-    bool ok = true;
+    size_t n = 0;
+    bool ok = true, done;
 
     /* Tombstone the id for this author first, even when the target has not
      * arrived yet: the writer refuses any later insert of (id, author). */
@@ -156,12 +156,12 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
         kind_is_requested(event, target->kind)) {
         if (target->kind == 1059) {
             tag_t recipient = {(char *[]) {"p", (char *) event->pubkey}, 2, 2};
-            result = storage->delete_record_by_id_and_kind_and_ptag(
-                id, 1059, &recipient);
+            done = storage->delete_record_by_id_and_kind_and_ptag(
+                id, 1059, &recipient, &n);
         } else {
-            result = storage->delete_record_by_id_and_pubkey(id, event->pubkey);
+            done = storage->delete_record_by_id_and_pubkey(id, event->pubkey, &n);
         }
-        if (result <= 0) ok = false;
+        if (!done || n == 0) ok = false;   /* target was just read: 0 rows = lost race */
     }
     event_free(target);
     return ok;

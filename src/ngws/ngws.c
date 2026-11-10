@@ -655,9 +655,9 @@ static int frame_check(sockx_t *x, int fin, int rsv, int op, int mask, uint64_t 
 /* In-tree codec: parse frames in place from the receive buffer (zero copy). */
 static long ws_frame(sockx_t *x, unsigned char *b, size_t blen) {
     ws_frame_t f;
-    int r = ws_parse_header(b, blen, &f);
-    if (r < 0) { ws_fail(x, 1002); return -1; }
-    if (r == 0) return 0;
+    ng_status_t r = ws_parse_header(b, blen, &f);
+    if (r == NG_E_INVALID) { ws_fail(x, 1002); return -1; }
+    if (r == NG_E_AGAIN) return 0;
     int code = frame_check(x, f.fin, 0, f.opcode, f.masked, f.len);
     if (code) {
         ws_fail(x, code);
@@ -689,7 +689,7 @@ static long ws_frame(sockx_t *x, unsigned char *b, size_t blen) {
  * frame buffer once avoids realloc/copy cascades for large messages. */
 static size_t frame_need(sockx_t *x, const unsigned char *b, size_t n) {
     ws_frame_t f;
-    if (ws_parse_header(b, n, &f) <= 0) return 4096;
+    if (ws_parse_header(b, n, &f) != NG_OK) return 4096;
     if (f.len > SRV(x)->cfg.max_payload) return 4096;   /* rejected anyway; never trust it */
     uint64_t t = f.header_len + f.len;
     return t < 4096 ? 4096 : (size_t) t;
@@ -749,9 +749,9 @@ static void drain_input(sockx_t *x, unsigned char *d, size_t n) {
         size_t take = 14 - have < n ? 14 - have : n;
         memcpy(hb + have, d, take);
         ws_frame_t f;
-        int r = ws_parse_header(hb, have + take, &f);
-        if (r < 0) { us_socket_close(0, x->s, 0, NULL); return; }
-        if (r == 0) {                          /* keep partial header */
+        ng_status_t r = ws_parse_header(hb, have + take, &f);
+        if (r == NG_E_INVALID) { us_socket_close(0, x->s, 0, NULL); return; }
+        if (r == NG_E_AGAIN) {                 /* keep partial header */
             if (!x->rbuf) { x->rbuf = (unsigned char *) malloc(16); x->rcap = 16; if (!x->rbuf) return; }
             memcpy(x->rbuf, hb, have + take); x->rlen = have + take;
             return;
