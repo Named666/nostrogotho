@@ -114,7 +114,8 @@ static void pgo_flags(Cmd *cmd)
 }
 
 #define US THIRD_PARTY_FOLDER"usockets/src/"
-#define NGWS_SOURCES SRC_FOLDER"ngws/ngws.c", SRC_FOLDER"ws_proto.c"
+#define NGWS_SOURCES SRC_FOLDER"ngws/ngws.c", SRC_FOLDER"ngws/ngws_handshake.c", SRC_FOLDER"ngws/ngws_frame.c", \
+                     SRC_FOLDER"ngws/ngws_send.c", SRC_FOLDER"ws_proto.c"
 
 #define CORE_SOURCES \
     SRC_FOLDER"main.c", SRC_FOLDER"ng_config.c", SRC_FOLDER"relay_core.c", SRC_FOLDER"relay_conn.c", \

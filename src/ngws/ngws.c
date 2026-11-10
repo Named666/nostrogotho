@@ -2,7 +2,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-#include "ngws.h"
+#include "ngws_internal.h"
 
 #include <arpa/inet.h>
 #ifdef __GLIBC__
@@ -14,461 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <errno.h>
-#include <sys/uio.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
 #include "libusockets.h"
 #include "../platform/ng_alloc.h"
-#include "../ws_proto.h"
-
-
-#define MAX_HTTP_HEADER   8192
-#define ARENA_CHUNK       (256 * 1024)
-#define SEND_WATERMARK    (64 * 1024)
-#define DIRECT_MIN        (64 * 1024)  /* frames this big skip the arena copy (send_direct) */
-#define MSG_CHUNK         65536      /* pooled message-assembly buffer */
-#define POOL_MAX          256        /* pooled buffers kept per loop */
-#define MAX_LOOPS         64
-
-enum { ST_HTTP = 0, ST_WS, ST_CLOSING, ST_CLOSED };
-
-typedef struct sockx {
-    struct sockx *dprev, *dnext;      /* loop dirty list (needs flush) */
-    struct sockx *aprev, *anext;      /* loop list of open WebSockets */
-    struct sockx *bprev, *bnext;      /* loop list of sockets owning a backlog buffer */
-    struct us_socket_t *s;
-    ngws_loop_t *loop;
-    uint8_t state, msg_op, ping_sent, dirty, shutdown_after_flush, in_data, in_frame, frame_op, drain;
-    unsigned char *rbuf; size_t rlen, rcap;    /* HTTP header / native partial frame */
-    unsigned char *msg;  size_t mlen, mcap;    /* fragmented message / split control frame */
-    char *obuf; size_t olen, ooff, ocap;       /* backlog the kernel did not take */
-    uint32_t qhead, qtail;                     /* this iteration's iovec queue (node idx+1) */
-    uint64_t skip;                             /* closing: payload bytes still to discard */
-    size_t qbytes;
-} sockx_t;
-
-#define USER_OFF ((sizeof(sockx_t) + 15) & ~(size_t) 15)
-
-typedef struct pool_item { struct pool_item *next; } pool_item_t;
-typedef struct arena_chunk { struct arena_chunk *next; size_t cap, used; unsigned char data[]; } arena_chunk_t;
-typedef struct { const void *p; size_t len; uint32_t next; } ionode_t;
-typedef struct { void (*fn)(void *); void *arg; } defer_t;
-
-struct ngws_loop {
-    int idx;
-    ngws_server_t *srv;
-    struct us_loop_t *loop;
-    struct us_socket_context_t *ctx;
-    struct us_listen_socket_t *ls;
-    bool ctx_closed;                    /* loop_stop_listening ran */
-    pthread_t th;
-    pthread_mutex_t mu;
-    ngws_task_t *head, *tail;
-    ng_atomic_bool wake_pending;
-    sockx_t *dirty;                     /* head of dirty list */
-    sockx_t *all;                       /* open WebSockets */
-    sockx_t *blog;                      /* sockets with a backlog buffer (obuf) */
-    size_t n_open;
-    arena_chunk_t *arena, *arena_cur;
-    ionode_t *nodes; uint32_t n_nodes, cap_nodes;
-    defer_t *defer; uint32_t n_defer, cap_defer;
-    pool_item_t *msg_pool; int n_msg_pool;
-    void *user;
-};
-
-struct ngws_server {
-    ngws_config_t cfg;
-    int n_loops;
-    ngws_loop_t loops[MAX_LOOPS];
-    ng_atomic_bool stopping;
-    ng_atomic_size backlog_total;        /* sum of obuf capacities, all loops */
-    ng_atomic_ullong closed_conn_limit, closed_total_limit;
-    bool uncork;                        /* flush a socket at the end of its on_data */
-};
-
-static inline sockx_t *X(struct us_socket_t *s) { return (sockx_t *) us_socket_ext(0, s); }
-static inline ngws_server_t *SRV(sockx_t *x) { return x->loop->srv; }
-
-/* ------------------------------------------------------------- pools ---- */
-
-/* ------------------------------------------------------------- frames --- */
-size_t ngws_frame_overhead(size_t len) { return len < 126 ? 2 : len <= 0xFFFF ? 4 : 10; }
-
-
-size_t ngws_frame_build(void *out, int op, const void *data, size_t len) {
-    size_t h = ws_frame_header((unsigned char *) out, op, len);
-    memcpy((char *) out + h, data, len);
-    return h + len;
-}
-
-/* ------------------------------------------------------------- output --- */
-/* Output model
- *   During a loop iteration every send becomes an iovec node on the socket's
- *   queue. Node bytes live in the loop arena (copied once, contiguous, reused
- *   every iteration so it stays in cache) or, for ngws_send_shared(), point at
- *   caller memory shared by many sockets (zero copy broadcast). At the end of
- *   the iteration each dirty socket is flushed with one writev(). Whatever the
- *   kernel does not take is copied into the socket's private backlog buffer
- *   (obuf); while a backlog exists, new sends append to it to keep order. */
-static void dirty_add(sockx_t *x) {
-    if (x->dirty) return;
-    ngws_loop_t *l = x->loop;
-    x->dirty = 1; x->dprev = NULL; x->dnext = l->dirty;
-    if (l->dirty) l->dirty->dprev = x;
-    l->dirty = x;
-}
-static void dirty_del(sockx_t *x) {
-    if (!x->dirty) return;
-    if (x->dprev) x->dprev->dnext = x->dnext; else x->loop->dirty = x->dnext;
-    if (x->dnext) x->dnext->dprev = x->dprev;
-    x->dirty = 0; x->dprev = x->dnext = NULL;
-}
-
-static void *arena_alloc(ngws_loop_t *l, size_t n);
-void *ngws_loop_alloc(ngws_loop_t *l, size_t n) {
-    arena_chunk_t *c = l->arena_cur;
-    if (c) c->used = (c->used + 15) & ~(size_t) 15;    /* caller-visible blocks are 16-aligned */
-    if (c && c->used > c->cap) c->used = c->cap;
-    return arena_alloc(l, (n + 15) & ~(size_t) 15);
-}
-
-void *ngws_loop_alloc_frame(ngws_loop_t *l, size_t n) { return arena_alloc(l, n); }
-
-/* Unaligned bump allocation (frame bytes need no alignment), so that a
- * socket's consecutive frames in one iteration land back to back and can
- * be coalesced into a single iovec. */
-static void *arena_alloc(ngws_loop_t *l, size_t n) {
-    arena_chunk_t *c = l->arena_cur;
-    if (c && c->used + n <= c->cap) { void *p = c->data + c->used; c->used += n; return p; }
-    /* next chunk: reuse a retained one or allocate */
-    arena_chunk_t *nc = c ? c->next : l->arena;
-    if (nc && nc->cap >= n) { nc->used = n; l->arena_cur = nc; return nc->data; }
-    size_t cap = n > ARENA_CHUNK ? n : ARENA_CHUNK;
-    arena_chunk_t *a = (arena_chunk_t *) ng_malloc_add(sizeof(*a), cap);
-    if (!a) return NULL;
-    a->cap = cap; a->used = n;
-    if (c) { a->next = c->next; c->next = a; } else { a->next = l->arena; l->arena = a; }
-    l->arena_cur = a;
-    return a->data;
-}
-
-static void arena_reset(ngws_loop_t *l) {
-    /* keep the first two standard chunks, free the rest (large/oversized) */
-    int kept = 0;
-    arena_chunk_t **pp = &l->arena;
-    while (*pp) {
-        arena_chunk_t *c = *pp;
-        if (kept < 2 && c->cap == ARENA_CHUNK) { c->used = 0; kept++; pp = &c->next; }
-        else { *pp = c->next; free(c); }
-    }
-    l->arena_cur = l->arena;
-    l->n_nodes = 0;
-}
-
-static bool node_add(sockx_t *x, const void *p, size_t n) {
-    ngws_loop_t *l = x->loop;
-    if (l->n_nodes == l->cap_nodes) {
-        if (l->cap_nodes > UINT32_MAX / 2) return false;          /* node index is 32-bit */
-        uint32_t nc = l->cap_nodes ? l->cap_nodes * 2 : 4096;
-        ionode_t *nn = (ionode_t *) ng_realloc_array(l->nodes, nc, sizeof(ionode_t));
-        if (!nn) return false;
-        l->nodes = nn; l->cap_nodes = nc;
-    }
-    uint32_t i = l->n_nodes++;
-    l->nodes[i].p = p; l->nodes[i].len = n; l->nodes[i].next = 0;
-    if (x->qtail) l->nodes[x->qtail - 1].next = i + 1; else x->qhead = i + 1;
-    x->qtail = i + 1;
-    x->qbytes += n;
-    dirty_add(x);
-    return true;
-}
-
-/* Grow the private backlog so that `need` bytes fit after compaction.
- * Enforces the per-socket limit (max_backpressure) and the process-wide
- * budget (max_total_backlog): once the budget is exhausted a socket that
- * wants a backlog above the drain watermark is a slow reader and is refused
- * (the caller terminates it). Capacity is accounted, not bytes in use, so
- * the budget tracks real memory. */
-static bool obuf_room(sockx_t *x, size_t n) {
-    ngws_server_t *srv = SRV(x);
-    size_t pending = x->olen - x->ooff;
-    if (pending + n > srv->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&srv->closed_conn_limit, 1, NG_MO_RELAXED); return false; }
-    if (x->olen + n <= x->ocap) return true;
-    if (x->ooff) { memmove(x->obuf, x->obuf + x->ooff, pending); x->olen = pending; x->ooff = 0; }
-    size_t want;
-    if (!ng_size_add(x->olen, n, &want)) return false;
-    if (want <= x->ocap) return true;
-    size_t nc = ng_grow_cap(x->ocap, want, 4096);
-    size_t grow = nc - x->ocap;
-    if (srv->cfg.max_total_backlog && pending + n > SEND_WATERMARK &&
-        ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED) + grow > srv->cfg.max_total_backlog) {
-        ng_atomic_fetch_add_explicit(&srv->closed_total_limit, 1, NG_MO_RELAXED);
-        return false;
-    }
-    char *nb = (char *) realloc(x->obuf, nc);
-    if (!nb) return false;
-    ng_atomic_fetch_add_explicit(&srv->backlog_total, grow, NG_MO_RELAXED);
-    if (!x->ocap) {                                   /* join the loop's backlog list */
-        ngws_loop_t *l = x->loop;
-        x->bprev = NULL; x->bnext = l->blog;
-        if (l->blog) l->blog->bprev = x;
-        l->blog = x;
-    }
-    x->obuf = nb; x->ocap = nc;
-    return true;
-}
-
-/* Append to the private backlog buffer. */
-static bool backlog_append(sockx_t *x, const void *p, size_t n) {
-    if (!obuf_room(x, n)) return false;
-    memcpy(x->obuf + x->olen, p, n); x->olen += n;
-    return true;
-}
-
-static void out_release(sockx_t *x) {
-    if (x->ocap) {
-        ng_atomic_fetch_sub_explicit(&SRV(x)->backlog_total, x->ocap, NG_MO_RELAXED);
-        if (x->bprev) x->bprev->bnext = x->bnext; else x->loop->blog = x->bnext;
-        if (x->bnext) x->bnext->bprev = x->bprev;
-        x->bprev = x->bnext = NULL;
-    }
-    free(x->obuf);
-    x->obuf = NULL; x->olen = x->ooff = x->ocap = 0;
-}
-
-/* Reserve n writable bytes for this socket's output. NULL = limit/oom (socket terminated). */
-static char *out_reserve(sockx_t *x, size_t n) {
-    if (x->olen > x->ooff) {                       /* backlog: keep order */
-        if (!obuf_room(x, n)) goto fail;
-        char *p = x->obuf + x->olen; x->olen += n;
-        return p;
-    }
-    if (x->qbytes + n > SRV(x)->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, NG_MO_RELAXED); goto fail; }
-    ngws_loop_t *l = x->loop;
-    arena_chunk_t *c = l->arena_cur;
-    if (x->qtail && c && c->used + n <= c->cap) {
-        ionode_t *t = &l->nodes[x->qtail - 1];
-        if ((const unsigned char *) t->p + t->len == c->data + c->used) {   /* extend our tail iovec */
-            char *p = (char *) c->data + c->used;
-            c->used += n; t->len += n; x->qbytes += n;
-            return p;
-        }
-    }
-    char *p = (char *) arena_alloc(l, n);
-    if (!p || !node_add(x, p, n)) goto fail;
-    return p;
-fail:
-    ngws_terminate((ngws_socket_t *) x->s);
-    return NULL;
-}
-
-/* Write pending output. Returns true if everything was flushed. */
-static bool flush(sockx_t *x) {
-    struct us_socket_t *s = x->s;
-    ngws_loop_t *l = x->loop;
-    while (x->ooff < x->olen) {                     /* backlog first */
-        size_t n = x->olen - x->ooff;
-        int w = us_socket_write(0, s, x->obuf + x->ooff, n > 0x40000000 ? 0x40000000 : (int) n, 0);
-        if (w <= 0) break;
-        x->ooff += (size_t) w;
-        if ((size_t) w < n) break;
-    }
-    if (x->ooff < x->olen) {
-        /* still backlogged: move queued nodes behind it */
-        for (uint32_t i = x->qhead; i; i = l->nodes[i - 1].next)
-            if (!backlog_append(x, l->nodes[i - 1].p, l->nodes[i - 1].len)) { x->qhead = x->qtail = 0; x->qbytes = 0; ngws_terminate((ngws_socket_t *) s); return false; }
-        x->qhead = x->qtail = 0; x->qbytes = 0;
-        return false;
-    }
-    if (x->obuf) {
-        out_release(x);
-        if (x->state == ST_WS && SRV(x)->cfg.on_drain) SRV(x)->cfg.on_drain((ngws_socket_t *) s);
-    }
-    if (x->qhead) {
-        int fd = (int) (intptr_t) us_socket_get_native_handle(0, s);
-        uint32_t i = x->qhead;
-        while (i) {
-            struct iovec iov[64]; int k = 0; size_t want = 0;
-            uint32_t j = i;
-            for (; j && k < 64; j = l->nodes[j - 1].next, k++) {
-                iov[k].iov_base = (void *) l->nodes[j - 1].p; iov[k].iov_len = l->nodes[j - 1].len; want += iov[k].iov_len;
-            }
-            /* one iovec (the common case: a socket's frames coalesce): send() skips the iovec import */
-            ssize_t w = us_socket_is_closed(0, s) || us_socket_is_shut_down(0, s) ? -1 :
-                        k == 1 ? send(fd, iov[0].iov_base, iov[0].iov_len, MSG_NOSIGNAL) : writev(fd, iov, k);
-            if (w == (ssize_t) want) { i = j; continue; }
-            /* partial: copy the unsent rest of this batch and all later nodes to the backlog */
-            size_t done = w > 0 ? (size_t) w : 0;
-            bool ok = true;
-            for (int m = 0; m < k && ok; m++) {
-                if (done >= iov[m].iov_len) { done -= iov[m].iov_len; continue; }
-                ok = backlog_append(x, (char *) iov[m].iov_base + done, iov[m].iov_len - done);
-                done = 0;
-            }
-            for (; j && ok; j = l->nodes[j - 1].next) ok = backlog_append(x, l->nodes[j - 1].p, l->nodes[j - 1].len);
-            x->qhead = x->qtail = 0; x->qbytes = 0;
-            if (!ok) { ngws_terminate((ngws_socket_t *) s); return false; }
-            if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { ngws_terminate((ngws_socket_t *) s); return false; }
-            /* let uSockets arm the writable poll */
-            if (x->olen > x->ooff) {
-                int w2 = us_socket_write(0, s, x->obuf + x->ooff, (int) (x->olen - x->ooff), 0);
-                if (w2 > 0) x->ooff += (size_t) w2;
-                if (x->ooff == x->olen) { out_release(x); break; }
-            }
-            return false;
-        }
-        x->qhead = x->qtail = 0; x->qbytes = 0;
-    }
-    if (x->shutdown_after_flush && !us_socket_is_closed(0, s)) us_socket_shutdown(0, s);
-    return true;
-}
-
-static int send_status(sockx_t *x) {
-    return (x->olen - x->ooff) + x->qbytes > SEND_WATERMARK ? NGWS_SEND_BACKPRESSURE : NGWS_SEND_OK;
-}
-
-/* Large frame with nothing queued ahead of it: write it straight from the
- * caller's buffer (header + payload in one writev) instead of copying it
- * into the arena first; only what the kernel does not take is copied, to
- * the backlog. Saves one full copy per large message. Smaller frames keep
- * the arena path so a socket's frames coalesce into one writev. */
-static int send_direct(sockx_t *x, int op, const void *data, size_t len) {
-    struct us_socket_t *s = x->s;
-    unsigned char hdr[10];
-    size_t h = ws_frame_header(hdr, op, len), total = h + len;
-    if (total > SRV(x)->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, NG_MO_RELAXED); ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
-    struct iovec iov[2] = { { hdr, h }, { (void *) data, len } };
-    ssize_t w = writev((int) (intptr_t) us_socket_get_native_handle(0, s), iov, 2);
-    if (w == (ssize_t) total) return NGWS_SEND_OK;
-    if (w < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
-        w = 0;
-    }
-    size_t done = (size_t) w;
-    bool ok = done < h ? backlog_append(x, hdr + done, h - done) && backlog_append(x, data, len)
-                       : backlog_append(x, (const char *) data + (done - h), len - (done - h));
-    if (!ok) { ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
-    /* let uSockets arm the writable poll (on_writable drains the backlog) */
-    int w2 = us_socket_write(0, s, x->obuf + x->ooff, (int) (x->olen - x->ooff), 0);
-    if (w2 > 0) x->ooff += (size_t) w2;
-    if (x->ooff == x->olen) { out_release(x); return NGWS_SEND_OK; }
-    return send_status(x);
-}
-
-static int queue_frame(sockx_t *x, int op, const void *data, size_t len) {
-    if (len >= DIRECT_MIN && !x->qhead && x->olen == x->ooff && !us_socket_is_closed(0, x->s) &&
-        !us_socket_is_shut_down(0, x->s))
-        return send_direct(x, op, data, len);
-    char *p = out_reserve(x, len + ngws_frame_overhead(len));
-    if (!p) return NGWS_SEND_DROPPED;
-    size_t h = ws_frame_header((unsigned char *) p, op, len);
-    memcpy(p + h, data, len);
-    return send_status(x);
-}
-
-int ngws_send(ngws_socket_t *ws, const void *data, size_t len, int opcode) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_WS) return NGWS_SEND_DROPPED;
-    return queue_frame(x, opcode, data, len);
-}
-
-int ngws_send_raw(ngws_socket_t *ws, const void *frame, size_t len) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_WS) return NGWS_SEND_DROPPED;
-    char *p = out_reserve(x, len);
-    if (!p) return NGWS_SEND_DROPPED;
-    memcpy(p, frame, len);
-    return send_status(x);
-}
-
-int ngws_send_raw3(ngws_socket_t *ws, const void *a, size_t an, const void *b, size_t bn, const void *c, size_t cn) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_WS) return NGWS_SEND_DROPPED;
-    char *p = out_reserve(x, an + bn + cn);
-    if (!p) return NGWS_SEND_DROPPED;
-    memcpy(p, a, an); memcpy(p + an, b, bn); memcpy(p + an + bn, c, cn);
-    return send_status(x);
-}
-
-int ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_WS) return NGWS_SEND_DROPPED;
-    if (x->olen > x->ooff) {
-        if (!backlog_append(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
-        dirty_add(x);
-    } else {
-        if (x->qbytes + len > SRV(x)->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, NG_MO_RELAXED); ngws_terminate(ws); return NGWS_SEND_DROPPED; }
-        ionode_t *t = x->qtail ? &x->loop->nodes[x->qtail - 1] : NULL;
-        if (t && (const char *) t->p + t->len == (const char *) frame) { t->len += len; x->qbytes += len; }  /* contiguous: one iovec */
-        else if (!node_add(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
-    }
-    return send_status(x);
-}
-
-void ngws_loop_defer(ngws_loop_t *l, void (*fn)(void *), void *arg) {
-    if (l->n_defer == l->cap_defer) {
-        uint32_t nc = l->cap_defer ? l->cap_defer * 2 : 256;
-        defer_t *nd = l->cap_defer > UINT32_MAX / 2 ? NULL : (defer_t *) ng_realloc_array(l->defer, nc, sizeof(defer_t));
-        if (!nd) { fn(arg); return; }      /* cannot defer: caller must not rely on it then */
-        l->defer = nd; l->cap_defer = nc;
-    }
-    l->defer[l->n_defer].fn = fn; l->defer[l->n_defer].arg = arg; l->n_defer++;
-}
-
-static void close_after_flush(sockx_t *x) {
-    x->state = ST_CLOSING;
-    x->shutdown_after_flush = 1;
-    if (x->olen == x->ooff && !x->qbytes) { if (!us_socket_is_closed(0, x->s)) us_socket_shutdown(0, x->s); }
-    else dirty_add(x);
-    us_socket_timeout(0, x->s, 8);      /* don't wait forever for the peer's FIN */
-}
-
-/* Server-initiated WebSocket close: send the close frame, then wait (up to
- * 8 s) for the peer to finish its close handshake and FIN instead of sending
- * our FIN at once; a client still writing a large message would otherwise
- * see its write fail. Input is discarded meanwhile. */
-static void close_wait_peer(sockx_t *x) {
-    x->state = ST_CLOSING;
-    x->drain = 1;
-    x->rlen = 0;
-    if (x->olen > x->ooff || x->qbytes) dirty_add(x);
-    us_socket_timeout(0, x->s, 8);
-}
-
-static void ws_fail(sockx_t *x, int code) {
-    if (x->state == ST_WS) {
-        unsigned char b[2] = { (unsigned char) (code >> 8), (unsigned char) code };
-        queue_frame(x, NGWS_OP_CLOSE, b, 2);
-        if (!us_socket_is_closed(0, x->s)) close_wait_peer(x);
-        return;
-    }
-    if (!us_socket_is_closed(0, x->s)) close_after_flush(x);
-}
-
-void ngws_close(ngws_socket_t *ws, int code, const char *reason) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_WS || us_socket_is_closed(0, s)) return;
-    unsigned char b[125];
-    size_t rl = reason ? strlen(reason) : 0; if (rl > 123) rl = 123;
-    b[0] = (unsigned char) (code >> 8); b[1] = (unsigned char) code;
-    if (rl) memcpy(b + 2, reason, rl);
-    queue_frame(x, NGWS_OP_CLOSE, b, 2 + rl);
-    if (!us_socket_is_closed(0, s)) close_wait_peer(x);
-}
-
-void ngws_terminate(ngws_socket_t *ws) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    if (!us_socket_is_closed(0, s)) us_socket_close(0, s, 0, NULL);
-}
 
 bool ngws_is_closed(ngws_socket_t *ws) {
     struct us_socket_t *s = (struct us_socket_t *) ws;
@@ -489,286 +41,24 @@ int ngws_remote_address(ngws_socket_t *ws, char *buf, size_t cap) {
     return snprintf(buf, cap, "%s:%d", txt, us_socket_remote_port(0, s));
 }
 
-void ngws_http_respond(ngws_socket_t *ws, const char *status, const char *extra,
-                       const char *ctype, const void *body, size_t len) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_HTTP || us_socket_is_closed(0, s)) return;
-    char head[1024];
-    int hl = snprintf(head, sizeof(head),
-        "HTTP/1.1 %s\r\n%sContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
-        status, extra ? extra : "", ctype ? ctype : "text/plain", len);
-    if (hl < 0 || (size_t) hl >= sizeof(head)) hl = 0;
-    char *p = out_reserve(x, (size_t) hl + len);
-    if (!p) return;
-    memcpy(p, head, (size_t) hl);
-    if (len) memcpy(p + hl, body, len);
-    close_after_flush(x);
-}
-
-/* ------------------------------------------------------------- input ---- */
-static bool header_value(const char *h, size_t n, const char *name, const char **v, size_t *vl) {
-    size_t nl = strlen(name);
-    const char *p = h, *end = h + n;
-    while (p < end) {
-        const char *eol = (const char *) memchr(p, '\n', (size_t) (end - p));
-        if (!eol) eol = end;
-        if ((size_t) (eol - p) > nl && strncasecmp(p, name, nl) == 0 && p[nl] == ':') {
-            const char *a = p + nl + 1, *b = eol;
-            while (a < b && (*a == ' ' || *a == '\t')) a++;
-            while (b > a && (b[-1] == '\r' || b[-1] == ' ' || b[-1] == '\t')) b--;
-            *v = a; *vl = (size_t) (b - a);
-            return true;
-        }
-        p = eol + 1;
-    }
-    return false;
-}
-static bool contains_ci(const char *v, size_t vl, const char *needle) {
-    size_t n = strlen(needle);
-    for (size_t i = 0; i + n <= vl; i++) if (strncasecmp(v + i, needle, n) == 0) return true;
-    return false;
-}
-
-static void ws_list_add(sockx_t *x) {
+void nx_ws_list_add(sockx_t *x) {
     ngws_loop_t *l = x->loop;
     x->aprev = NULL; x->anext = l->all;
     if (l->all) l->all->aprev = x;
     l->all = x; l->n_open++;
 }
-static void ws_list_del(sockx_t *x) {
+void nx_ws_list_del(sockx_t *x) {
     ngws_loop_t *l = x->loop;
     if (x->aprev) x->aprev->anext = x->anext; else if (l->all == x) l->all = x->anext; else return;
     if (x->anext) x->anext->aprev = x->aprev;
     x->aprev = x->anext = NULL; l->n_open--;
 }
 
-/* Returns header bytes consumed, 0 if incomplete, -1 if the request was answered/failed. */
-static long handle_http(sockx_t *x, const char *b, size_t n) {
-    ngws_server_t *srv = SRV(x);
-    const char *endh = NULL;
-    for (size_t i = 3; i < n; i++)
-        if (b[i] == '\n' && b[i-1] == '\r' && b[i-2] == '\n' && b[i-3] == '\r') { endh = b + i + 1; break; }
-    if (!endh) {
-        if (n > MAX_HTTP_HEADER) { ngws_http_respond((ngws_socket_t *) x->s, "431 Request Header Fields Too Large", NULL, NULL, "", 0); return -1; }
-        return 0;
-    }
-    size_t hn = (size_t) (endh - b);
-    ngws_http_req_t req = {0};
-    const char *sp = (const char *) memchr(b, ' ', hn);
-    if (!sp) { ngws_http_respond((ngws_socket_t *) x->s, "400 Bad Request", NULL, NULL, "", 0); return -1; }
-    req.method = b; req.method_len = (size_t) (sp - b);
-    req.path = sp + 1;
-    const char *sp2 = (const char *) memchr(req.path, ' ', (size_t) (endh - req.path));
-    req.path_len = sp2 ? (size_t) (sp2 - req.path) : 0;
-    const char *eol = (const char *) memchr(b, '\n', hn);
-    req.headers = eol ? eol + 1 : endh; req.headers_len = (size_t) (endh - req.headers);
-
-    const char *v; size_t vl;
-    bool upgrade = req.method_len == 3 && memcmp(b, "GET", 3) == 0 &&
-                   header_value(req.headers, req.headers_len, "Upgrade", &v, &vl) && contains_ci(v, vl, "websocket");
-    if (!upgrade) {
-        if (srv->cfg.on_http) srv->cfg.on_http((ngws_socket_t *) x->s, &req);
-        if (x->state == ST_HTTP && !us_socket_is_closed(0, x->s))
-            ngws_http_respond((ngws_socket_t *) x->s, "426 Upgrade Required", "Upgrade: websocket\r\n", NULL, "", 0);
-        return -1;
-    }
-    if (!header_value(req.headers, req.headers_len, "Sec-WebSocket-Key", &v, &vl) || vl == 0 || vl > 64) {
-        ngws_http_respond((ngws_socket_t *) x->s, "400 Bad Request", NULL, NULL, "", 0); return -1;
-    }
-    char accept[29];
-    ws_accept_key(v, vl, accept);
-    static const char r1[] = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
-    char *p = out_reserve(x, sizeof(r1) - 1 + 28 + 4);
-    if (!p) return -1;
-    memcpy(p, r1, sizeof(r1) - 1); p += sizeof(r1) - 1;
-    memcpy(p, accept, 28); p += 28;
-    memcpy(p, "\r\n\r\n", 4);
-    x->state = ST_WS;
-    us_socket_timeout(0, x->s, srv->cfg.idle_timeout);
-    ws_list_add(x);
-    if (srv->cfg.on_open) srv->cfg.on_open((ngws_socket_t *) x->s, &req);
-    if (us_socket_is_closed(0, x->s)) return -1;
-    return (long) hn;
-}
-
-static void deliver(sockx_t *x, char *data, size_t len, int op) {
-    ngws_server_t *srv = SRV(x);
-    if (op == NGWS_OP_TEXT || op == NGWS_OP_BINARY) {
-        if (op == NGWS_OP_TEXT && !srv->cfg.skip_utf8_check &&
-            !ws_utf8_valid((const unsigned char *) data, len)) { ws_fail(x, 1007); return; }
-        if (srv->cfg.on_message) srv->cfg.on_message((ngws_socket_t *) x->s, data, len, op);
-    } else if (op == NGWS_OP_PING) {
-        queue_frame(x, NGWS_OP_PONG, data, len);
-    } else if (op == NGWS_OP_CLOSE) {
-        unsigned char code[2] = { 0x03, 0xE8 };
-        if (len == 1) { ws_fail(x, 1002); return; }
-        if (len >= 2) {
-            unsigned c = (unsigned) (unsigned char) data[0] << 8 | (unsigned char) data[1];
-            bool ok = (c >= 1000 && c <= 1003) || (c >= 1007 && c <= 1011) || (c >= 3000 && c <= 4999);
-            if (!ok) { ws_fail(x, 1002); return; }
-            if (!ws_utf8_valid((const unsigned char *) data + 2, len - 2)) { ws_fail(x, 1007); return; }
-            code[0] = (unsigned char) data[0]; code[1] = (unsigned char) data[1];
-        }
-        queue_frame(x, NGWS_OP_CLOSE, code, 2);
-        close_after_flush(x);
-    }
-}
-
-static void msg_free(ngws_loop_t *l, unsigned char *m, size_t cap) {
-    if (!m) return;
-    if (cap == MSG_CHUNK && l->n_msg_pool < POOL_MAX) {
-        pool_item_t *p = (pool_item_t *) m; p->next = l->msg_pool; l->msg_pool = p; l->n_msg_pool++;
-    } else free(m);
-}
-static bool msg_append(sockx_t *x, const void *p, size_t n) {
-    if (!x->msg && n < MSG_CHUNK && x->loop->msg_pool) {
-        pool_item_t *it = x->loop->msg_pool; x->loop->msg_pool = it->next; x->loop->n_msg_pool--;
-        x->msg = (unsigned char *) it; x->mcap = MSG_CHUNK; x->mlen = 0;
-    }
-    if (x->mlen + n > x->mcap) {           /* mlen + n <= max_payload: checked by the caller */
-        size_t want;
-        if (!ng_size_add(x->mlen, n, &want)) return false;
-        size_t nc = ng_grow_cap(x->mcap, want, n < MSG_CHUNK ? MSG_CHUNK : 1024);
-        unsigned char *nb = (unsigned char *) realloc(x->msg, nc);
-        if (!nb) return false;
-        x->msg = nb; x->mcap = nc;
-    }
-    memcpy(x->msg + x->mlen, p, n); x->mlen += n;
-    return true;
-}
-static void msg_reset(sockx_t *x) { msg_free(x->loop, x->msg, x->mcap); x->msg = NULL; x->mlen = x->mcap = 0; x->msg_op = 0; }
-
-/* Validate a new frame header. Returns 0 or a close code. */
-static int frame_check(sockx_t *x, int fin, int rsv, int op, int mask, uint64_t plen) {
-    size_t maxp = SRV(x)->cfg.max_payload;
-    if (rsv) return 1002;
-    if (!mask) return 1002;
-    if ((op > 2 && op < 8) || op > 10) return 1002;
-    if (op >= 8) return (!fin || plen > 125) ? 1002 : 0;
-    if (op == NGWS_OP_CONT) { if (!x->msg_op) return 1002; }
-    else if (x->msg_op) return 1002;
-    if (plen > maxp || x->mlen + plen > maxp) return 1009;
-    return 0;
-}
-
-/* In-tree codec: parse frames in place from the receive buffer (zero copy). */
-static long ws_frame(sockx_t *x, unsigned char *b, size_t blen) {
-    ws_frame_t f;
-    ng_status_t r = ws_parse_header(b, blen, &f);
-    if (r == NG_E_INVALID) { ws_fail(x, 1002); return -1; }
-    if (r == NG_E_AGAIN) return 0;
-    int code = frame_check(x, f.fin, 0, f.opcode, f.masked, f.len);
-    if (code) {
-        ws_fail(x, code);
-        uint64_t total = f.header_len + f.len;
-        x->skip = total > blen ? total - blen : 0;   /* rest of the rejected frame */
-        return -1;
-    }
-    if (blen - f.header_len < f.len) return 0;
-    unsigned char *p = b + f.header_len;
-    size_t n = (size_t) f.len;
-    ws_unmask(p, n, f.mask);
-    int op = f.opcode;
-    if (op >= 8 || (f.fin && op != NGWS_OP_CONT)) deliver(x, (char *) p, n, op);
-    else {
-        if (op != NGWS_OP_CONT) x->msg_op = (uint8_t) op;
-        if (!msg_append(x, p, n)) { ws_fail(x, 1011); return -1; }
-        if (f.fin) {
-            if (msg_append(x, "", 1)) x->mlen--;
-            int mop = x->msg_op; unsigned char *m = x->msg; size_t ml = x->mlen, mc = x->mcap;
-            x->msg = NULL; x->mlen = x->mcap = 0; x->msg_op = 0;
-            deliver(x, (char *) m, ml, mop);
-            msg_free(x->loop, m, mc);
-        }
-    }
-    return (long) (f.header_len + n);
-}
-/* Bytes needed to hold the whole frame starting at b (header + payload),
- * or 4096 when the header itself is still incomplete. Sizing the partial-
- * frame buffer once avoids realloc/copy cascades for large messages. */
-static size_t frame_need(sockx_t *x, const unsigned char *b, size_t n) {
-    ws_frame_t f;
-    if (ws_parse_header(b, n, &f) != NG_OK) return 4096;
-    if (f.len > SRV(x)->cfg.max_payload) return 4096;   /* rejected anyway; never trust it */
-    uint64_t t = f.header_len + f.len;
-    return t < 4096 ? 4096 : (size_t) t;
-}
-
-static void ws_feed(sockx_t *x, unsigned char *data, size_t len) {
-    unsigned char *b = data; size_t n = len;
-    bool owned = false;
-    if (x->rlen) {                        /* append to partial frame */
-        if (x->rlen + len > x->rcap) {
-            size_t want;
-            if (!ng_size_add(x->rlen, len, &want)) { ngws_terminate((ngws_socket_t *) x->s); return; }
-            size_t nc = ng_grow_cap(x->rcap, want, 4096);
-            size_t fn = frame_need(x, x->rbuf, x->rlen);
-            if (fn >= x->rlen + len && fn > x->rcap) nc = fn;
-            unsigned char *nb = (unsigned char *) realloc(x->rbuf, nc);
-            if (!nb) { ngws_terminate((ngws_socket_t *) x->s); return; }
-            x->rbuf = nb; x->rcap = nc;
-        }
-        memcpy(x->rbuf + x->rlen, data, len); x->rlen += len;
-        b = x->rbuf; n = x->rlen; owned = true;
-    }
-    size_t off = 0;
-    while (off < n && x->state == ST_WS && !us_socket_is_closed(0, x->s)) {
-        long used = ws_frame(x, b + off, n - off);
-        if (used <= 0) break;
-        off += (size_t) used;
-    }
-    if (us_socket_is_closed(0, x->s) || x->state != ST_WS) { if (owned) x->rlen = 0; return; }
-    size_t rest = n - off;
-    if (!rest) { x->rlen = 0; if (x->rbuf && x->rcap > 65536) { free(x->rbuf); x->rbuf = NULL; x->rcap = 0; } return; }
-    if (owned) { memmove(x->rbuf, x->rbuf + off, rest); x->rlen = rest; }
-    else {
-        size_t need = frame_need(x, b + off, rest);
-        if (need < rest) need = rest;
-        if (need > x->rcap) {
-            unsigned char *nb = (unsigned char *) realloc(x->rbuf, need);
-            if (!nb) { ngws_terminate((ngws_socket_t *) x->s); return; }
-            x->rbuf = nb; x->rcap = need;
-        }
-        memcpy(x->rbuf, b + off, rest); x->rlen = rest;
-    }
-}
-
-static void free_inputs(sockx_t *x) {
-    free(x->rbuf); x->rbuf = NULL; x->rlen = x->rcap = 0;
-    msg_reset(x);
-}
-
-/* After a server-initiated close: discard frames until the peer's close frame
- * arrives, then close TCP (RFC 6455 7.1.1: the server closes first). */
-static void drain_input(sockx_t *x, unsigned char *d, size_t n) {
-    while (n) {
-        if (x->skip) { size_t k = x->skip < n ? (size_t) x->skip : n; x->skip -= k; d += k; n -= k; continue; }
-        unsigned char hb[14]; size_t have = x->rlen < 14 ? x->rlen : 14;
-        if (have) memcpy(hb, x->rbuf, have);
-        size_t take = 14 - have < n ? 14 - have : n;
-        memcpy(hb + have, d, take);
-        ws_frame_t f;
-        ng_status_t r = ws_parse_header(hb, have + take, &f);
-        if (r == NG_E_INVALID) { us_socket_close(0, x->s, 0, NULL); return; }
-        if (r == NG_E_AGAIN) {                 /* keep partial header */
-            if (!x->rbuf) { x->rbuf = (unsigned char *) malloc(16); x->rcap = 16; if (!x->rbuf) return; }
-            memcpy(x->rbuf, hb, have + take); x->rlen = have + take;
-            return;
-        }
-        if (f.opcode == NGWS_OP_CLOSE) { x->rlen = 0; us_socket_close(0, x->s, 0, NULL); return; }
-        size_t used_new = f.header_len - have;   /* header bytes taken from d */
-        x->rlen = 0;
-        d += used_new; n -= used_new;
-        x->skip = f.len;
-    }
-}
-
 static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length) {
     sockx_t *x = X(s);
     if (length <= 0 || x->state == ST_CLOSED) return s;
     if (x->state == ST_CLOSING) {
-        if (x->drain) drain_input(x, (unsigned char *) data, (size_t) length);
+        if (x->drain) nx_drain_input(x, (unsigned char *) data, (size_t) length);
         return s;
     }
     x->in_data = 1;
@@ -783,34 +73,34 @@ static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length
             }
             memcpy(x->rbuf + x->rlen, b, n); x->rlen += n;
         }
-        long used = handle_http(x, (const char *) x->rbuf, x->rlen);
+        long used = nx_handle_http(x, (const char *) x->rbuf, x->rlen);
         if (used > 0 && !us_socket_is_closed(0, s) && x->state == ST_WS) {
             size_t rest = x->rlen - (size_t) used;
             unsigned char *hb = x->rbuf;
             x->rbuf = NULL; x->rlen = x->rcap = 0;
-            if (rest) ws_feed(x, hb + used, rest);
+            if (rest) nx_ws_feed(x, hb + used, rest);
             free(hb);
         }
     } else {
         x->ping_sent = 0;
         if (SRV(x)->cfg.idle_timeout) us_socket_timeout(0, s, SRV(x)->cfg.idle_timeout);
-        ws_feed(x, (unsigned char *) data, (size_t) length);
+        nx_ws_feed(x, (unsigned char *) data, (size_t) length);
     }
     x->in_data = 0;
-    if (us_socket_is_closed(0, s)) { free_inputs(x); return s; }
+    if (us_socket_is_closed(0, s)) { nx_free_inputs(x); return s; }
     /* Uncork: replies produced while handling this read go out now instead
      * of at the end of the loop iteration (lower latency; same writev
      * count, since a socket's frames from one read are already coalesced).
      * Sends from other sockets' callbacks/tasks still batch until loop_post. */
-    if (x->dirty && SRV(x)->uncork) { dirty_del(x); flush(x); }
+    if (x->dirty && SRV(x)->uncork) { nx_dirty_del(x); nx_flush(x); }
     return s;
 }
 
 static struct us_socket_t *on_writable(struct us_socket_t *s) {
     sockx_t *x = X(s);
     bool had = x->olen > x->ooff || x->qbytes;
-    if (flush(x)) {
-        dirty_del(x);
+    if (nx_flush(x)) {
+        nx_dirty_del(x);
         if (had && x->state == ST_WS && SRV(x)->cfg.on_drain) SRV(x)->cfg.on_drain((ngws_socket_t *) s);
     }
     return s;
@@ -831,11 +121,11 @@ static struct us_socket_t *on_close(struct us_socket_t *s, int code, void *reaso
     sockx_t *x = X(s);
     int was = x->state;
     x->state = ST_CLOSED;
-    dirty_del(x);
-    out_release(x);
-    if (!x->in_data) free_inputs(x);
+    nx_dirty_del(x);
+    nx_out_release(x);
+    if (!x->in_data) nx_free_inputs(x);
     if (was == ST_WS || x->aprev || x->loop->all == x) {
-        ws_list_del(x);
+        nx_ws_list_del(x);
         if (SRV(x)->cfg.on_close) SRV(x)->cfg.on_close((ngws_socket_t *) s, 1006);
     } else if (was == ST_CLOSING && x->anext == NULL && x->aprev == NULL) {
         /* closing sockets that were WebSockets are still in the list until here */
@@ -850,7 +140,7 @@ static struct us_socket_t *on_timeout(struct us_socket_t *s) {
     unsigned it = SRV(x)->cfg.idle_timeout;
     if (x->state == ST_WS && it && !x->ping_sent) {
         x->ping_sent = 1;
-        queue_frame(x, NGWS_OP_PING, "", 0);
+        nx_queue_frame(x, NGWS_OP_PING, "", 0);
         us_socket_timeout(0, s, it);
         return s;
     }
@@ -896,15 +186,15 @@ static void loop_post(struct us_loop_t *ul) {
     sockx_t *x = l->dirty;
     while (x) {
         sockx_t *next = x->dnext;
-        dirty_del(x);
-        if (!us_socket_is_closed(0, x->s)) flush(x);   /* partial: writable event resumes */
+        nx_dirty_del(x);
+        if (!us_socket_is_closed(0, x->s)) nx_flush(x);   /* partial: writable event resumes */
         x = next;
     }
     l->dirty = NULL;
     shed_sweep(l);
     for (uint32_t i = 0; i < l->n_defer; i++) l->defer[i].fn(l->defer[i].arg);
     l->n_defer = 0;
-    if (l->n_nodes || l->arena_cur != l->arena || (l->arena && l->arena->used)) arena_reset(l);
+    if (l->n_nodes || l->arena_cur != l->arena || (l->arena && l->arena->used)) nx_arena_reset(l);
 }
 
 /* Close the listener and every socket; the loop then runs out of polls. */
