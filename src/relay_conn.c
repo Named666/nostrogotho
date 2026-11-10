@@ -44,7 +44,10 @@ relay_body_t *relay_body_new(const char *json, size_t len) {
     memcpy(b->json, json, len); b->json[len] = '\0';
     return b;
 }
-void relay_body_retain(relay_body_t *b, int n) { atomic_fetch_add(&b->refs, n); }
+void relay_body_retain(relay_body_t *b, int n) { atomic_fetch_add_explicit(&b->refs, n, memory_order_relaxed); }
+void relay_body_release_n(relay_body_t *b, int n) {
+    if (b && atomic_fetch_sub_explicit(&b->refs, n, memory_order_acq_rel) == n) free(b);
+}
 void relay_body_release(relay_body_t *b) {
     if (b && atomic_fetch_sub(&b->refs, 1) == 1) free(b);
 }

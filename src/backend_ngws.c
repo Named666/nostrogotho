@@ -3,10 +3,10 @@
  * nginx/haproxy in front for wss://).
  *
  * Thread layout
- *   I/O loops  (NG_IO_THREADS, default max(1, nproc/4)): ngws event loops on
+ *   I/O loops  (io_threads / NG_IO_THREADS, default: usable CPUs): ngws loops on
  *              one port via SO_REUSEPORT. TCP, HTTP upgrade, NIP-11, framing,
  *              corked writev output. No protocol logic.
- *   Workers    (NG_WORKERS, default nproc): each connection is pinned to one
+ *   Workers    (workers / NG_WORKERS, default: usable CPUs): each connection is pinned to one
  *              worker (id % W) which owns its protocol state and its
  *              subscriptions (one relay_core shard + subscription index),
  *              parses JSON, verifies signatures, runs REQ queries on its own
@@ -23,12 +23,19 @@
  *   worker/writer -> loop: sends go to a thread-local outbox per loop, posted
  *                   as one ngws task after each job batch. Event deliveries
  *                   carry a reference to the shared body and are written with
- *                   writev (frame prefix | shared body | "]"), zero copy.
+ *                   writev (frame prefix | shared body | "]"), zero copy
+ *                   (bodies <= 2 KiB are copied into one contiguous frame).
+ *                   Records hold no per-delivery connection reference and
+ *                   body references are taken/dropped once per run of
+ *                   records (see ngb_destroy, outbox_commit_ref); a socket's
+ *                   frames from one loop iteration go out in one send().
  * ============================================================================ */
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sched.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,12 +57,20 @@
 #define MAX_IO_LOOPS     64
 #define WRITER_BATCH     8192   /* hard cap; NG_BATCH_MAX tunes below it */
 #define OUTBOX_FLUSH     (256u * 1024)
+/* Default I/O loop count for n usable CPUs (io_threads = auto): one per CPU.
+ * Fan-out is kernel-send bound on the loops (loopback: ~90% system time), so
+ * they must scale with cores; idle loops cost nothing. On 4 CPUs, 4 loops vs
+ * the previous nproc/4 halved fan-out p50 latency (SCALING.md). */
+#ifndef IO_THREADS_AUTO
+#define IO_THREADS_AUTO(n) ((int) (n))
+#endif
 
 /* ---------------------------------------------------------------- types -- */
 typedef struct {
     relay_conn_t base;          /* must be first */
     ngws_loop_t *loop;
     ngws_socket_t *ws;          /* loop thread only; NULL once closed */
+    ngws_task_t free_task;      /* final free runs on the owning loop (see ngb_destroy) */
     atomic_int pending;         /* messages queued to the worker, not yet handled */
     atomic_size_t out_buffered; /* socket output backlog as last seen by its loop */
 } ng_conn_t;
@@ -124,7 +139,10 @@ typedef struct {
     char data[];
 } outtask_t;
 
-typedef struct { outtask_t *t; size_t cap; } outbox_t;
+/* Per-thread outbox for one loop. Body references for R_EVENT records are
+ * taken in bulk: consecutive records of one body (a broadcast walks all of a
+ * shard's subscribers for one event) cost one atomic add, not one each. */
+typedef struct { outtask_t *t; size_t cap; relay_body_t *rbody; int rn; } outbox_t;
 
 #ifndef SMALL_EVENT_COPY
 #define SMALL_EVENT_COPY 2048   /* event bodies up to this size are copied per subscriber */
@@ -155,8 +173,22 @@ static __thread uint64_t tl_outbox_dirty;
 /* --------------------------------------------------------- loop side ----- */
 static void run_outtask(ngws_task_t *t, ngws_loop_t *loop);
 
-static void outtask_free(void *p) { free(p); }
-static void body_release_cb(void *p) { relay_body_release((relay_body_t *) p); }
+/* After the iteration's output is flushed: drop body references in runs
+ * (one atomic per run of consecutive records sharing a body). */
+static void outtask_free(void *p) {
+    outtask_t *t = (outtask_t *) p;
+    relay_body_t *run = NULL; int n = 0;
+    for (size_t o = 0; o < t->len; ) {
+        rec_t *r = (rec_t *) (t->data + o);
+        if (r->kind == R_EVENT) {
+            if (r->body != run) { if (run) relay_body_release_n(run, n); run = r->body; n = 0; }
+            n++;
+        }
+        o += sizeof(rec_t) + ((r->len + 7) & ~(size_t) 7);
+    }
+    if (run) relay_body_release_n(run, n);
+    free(t);
+}
 
 static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
     outtask_t *t = (outtask_t *) tk;
@@ -185,17 +217,28 @@ static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
                     atomic_store_explicit(&c->out_buffered, b, memory_order_relaxed);
             }
         }
-        if (r->kind == R_EVENT) ngws_loop_defer(loop, body_release_cb, r->body);
-        relay_conn_unref(&c->base);
+        /* No per-record connection reference: a connection is only freed by
+         * a task on this loop, posted after every thread that could still
+         * hold a record for it has flushed its outbox (see ngb_destroy). */
         o += sizeof(rec_t) + ((r->len + 7) & ~(size_t) 7);
     }
     atomic_fetch_sub_explicit(&out_task_bytes, t->len, memory_order_relaxed);
-    ngws_loop_defer(loop, outtask_free, t);   /* frames are referenced until flushed */
+    ngws_loop_defer(loop, outtask_free, t);   /* frames/bodies are referenced until flushed */
 }
 
 /* ---------------------------------------------------------- outbox ------- */
+static void outbox_commit_ref(outbox_t *ob) {
+    if (ob->rbody) { relay_body_retain(ob->rbody, ob->rn); ob->rbody = NULL; ob->rn = 0; }
+}
+/* Take pending bulk body references now (before the caller may drop its own). */
+static void outbox_commit_refs(void) {
+    uint64_t m = tl_outbox_dirty;
+    while (m) { int i = __builtin_ctzll(m); m &= m - 1; outbox_commit_ref(&tl_outbox[i]); }
+}
+
 static void outbox_flush_loop(int i) {
     outbox_t *ob = &tl_outbox[i];
+    outbox_commit_ref(ob);
     if (!ob->t || !ob->t->len) return;
     outtask_t *t = ob->t;
     ob->t = NULL; ob->cap = 0;
@@ -233,7 +276,10 @@ static char *outbox_reserve(ng_conn_t *c, uint32_t kind, size_t len, relay_body_
     r->kind = kind; r->len = (uint32_t) len; r->conn = c; r->body = body;
     ob->t->len += need;
     tl_outbox_dirty |= 1ull << li;
-    relay_conn_retain(&c->base);
+    if (body) {
+        if (ob->rbody != body) { outbox_commit_ref(ob); ob->rbody = body; }
+        ob->rn++;
+    }
     return (char *) (r + 1);
 }
 
@@ -248,9 +294,8 @@ static void ngb_send_event(relay_conn_t *rc, const char *sub, size_t sl, relay_b
     ng_conn_t *c = (ng_conn_t *) rc;
     size_t payload = 9 + sl + 1 + body->len + 1;
     size_t hl = ngws_frame_overhead(payload);
-    char *d = outbox_reserve(c, R_EVENT, hl + 9 + sl + 1, body);
+    char *d = outbox_reserve(c, R_EVENT, hl + 9 + sl + 1, body);   /* takes the body ref */
     if (!d) return;
-    relay_body_retain(body, 1);
     ws_frame_header((unsigned char *) d, NGWS_OP_TEXT, payload);
     memcpy(d + hl, "[\"EVENT\",", 9);
     memcpy(d + hl + 9, sub, sl);
@@ -261,7 +306,38 @@ static void ngb_close(relay_conn_t *rc) {
     (void) outbox_reserve((ng_conn_t *) rc, R_CLOSE, 0, NULL);
 }
 
-static void ngb_destroy(relay_conn_t *rc) { free(rc); }
+/* Last reference dropped. Every thread drops its connection references only
+ * after posting its outbox (see unref_later), and loop task queues are FIFO,
+ * so freeing from a task on the connection's own loop runs after every
+ * record that still points at it. */
+static void conn_free_task(ngws_task_t *t, ngws_loop_t *loop) {
+    (void) loop;
+    free((char *) t - offsetof(ng_conn_t, free_task));
+}
+static void ngb_destroy(relay_conn_t *rc) {
+    ng_conn_t *c = (ng_conn_t *) rc;
+    c->free_task.run = conn_free_task;
+    ngws_loop_post(c->loop, &c->free_task);
+}
+
+/* Deferred unref: workers/writer release connection references only after
+ * flushing their outbox (required by ngb_destroy's ordering argument). */
+static __thread relay_conn_t **tl_unref; static __thread size_t tl_unref_n, tl_unref_cap;
+static void unref_later(relay_conn_t *rc) {
+    if (tl_unref_n == tl_unref_cap) {
+        size_t nc = tl_unref_cap ? tl_unref_cap * 2 : 1024;
+        relay_conn_t **nv = (relay_conn_t **) realloc(tl_unref, nc * sizeof(*nv));
+        if (!nv) { outbox_flush(); relay_conn_unref(rc); return; }   /* flush first: still ordered */
+        tl_unref = nv; tl_unref_cap = nc;
+    }
+    tl_unref[tl_unref_n++] = rc;
+}
+/* Flush the outbox, then drop the deferred references. */
+static void outbox_flush_and_unref(void) {
+    outbox_flush();
+    for (size_t i = 0; i < tl_unref_n; i++) relay_conn_unref(tl_unref[i]);
+    tl_unref_n = 0;
+}
 static const relay_backend_ops_t ng_ops = { ngb_send, ngb_close, ngb_destroy, ngb_send_event };
 
 /* -------------------------------------------------------- worker queue --- */
@@ -437,6 +513,7 @@ static void on_close(ngws_socket_t *ws, int code) {
 }
 
 /* -------------------------------------------------------------- workers -- */
+
 static void bset_unref(bset_t *s) {
     if (atomic_fetch_sub(&s->refs, 1) == 1) {
         for (int i = 0; i < s->n; i++) relay_bcast_free(s->b[i]);
@@ -463,24 +540,26 @@ static void *worker_thread(void *arg) {
             job_t *next = j->next;
             relay_conn_t *rc = j->conn ? &j->conn->base : NULL;
             switch (j->type) {
-            case J_OPEN: relay_core_on_open(rc); relay_conn_unref(rc); break;
+            case J_OPEN: relay_core_on_open(rc); unref_later(rc); break;
             case J_MSG:
                 if (rc->core && !atomic_load(&rc->closed)) relay_core_on_message(rc, j->payload, j->len);
                 atomic_fetch_sub_explicit(&j->conn->pending, 1, memory_order_relaxed);
-                relay_conn_unref(rc); break;
-            case J_CLOSE: if (rc->core) relay_core_on_close(rc); relay_conn_unref(rc); break;
+                unref_later(rc); break;
+            case J_CLOSE: if (rc->core) relay_core_on_close(rc); unref_later(rc); break;
             case J_BSET:
-                for (int i = 0; i < j->bset->n; i++) relay_core_broadcast_shard(wk->idx, j->bset->b[i]);
+                for (int i = 0; i < j->bset->n; i++) {
+                    relay_core_broadcast_shard(wk->idx, j->bset->b[i]);
+                    outbox_commit_refs();          /* bulk body refs, before the set can be freed */
+                }
                 bset_unref(j->bset); break;
             }
             if (j->type != J_BSET) atomic_fetch_sub_explicit(&wk->qbytes, job_cost(j), memory_order_relaxed);
             free(j);
             j = next;
-            if (tl_outbox_dirty && !j) outbox_flush();
         }
-        outbox_flush();
+        outbox_flush_and_unref();
     }
-    outbox_flush();
+    outbox_flush_and_unref();
     if (st->thread_close) st->thread_close();
     return NULL;
 }
@@ -494,7 +573,7 @@ static void publish_to_writer(relay_conn_t *rc, relay_bcast_t *bc) {
         atomic_fetch_sub(&writer_depth, 1);
         if (full) atomic_fetch_add_explicit(&stat_shed_writer, 1, memory_order_relaxed);
         nip_plugin_send_status(rc, "OK", bc->ev.id, false, full ? overload_msg : "error: out of memory");
-        dedupe_release(bc->ev.id); relay_bcast_free(bc); relay_conn_unref(rc); return;
+        dedupe_release(bc->ev.id); relay_bcast_free(bc); unref_later(rc); return;   /* worker thread */
     }
     w->next = NULL; w->conn = (ng_conn_t *) rc; w->bc = bc;
     pthread_mutex_lock(&writer_mu);
@@ -636,7 +715,7 @@ static void *writer_thread(void *arg) {
             if (set && results[i].accepted && results[i].should_broadcast && !results[i].duplicate)
                 set->b[set->n++] = batch[i]->bc;
             else relay_bcast_free(batch[i]->bc);
-            relay_conn_unref(rc);
+            unref_later(rc);
             free(batch[i]);
         }
         if (set && set->n) {
@@ -648,10 +727,10 @@ static void *writer_thread(void *arg) {
                 worker_push(w, j);
             }
         } else free(set);
-        outbox_flush();
+        outbox_flush_and_unref();
         stat_us[0] += t1 - t0; stat_us[1] += t2 - t1; stat_us[2] += now_us() - t2;
     }
-    outbox_flush();
+    outbox_flush_and_unref();
     if (getenv("NG_WRITER_STATS")) fprintf(stderr, "writer: dispatch %.2fs commit %.2fs post %.2fs\n", stat_us[0]/1e6, stat_us[1]/1e6, stat_us[2]/1e6);
     if (getenv("NG_WRITER_STATS")) fprintf(stderr, "writer: %llu events in %llu batches (avg %.1f)\n",
         stat_events, stat_batches, stat_batches ? (double) stat_events / (double) stat_batches : 0.0);
@@ -716,9 +795,13 @@ bool server_config_set(const char *key, const char *value) {
 
 bool server_run(int port) {
     if (!relay_core_storage() || port < 1 || port > 65535) return false;
+    /* CPUs this process may run on (taskset/cgroup cpusets), not all online. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __linux__
+    { cpu_set_t cs; if (sched_getaffinity(0, sizeof(cs), &cs) == 0 && CPU_COUNT(&cs) > 0) ncpu = CPU_COUNT(&cs); }
+#endif
     if (ncpu < 1) ncpu = 1;
-    n_loops = env_int("NG_IO_THREADS", opt.io_threads ? opt.io_threads : ncpu >= 4 ? (int) (ncpu / 4) : 1);
+    n_loops = env_int("NG_IO_THREADS", opt.io_threads ? opt.io_threads : IO_THREADS_AUTO(ncpu));
     n_workers = env_int("NG_WORKERS", opt.workers ? opt.workers : (int) ncpu);
     if (n_loops > MAX_IO_LOOPS) n_loops = MAX_IO_LOOPS;
     if (n_workers > RELAY_MAX_SHARDS) n_workers = RELAY_MAX_SHARDS;

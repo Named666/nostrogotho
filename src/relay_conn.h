@@ -38,6 +38,7 @@ typedef struct relay_body {
 relay_body_t *relay_body_new(const char *json, size_t len);
 void relay_body_retain(relay_body_t *b, int n);
 void relay_body_release(relay_body_t *b);
+void relay_body_release_n(relay_body_t *b, int n);   /* drop n references at once */
 
 void relay_conn_send(relay_conn_t *conn, const char *json, size_t len);
 void relay_conn_close(relay_conn_t *conn);
