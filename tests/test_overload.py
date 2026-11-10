@@ -15,6 +15,9 @@ E bounded writer queue: 300 pipelined EVENTs each get one OK; overflow is
   OK false "error: relay overloaded" and such an event can be resent.
 F worker queue budget: a message larger than the budget is answered by the
   I/O thread (OK false "error: relay overloaded").
+G outbox allocation failure (NG_FAULT_OUTBOX_OOM fault hook): the connection
+  whose output could not be queued is closed with 1011; it never silently
+  misses a message and continues; other connections are unaffected.
 """
 import hashlib, json, os, pathlib, signal, socket, struct, subprocess, sys, tempfile, threading, time
 from coincurve import PrivateKey
@@ -53,6 +56,7 @@ class WS:
             if not d: raise IOError("closed in handshake")
             buf += d
         self.s, self.buf, self.closed, self.nbytes, self.pos = s, buf.split(b"\r\n\r\n", 1)[1], False, 0, 0
+        self.close_code = None
     def send(self, *msgs): self.s.sendall(b"".join(frame(json.dumps(m)) for m in msgs))
     def _fill(self, timeout):
         self.s.settimeout(timeout)
@@ -71,7 +75,10 @@ class WS:
                 if n >= 0 and len(b) - i >= o + n:
                     op = b[i] & 15; payload = b[i + o:i + o + n]; self.pos = i + o + n
                     if self.pos > (1 << 20): self.buf = b[self.pos:]; self.pos = 0
-                    if op == 8: self.closed = True; return None
+                    if op == 8:
+                        self.closed = True
+                        if len(payload) >= 2: self.close_code = struct.unpack(">H", payload[:2])[0]
+                        return None
                     if op == 1:
                         m = json.loads(payload)
                         if m and m[0] == "AUTH": continue   # NIP-42 challenge on connect
@@ -85,12 +92,12 @@ class WS:
         except OSError: pass
 
 class Relay:
-    def __init__(self, conf):
+    def __init__(self, conf, extra_env=None):
         self.td = tempfile.TemporaryDirectory(prefix="ng-overload-")
         with socket.socket() as s: s.bind(("127.0.0.1", 0)); self.port = s.getsockname()[1]
         pathlib.Path(self.td.name, "r.conf").write_text(conf)
         self.err = open(pathlib.Path(self.td.name, "err.log"), "w+")
-        env = dict(os.environ, NG_IO_THREADS="2", NG_WORKERS="2")
+        env = dict(os.environ, NG_IO_THREADS="2", NG_WORKERS="2", **(extra_env or {}))
         self.p = subprocess.Popen([BIN, "--port", str(self.port), "--db", self.td.name + "/t.sqlite",
                                    "--config", self.td.name + "/r.conf"], stdout=subprocess.DEVNULL, stderr=self.err, env=env)
         for _ in range(200):
@@ -103,6 +110,7 @@ class Relay:
         try: self.p.wait(timeout=20)
         except subprocess.TimeoutExpired: self.p.kill(); self.p.wait()
         self.err.seek(0); log = self.err.read(); self.err.close(); self.td.cleanup()
+        self.log = log
         st = {}
         for line in log.splitlines():
             if line.startswith("overload:"):
@@ -263,6 +271,35 @@ c.send(["REQ", "ok", {"kinds": [1], "limit": 1}]); m = c.recv(5)
 check("F small messages still processed", m and m[0] == "EOSE", str(m))
 alive, st = r.stop()
 check("F relay alive", alive, str(st))
+
+# ---------------------------------------------------------------- G ----
+for k in (3, 8, 13):
+    r = Relay("", {"NG_FAULT_OUTBOX_OOM": str(k)})
+    s1 = WS(r.port); subscribe(s1, "g"); eose = wait_eose(s1, "g")
+    p1 = WS(r.port); time.sleep(.2)
+    evs = [mk(f"outbox fault {k} {i}") for i in range(10)]
+    oks = sent = 0
+    for e in evs:
+        p1.send(["EVENT", e]); sent += 1; m = p1.recv(5)
+        if m is None: break
+        if m[0] == "OK" and m[2] is True: oks += 1
+    got = 0
+    if eose:
+        while True:
+            m = s1.recv(1.5)
+            if m is None: break
+            if m[0] == "EVENT": got += 1
+    pub_ok = oks == 10 or (p1.closed and p1.close_code == 1011)
+    # an event whose OK was lost with the publisher may still be stored and delivered
+    sub_ok = (eose and oks <= got <= sent) or (s1.closed and s1.close_code == 1011)
+    check(f"G[{k}] each connection: complete output or closed 1011",
+          pub_ok and sub_ok, f"oks={oks} pub_close={p1.close_code} events={got} sub_close={s1.close_code}")
+    check(f"G[{k}] exactly one connection hit", (p1.close_code == 1011) + (s1.close_code == 1011) == 1)
+    q = WS(r.port); q.send(["REQ", "q", {"kinds": [1], "limit": 1}]); m = q.recv(5)
+    while m is not None and m[0] == "EVENT": m = q.recv(5)
+    check(f"G[{k}] new connections still served", m and m[0] == "EOSE", str(m))
+    alive, st = r.stop()
+    check(f"G[{k}] relay alive, failure logged", alive and "outbox: out of memory" in r.log, str(st))
 
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

@@ -13,6 +13,9 @@
  *   loop     immutable after on_open.
  *   ws       owning loop thread only; NULL once the socket closed.
  *   free_task  used once, by ngb_destroy.
+ *   fail_task  used at most once: posted by the first thread whose outbox
+ *            could not queue a record for this connection (ngb_outbox.c).
+ *   failed   0 -> 1 when that happens (atomic); later records are refused.
  *   pending  messages queued to the worker and not yet handled (atomic).
  *   out_buffered  socket output backlog as last seen by its loop (atomic,
  *            relaxed: an admission hint, not a synchronization point).
@@ -34,6 +37,8 @@ typedef struct {
     ngws_loop_t *loop;
     ngws_socket_t *ws;
     ngws_task_t free_task;
+    ngws_task_t fail_task;
+    ng_atomic_int failed;
     ng_atomic_int pending;
     ng_atomic_size out_buffered;
 } ng_conn_t;

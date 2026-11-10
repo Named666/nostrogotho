@@ -1,7 +1,9 @@
 /* ngb_outbox - see ngb_outbox.h. */
 #include "ngb_outbox.h"
 
+#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,7 +42,22 @@ static NG_THREAD_LOCAL size_t tl_unref_n, tl_unref_cap;
 
 NG_STATIC_ASSERT(NG_MAX_IO_LOOPS <= 64, dirty_mask_fits);
 
-void ngb_outbox_set_server(ngws_server_t *s) { srv = s; }
+/* Test hook (see header): reservations left before one injected failure. */
+static bool fault_armed;
+static ng_atomic_size fault_left;
+
+void ngb_outbox_set_server(ngws_server_t *s) {
+    srv = s;
+    const char *f = getenv("NG_FAULT_OUTBOX_OOM");
+    if (f && *f) {
+        ng_atomic_store(&fault_left, (size_t) strtoull(f, NULL, 10) + 1);
+        fault_armed = true;
+    }
+}
+
+static bool fault_fire(void) {      /* only when armed; wraps harmlessly after firing */
+    return ng_atomic_fetch_sub_explicit(&fault_left, 1, NG_MO_RELAXED) == 1;
+}
 size_t ngb_outbox_pending_bytes(void) { return ng_atomic_load_explicit(&out_task_bytes, NG_MO_RELAXED); }
 
 static size_t rec_size(uint32_t len) { return sizeof(rec_t) + (((size_t) len + 7) & ~(size_t) 7); }
@@ -123,29 +140,52 @@ static void outbox_flush(void) {
     while (m) { int i = ng_ctz64(m); m &= m - 1; outbox_flush_loop(i); }
 }
 
-/* Append a record of len payload bytes for c; returns the payload area or
- * NULL (allocation failure / size overflow: the record is not queued). */
+/* Runs on c's loop: close the connection whose output could not be queued,
+ * then drop the reference taken by conn_fail. */
+static void conn_fail_task(ngws_task_t *t, ngws_loop_t *loop) {
+    (void) loop;
+    ng_conn_t *c = (ng_conn_t *) (void *) ((char *) t - offsetof(ng_conn_t, fail_task));
+    if (c->ws) ngws_close(c->ws, 1011, "server out of memory");   /* terminates if it cannot queue */
+    relay_conn_unref(&c->base);
+}
+
+/* A record for c could not be queued: mark c failed (its later records are
+ * refused) and close it from its loop. Allocation-free; first caller wins. */
+static void conn_fail(ng_conn_t *c) {
+    if (ng_atomic_exchange(&c->failed, 1)) return;
+    fprintf(stderr, "outbox: out of memory queueing output for connection %llu; closing it\n",
+            (unsigned long long) c->base.id);
+    relay_conn_retain(&c->base);
+    c->fail_task.run = conn_fail_task;
+    ngws_loop_post(c->loop, &c->fail_task);
+}
+
+/* Append a record of len payload bytes for c; returns the payload area, or
+ * NULL when the record cannot be queued (c failed earlier, allocation
+ * failure, size overflow) -- c is then closed by conn_fail. */
 static char *outbox_reserve(ng_conn_t *c, uint32_t kind, size_t len, relay_body_t *body) {
     int li = ngws_loop_index(c->loop);
     outbox_t *ob = &tl_outbox[li];
-    if (NG_UNLIKELY(len > (size_t) UINT32_MAX - 8)) return NULL;   /* rec_t.len is 32-bit */
+    if (NG_UNLIKELY(ng_atomic_load_explicit(&c->failed, NG_MO_RELAXED))) return NULL;
+    if (NG_UNLIKELY(fault_armed) && fault_fire()) goto fail;
+    if (NG_UNLIKELY(len > (size_t) UINT32_MAX - 8)) goto fail;   /* rec_t.len is 32-bit */
     size_t need = rec_size((uint32_t) len);
     if (ob->t && ob->t->len + need > ob->cap) {
         if (ob->t->len >= OUTBOX_FLUSH) outbox_flush_loop(li);
         else {
             size_t want, nc, bytes;
-            if (!ng_size_add(ob->t->len, need, &want)) return NULL;
+            if (!ng_size_add(ob->t->len, need, &want)) goto fail;
             nc = ng_grow_cap(ob->cap, want, 16384);
-            if (!ng_size_add(sizeof(outtask_t), nc, &bytes)) return NULL;
+            if (!ng_size_add(sizeof(outtask_t), nc, &bytes)) goto fail;
             outtask_t *nt = (outtask_t *) realloc(ob->t, bytes);
-            if (!nt) return NULL;
+            if (!nt) goto fail;
             ob->t = nt; ob->cap = nc;
         }
     }
     if (!ob->t) {
         size_t cap = need > 16384 ? need : 16384;
         ob->t = (outtask_t *) ng_malloc_add(sizeof(outtask_t), cap);
-        if (!ob->t) return NULL;
+        if (!ob->t) goto fail;
         ob->t->len = 0; ob->cap = cap;
     }
     rec_t *r = (rec_t *) (void *) (ob->t->data + ob->t->len);
@@ -157,6 +197,9 @@ static char *outbox_reserve(ng_conn_t *c, uint32_t kind, size_t len, relay_body_
         ob->rn++;
     }
     return (char *) (r + 1);
+fail:
+    conn_fail(c);
+    return NULL;
 }
 
 /* ------------------------------------------------- relay_conn backend --- */

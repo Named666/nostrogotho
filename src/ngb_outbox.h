@@ -20,8 +20,15 @@
  *
  * Thread-safety: every function except ngb_outbox_set_server and
  * ngb_outbox_pending_bytes acts on the calling thread's outbox only.
- * Errors: allocation failure drops the frame being queued (the connection
- * then misses that message; budgets in ngb_admit keep this rare).
+ * Errors: if a record cannot be queued (allocation failure), the
+ * connection is marked failed and closed from its own loop (close 1011
+ * "server out of memory"; the socket is terminated if even the close frame
+ * cannot be queued). Its later records are refused, so a client never
+ * silently misses a message and carries on. Budgets in ngb_admit keep this
+ * rare. The close needs no allocation (intrusive task in ng_conn_t).
+ *
+ * Test hook: NG_FAULT_OUTBOX_OOM=<n> in the environment makes the
+ * reservation after the first n successful ones fail (once, process wide).
  */
 #ifndef NGB_OUTBOX_H_
 #define NGB_OUTBOX_H_
