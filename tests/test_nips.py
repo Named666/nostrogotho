@@ -66,6 +66,49 @@ def limit0():
 
 
 @section
+def limits():
+    """Configurable limits: tags (A3), content/event size, subscriptions."""
+    r = Relay(); w = WS(r.port); k = Key()
+    many = [["p", Key().pk] for _ in range(3000)]
+    m = w.publish(k.ev("", 3, many))
+    check("kind 3 with 3000 p tags accepted", m and m[2] is True, m and m[3])
+    m = w.publish(k.ev("", 3, [["t", str(i)] for i in range(5001)]))
+    check("5001 tags -> OK false invalid:", m and m[0] == "OK" and m[2] is False and m[3].startswith("invalid:"), m and m[3])
+    art = k.ev("x" * (200 << 10), 30023, [["d", "long"], ["title", "NIP-23"]])
+    m = w.publish(art)
+    check("200 KiB long-form content accepted", m and m[2] is True, m and m[3])
+    m = w.publish(k.ev("y" * (300 << 10), 30023, [["d", "big"]]))
+    check("300 KiB content -> OK false invalid:", m and m[2] is False and m[3].startswith("invalid:"), m and m[3])
+    big = k.ev("", 9735, [["description", json.dumps({"content": "z" * 3000, "tags": [["p", k.pk]] * 20})], ["p", k.pk]])
+    m = w.publish(big)
+    check("zap-receipt style 4 KB tag element accepted", m and m[2] is True, m and m[3])
+    # canonical id: escapes and whitespace in the client's tags are normalized
+    tags = [["t", "caf\u00e9 \"q\" /"], [], ["emoji", "\U0001f600"]]
+    ev = k.ev("", 1, tags)
+    raw = json.dumps(ev, ensure_ascii=True, indent=1)        # \uXXXX, surrogates, whitespace
+    w.send_raw(json.dumps(["EVENT", json.loads(raw)], ensure_ascii=True).replace('"tags": [', '"tags":  [ '))
+    m = w.recv()
+    check("non-canonical tag JSON (\\u escapes, empty tag) verifies", m and m[0] == "OK" and m[2] is True, m)
+    subs = [w.req(f"s{i}", {"kinds": [1], "limit": 0}) for i in range(30)]
+    check("30 open subscriptions (home feed) allowed", all(e and e[0] == "EOSE" for _, e in subs))
+    r.stop()
+    r = Relay("max_event_tags = 3\nmax_content_length = 1K\nmax_subscriptions = 2\nmax_event_size = 4K\n")
+    w = WS(r.port)
+    m = w.publish(k.ev("", 1, [["t", "a"]] * 4))
+    check("max_event_tags = 3 enforced", m and m[2] is False and "3 tags" in m[3], m and m[3])
+    m = w.publish(k.ev("a" * 1025))
+    check("max_content_length = 1K enforced", m and m[2] is False and "1024" in m[3], m and m[3])
+    m = w.publish(k.ev("", 1, [["t", "a" * 1500], ["t", "b" * 1500], ["t", "c" * 1500]]))
+    check("max_event_size = 4K enforced", m and m[2] is False and "4096" in m[3], m and m[3])
+    w.req("a", {"limit": 0}); w.req("b", {"limit": 0})
+    _, end = w.req("c", {"limit": 0})
+    check("max_subscriptions = 2: third REQ CLOSED", end and end[0] == "CLOSED", end)
+    _, end = w.req("a", {"limit": 0})
+    check("re-using an open subscription id is allowed", end and end[0] == "EOSE", end)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

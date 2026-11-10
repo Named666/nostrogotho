@@ -18,10 +18,8 @@
 #define MAX_ID_SIZE 64          /* Event ID (SHA256 hex) */
 #define MAX_PUBKEY_SIZE 64      /* Public key (hex) */
 #define MAX_SIG_SIZE 128        /* Schnorr signature (hex) */
-#define MAX_CONTENT_SIZE 65536  /* Event content payload */
-#define MAX_TAGS_SIZE 65536     /* Full tags JSON size */
 #define MAX_TAG_ELEMENTS 256    /* Maximum elements in a single tag */
-#define MAX_TAG_SIZE 512        /* Maximum size of a tag element */
+/* Content, tag and event sizes are relay limits: ng_limits (ng_config.h). */
 
 /* ============================================================================
  * event_t - Represents a single Nostr event

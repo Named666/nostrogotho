@@ -36,6 +36,7 @@ static bool load_config(const char *path, bool required) {
         return false;
     }
     storage_set_sync_full(cfg.db_sync == NG_DB_SYNC_FULL);
+    ng_limits_apply(&cfg.limits);
     server_set_config(&cfg);
     return true;
 }

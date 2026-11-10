@@ -24,7 +24,30 @@
 #define NG_MAX_IO_LOOPS 64      /* io_threads upper bound */
 #define NG_MAX_WORKERS  64      /* workers upper bound (== RELAY_MAX_SHARDS) */
 
+#define NG_MAX_FILTERS  64      /* max_filters upper bound (stack-sized index) */
+
 typedef enum { NG_DB_SYNC_FULL = 0, NG_DB_SYNC_NORMAL = 1 } ng_db_sync_t;
+
+/* Protocol limits (also published in the NIP-11 limitation object). */
+typedef struct {
+    size_t max_message_length;  /* max_message_length: bytes of one client message */
+    size_t max_event_size;      /* max_event_size: bytes of the serialized event JSON */
+    size_t max_content_length;  /* max_content_length: bytes of "content" */
+    int max_event_tags;         /* max_event_tags: tags per event */
+    int max_subscriptions;      /* max_subscriptions: open REQs per connection */
+    int max_filters;            /* max_filters: filters per REQ/COUNT */
+    int max_subid_length;       /* max_subid_length: subscription id bytes */
+    int max_limit;              /* max_limit: cap on a filter's "limit" */
+    int default_limit;          /* default_limit: stored events when no "limit" */
+    int max_filter_items;       /* max_filter_items: ids/authors/kinds/#tag values per filter */
+    int max_req_authors;        /* max_req_authors: authors summed over a REQ's filters */
+} ng_limits_t;
+
+/* The process-wide limits: compiled-in defaults until ng_limits_apply()
+ * runs at startup (before any thread starts); read-only afterwards. */
+extern ng_limits_t ng_limits;
+void ng_limits_defaults(ng_limits_t *l);
+void ng_limits_apply(const ng_limits_t *l);
 
 typedef struct {
     ng_db_sync_t db_sync;       /* db_sync: full (default) | normal */
@@ -36,6 +59,7 @@ typedef struct {
     size_t worker_queue_max;    /* worker_queue_max: queued inbound bytes per worker */
     int writer_queue_max;       /* writer_queue_max: EVENTs waiting for the writer */
     int conn_pending_max;       /* conn_pending_max: queued messages per connection */
+    ng_limits_t limits;         /* protocol limits (see ng_limits_t) */
 } ng_config_t;
 
 /* Fill *cfg with the defaults (db_sync full, 4M / 1G / 16M budgets,

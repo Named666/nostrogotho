@@ -7,6 +7,31 @@
 #include <stdlib.h>
 #include <string.h>
 
+ng_limits_t ng_limits = {
+    (size_t) 5 << 20, (size_t) 512 << 10, (size_t) 256 << 10, 5000,
+    100, 20, 100, 500, 500, 5000, 10000
+};
+
+void ng_limits_defaults(ng_limits_t *l) {
+    l->max_message_length = (size_t) 5 << 20;
+    l->max_event_size = (size_t) 512 << 10;
+    l->max_content_length = (size_t) 256 << 10;
+    l->max_event_tags = 5000;
+    l->max_subscriptions = 100;
+    l->max_filters = 20;
+    l->max_subid_length = 100;
+    l->max_limit = 500;
+    l->default_limit = 500;
+    l->max_filter_items = 5000;
+    l->max_req_authors = 10000;
+}
+
+void ng_limits_apply(const ng_limits_t *l) {
+    ng_limits = *l;
+    if (ng_limits.default_limit > ng_limits.max_limit) ng_limits.default_limit = ng_limits.max_limit;
+    if (ng_limits.max_event_size > ng_limits.max_message_length) ng_limits.max_event_size = ng_limits.max_message_length;
+}
+
 void ng_config_defaults(ng_config_t *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->db_sync = NG_DB_SYNC_FULL;
@@ -15,6 +40,7 @@ void ng_config_defaults(ng_config_t *cfg) {
     cfg->worker_queue_max = (size_t) 16 << 20;
     cfg->writer_queue_max = 65536;
     cfg->conn_pending_max = 1024;
+    ng_limits_defaults(&cfg->limits);
 }
 
 bool ng_parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
@@ -53,6 +79,15 @@ static const cfg_key_t keys[] = {
     { "worker_queue_max",   K_SIZE,    (size_t) 64 << 10,  (size_t) 1 << 36, F(worker_queue_max) },
     { "writer_queue_max",   K_INT,     1, (size_t) 1 << 24,            F(writer_queue_max) },
     { "conn_pending_max",   K_INT,     1, (size_t) 1 << 20,            F(conn_pending_max) },
+    { "max_message_length", K_SIZE,    (size_t) 64 << 10, (size_t) 64 << 20,  F(limits.max_message_length) },
+    { "max_event_size",     K_SIZE,    (size_t) 4 << 10,  (size_t) 4 << 20,   F(limits.max_event_size) },
+    { "max_content_length", K_SIZE,    1,                 (size_t) 4 << 20,   F(limits.max_content_length) },
+    { "max_event_tags",     K_INT,     1, 100000,                      F(limits.max_event_tags) },
+    { "max_subscriptions",  K_INT,     1, 10000,                       F(limits.max_subscriptions) },
+    { "max_filters",        K_INT,     1, NG_MAX_FILTERS,              F(limits.max_filters) },
+    { "max_subid_length",   K_INT,     1, 1024,                        F(limits.max_subid_length) },
+    { "max_limit",          K_INT,     1, 100000,                      F(limits.max_limit) },
+    { "default_limit",      K_INT,     1, 100000,                      F(limits.default_limit) },
 };
 #undef F
 

@@ -54,7 +54,6 @@
 #include "relay_wire.h"
 #include "server.h"
 
-#define MAX_WS_MESSAGE   (5u * 1024 * 1024)
 /* Default I/O loop count for n usable CPUs (io_threads = auto): one per CPU.
  * Fan-out is kernel-send bound on the loops (loopback: ~90% system time), so
  * they must scale with cores; idle loops cost nothing. On 4 CPUs, 4 loops vs
@@ -72,9 +71,8 @@ NG_STATIC_ASSERT(RELAY_MAX_SHARDS <= 64 && NG_MAX_IO_LOOPS <= 64, masks_fit_64_b
  * read-only afterwards, so every thread may read it without
  * synchronization. NG_IO_THREADS / NG_WORKERS (environment) still override
  * the thread counts for benchmark scripts. */
-static ng_config_t opt = {
-    NG_DB_SYNC_FULL, 0, 0, 0, (size_t) 4 << 20, (size_t) 1 << 30, (size_t) 16 << 20, 65536, 1024
-};
+static ng_config_t opt;
+static bool opt_set;                    /* else ng_config_defaults() */
 
 /* ---------------------------------------------------------------- state -- */
 static ngws_server_t *srv;              /* set once in server_run */
@@ -195,7 +193,7 @@ static void on_close(ngws_socket_t *ws, int code) {
 }
 
 /* ----------------------------------------------------------------- run --- */
-void server_set_config(const ng_config_t *cfg) { opt = *cfg; }
+void server_set_config(const ng_config_t *cfg) { opt = *cfg; opt_set = true; }
 
 static long usable_cpus(void) {
     /* CPUs this process may run on (taskset/cgroup cpusets), not all online. */
@@ -208,6 +206,7 @@ static long usable_cpus(void) {
 
 bool server_run(int port) {
     if (!relay_core_storage() || port < 1 || port > 65535) return false;
+    if (!opt_set) { ng_config_defaults(&opt); opt_set = true; }
     long ncpu = usable_cpus();
     int n_loops = env_int("NG_IO_THREADS", opt.io_threads ? opt.io_threads : IO_THREADS_AUTO(ncpu));
     int n_workers = env_int("NG_WORKERS", opt.workers ? opt.workers : (int) ncpu);
@@ -230,7 +229,7 @@ bool server_run(int port) {
         ngws_config_t cfg; memset(&cfg, 0, sizeof(cfg));
         cfg.port = port;
         cfg.loops = n_loops;
-        cfg.max_payload = MAX_WS_MESSAGE;
+        cfg.max_payload = ng_limits.max_message_length;
         cfg.max_backpressure = opt.conn_outbound_max;
         cfg.max_total_backlog = opt.total_outbound_max;
         cfg.listen_backlog = opt.listen_backlog;

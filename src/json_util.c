@@ -732,31 +732,44 @@ static bool append_filter_tag(filter_t *filter, const char *name,
     return true;
 }
 
+/* One tag element: a JSON string that decodes without errors and without
+ * an embedded NUL (elements are C strings everywhere downstream). */
+static bool tag_element_ok(jstr_t el) {
+    if (el.len < 2 || el.buf[0] != '"') return false;
+    char stackbuf[512];
+    char *buf = el.len <= sizeof(stackbuf) ? stackbuf : (char *) malloc(el.len);
+    size_t n = 0;
+    bool ok = buf && jl_unescape(el, buf, &n) && !memchr(buf, 0, n);
+    if (buf != stackbuf) free(buf);
+    return ok;
+}
+
+/* tags: an array of arrays of strings, each tag at most MAX_TAG_ELEMENTS
+ * elements (matches the canonical serializer in crypto.c). The tag count
+ * is a relay limit checked with a reason in nip01_precheck_event. */
 static bool validate_event_tags(jstr_t tags) {
     jstr_t key, tag;
     size_t tag_offset = 0;
-    size_t tag_count = 0;
     if (!tags.buf || tags.len < 2 || tags.buf[0] != '[') return false;
     while ((tag_offset = jl_next(tags, tag_offset, &key, &tag)) != 0) {
         jstr_t element_key, element;
         size_t element_offset = 0;
         size_t element_count = 0;
-        if (key.buf != NULL || ++tag_count > 100 || tag.len < 2 || tag.buf[0] != '[') return false;
-        /* Per-tag element cap must match parse_tags_json() in crypto.c (the
-         * canonical id serialization), so anything accepted here is hashed
-         * over every element. */
+        if (key.buf != NULL || tag.len < 2 || tag.buf[0] != '[') return false;
         while ((element_offset = jl_next(tag, element_offset, &element_key, &element)) != 0) {
-            char *string;
             if (element_key.buf != NULL || ++element_count > MAX_TAG_ELEMENTS) return false;
-            string = json_raw_string(element);
-            if (!string || strlen(string) > MAX_TAG_SIZE) {
-                free(string);
-                return false;
-            }
-            free(string);
+            if (!tag_element_ok(element)) return false;
         }
     }
     return true;
+}
+
+size_t json_event_tag_count(const event_t *event) {
+    if (!event || !event->tags_json) return 0;
+    jstr_t tags = jl_str_n(event->tags_json, event->tags_json_len), key, tag;
+    size_t offset = 0, n = 0;
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) n++;
+    return n;
 }
 
 bool json_parse_filter(const char *json_str, filter_t *filter) {
@@ -839,10 +852,10 @@ bool json_parse_event(const char *json_str, event_t *event) {
     tags = jl_get_tok(json, "$.tags");
     if (!id || !pubkey || !content || !sig || !tags.buf ||
         strlen(id) != MAX_ID_SIZE || strlen(pubkey) != MAX_PUBKEY_SIZE ||
-        strlen(sig) != MAX_SIG_SIZE || tags.len > MAX_TAGS_SIZE ||
+        strlen(sig) != MAX_SIG_SIZE ||
         !is_lower_hex(id, MAX_ID_SIZE) || !is_lower_hex(pubkey, MAX_PUBKEY_SIZE) ||
         !is_lower_hex(sig, MAX_SIG_SIZE) ||
-        strlen(content) > MAX_CONTENT_SIZE || !jl_get_num(json, "$.created_at", &created_at) ||
+        !jl_get_num(json, "$.created_at", &created_at) ||
         !jl_get_num(json, "$.kind", &kind) || created_at != (double)(time_t)created_at || kind != (int) kind ||
         !validate_event_tags(tags)) {
         free(id); free(pubkey); free(content); free(sig);

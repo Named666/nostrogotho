@@ -1,5 +1,6 @@
 #include "platform/ng_platform.h"
 #include "crypto.h"
+#include "json_lite.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -553,184 +554,75 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex, const uint8_t
 }
 
 /* ============================================================================
- * Tag Parsing (Helper)
+ * Canonical tags serialization (event id)
  * ============================================================================ */
 
-/* parse_tags_json - Parse tags from JSON array string
- * 
- * Extracts tags from a JSON array string and creates a tags_array_t structure.
- * Handles basic Nostr tag format: [["name", "val1", "val2"], ...]
- * 
- * Args: json_str - JSON array string (NULL-safe)
- * Returns: parsed tags_array_t, or NULL if parsing fails
- * 
- * Implementation:
- *   - Simple state machine parser (not full JSON parser)
- *   - Handles escaped quotes within strings
- *   - Skips whitespace and commas
- *   - Builds tag array incrementally
- * 
- * Caller responsibility: Must call tags_array_free() to release result
- */
-static tags_array_t *parse_tags_json(const char *json_str) {
-    if (!json_str) return NULL;
-    
-    /* Simple JSON parser for tag arrays
-     * This is a simplified parser that handles basic array of arrays format:
-     * [["tag1", "value1"], ["tag2", "value2", "value3"]]
-     */
-    
-    tags_array_t *tags = tags_array_alloc(MAX_TAG_ELEMENTS);
-    if (!tags) return NULL;
-    
-    const char *p = json_str;
-    
-    /* Skip to first '[' */
-    while (*p && *p != '[') p++;
-    if (*p != '[') {
-        tags_array_free(tags);
-        return NULL;
-    }
-    
-    p++;  /* Skip '[' */
-    
-    while (*p && *p != ']') {
-        /* Skip whitespace */
-        while (*p && (*p == ' ' || *p == '\n' || *p == '\t' || *p == ',')) p++;
-        
-        if (*p == ']') break;
-        
-        if (*p == '[') {
-            /* Start of a tag */
-            p++;
-            /* Bounds check: reject events with more tags than capacity */
-            if (tags->count >= MAX_TAG_ELEMENTS) {
-                tags_array_free(tags);
-                return NULL;
-            }
-            tag_t *tag = tag_alloc(MAX_TAG_ELEMENTS);
-            if (!tag) {
-                tags_array_free(tags);
-                return NULL;
-            }
-            
-            while (*p && *p != ']') {
-                /* Skip whitespace and comma */
-                while (*p && (*p == ' ' || *p == '\n' || *p == '\t' || *p == ',')) p++;
-                
-                if (*p == ']') break;
-                
-                if (*p == '"') {
-                    /* Parse string with proper unescaping (mirrors
-                     * parse_json_string in json_util.c): scan the raw span,
-                     * then decode escape sequences into the output buffer. */
-                    p++;
-                    /* Bounds check: reject tags with more elements than capacity */
-                    if (tag->count >= tag->capacity) {
-                        tag_free(tag);
-                        tags_array_free(tags);
-                        return NULL;
-                    }
-                    const char *str_start = p;
-                    size_t raw_len = 0;
-
-                    /* Find the raw (escaped) span of the string */
-                    while (*p && *p != '"') {
-                        if (*p == '\\' && p[1]) p++;  /* Skip escaped character */
-                        p++;
-                        raw_len++;
-                    }
-
-                    if (*p == '"') {
-                        /* Unescape into output buffer; output is never longer
-                         * than the raw span, so raw_len + 1 always suffices */
-                        char *element = (char *) ng_malloc_add(raw_len, 1);
-                        if (element) {
-                            size_t out_idx = 0;
-                            size_t in_idx = 0;
-                            while (in_idx < raw_len) {
-                                if (str_start[in_idx] == '\\' && in_idx + 1 < raw_len) {
-                                    in_idx++;
-                                    char c = str_start[in_idx];
-                                    switch (c) {
-                                        case '"':  element[out_idx++] = '"'; break;
-                                        case '\\': element[out_idx++] = '\\'; break;
-                                        case '/':  element[out_idx++] = '/'; break;
-                                        case 'b':  element[out_idx++] = '\b'; break;
-                                        case 'f':  element[out_idx++] = '\f'; break;
-                                        case 'n':  element[out_idx++] = '\n'; break;
-                                        case 'r':  element[out_idx++] = '\r'; break;
-                                        case 't':  element[out_idx++] = '\t'; break;
-                                        default:   element[out_idx++] = c; break;
-                                    }
-                                } else {
-                                    element[out_idx++] = str_start[in_idx];
-                                }
-                                in_idx++;
-                            }
-                            element[out_idx] = '\0';
-                            tag->elements[tag->count++] = element;
-                        }
-                        p++;
-                    }
-                }
-            }
-            
-            if (*p == ']') {
-                p++;
-                if (tag->count > 0) {
-                    tags->tags[tags->count++] = *tag;
-                    free(tag); /* contents moved into array */
-                } else {
-                    tag_free(tag);
-                }
-            } else {
-                /* Unterminated tag: free partially filled tag */
-                tag_free(tag);
-                tags_array_free(tags);
-                return NULL;
-            }
+/* Already canonical: only [ ] , and strings outside strings (no
+ * whitespace), and inside strings no control bytes and only the escapes
+ * the canonical form itself uses. The structure was validated by
+ * json_parse_event. Most clients send exactly this, so the id can be
+ * hashed over the raw bytes without re-serializing. */
+static bool tags_json_is_canonical(const char *s, size_t n) {
+    bool in_str = false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char) s[i];
+        if (!in_str) {
+            if (c == '"') in_str = true;
+            else if (c != '[' && c != ']' && c != ',') return false;
+            continue;
+        }
+        if (c < 0x20) return false;
+        if (c == '"') { in_str = false; continue; }
+        if (c == '\\') {
+            if (++i >= n) return false;
+            c = (unsigned char) s[i];
+            if (c != '"' && c != '\\' && c != 'n' && c != 'r' && c != 't' && c != 'b' && c != 'f') return false;
         }
     }
-
-    return tags;
+    return !in_str;
 }
 
-
-
 /* canonical_tags_json - re-serialize tags in NIP-01 canonical form (no
- * whitespace, minimal escaping) so the id is computed over the canonical
- * serialization rather than the client's raw bytes. Returns malloc'd string
- * or NULL. */
+ * whitespace, minimal escaping, every element decoded including \uXXXX
+ * escapes and surrogate pairs) so the id is computed over the canonical
+ * serialization rather than the client's raw bytes. Empty tags are kept.
+ * The input must have passed json_parse_event (an array of string arrays).
+ * Returns a malloc'd string or NULL (malformed input or out of memory). */
 static char *canonical_tags_json(const char *raw) {
-    tags_array_t *tags = parse_tags_json(raw);
-    if (!tags) return NULL;
-    size_t cap = 3, len = 0, add;     /* worst case: every byte escaped as \u00XX */
-    bool fits = true;
-    for (size_t i = 0; fits && i < tags->count; i++)
-        for (size_t j = 0; fits && j < tags->tags[i].count; j++)
-            fits = ng_size_flex(4, strlen(tags->tags[i].elements[j]), 6, &add) && ng_size_add(cap, add, &cap);
-    if (fits) fits = ng_size_flex(cap, tags->count, 3, &cap);
-    char *out = fits ? (char *) malloc(cap) : NULL;
-    if (!out) { tags_array_free(tags); return NULL; }
+    jstr_t all = jl_str(raw), key, tag;
+    /* Output bound: every decoded byte escapes to at most 6 bytes and a
+     * decoded element is never longer than its token. */
+    size_t cap;
+    if (!ng_size_flex(3, all.len, 6, &cap)) return NULL;
+    char *out = (char *) malloc(cap);
+    char *tmp = (char *) ng_malloc_add(all.len, 1);
+    if (!out || !tmp) { free(out); free(tmp); return NULL; }
+    size_t len = 0, offset = 0;
+    bool ok = all.len >= 2 && all.buf[0] == '[';
     out[len++] = '[';
-    for (size_t i = 0; i < tags->count; i++) {
-        if (i) out[len++] = ',';
+    for (bool first = true; ok && (offset = jl_next(all, offset, &key, &tag)) != 0; first = false) {
+        if (key.buf || tag.len < 2 || tag.buf[0] != '[') { ok = false; break; }
+        if (!first) out[len++] = ',';
         out[len++] = '[';
-        for (size_t j = 0; j < tags->tags[i].count; j++) {
-            if (j) out[len++] = ',';
+        jstr_t ek, el;
+        size_t eo = 0;
+        for (bool efirst = true; ok && (eo = jl_next(tag, eo, &ek, &el)) != 0; efirst = false) {
+            size_t n = 0;
+            if (ek.buf || !jl_unescape(el, tmp, &n) || memchr(tmp, 0, n)) { ok = false; break; }
+            tmp[n] = '\0';
+            if (!efirst) out[len++] = ',';
             out[len++] = '"';
-            if (!json_escape_string(tags->tags[i].elements[j], out + len, cap - len)) {
-                free(out); tags_array_free(tags); return NULL;
-            }
-            len += strlen(out + len);
+            size_t w = json_escape_string(tmp, out + len, cap - len);
+            if (!w) { ok = false; break; }
+            len += w - 1;
             out[len++] = '"';
         }
-        out[len++] = ']';
+        if (ok) out[len++] = ']';
     }
+    free(tmp);
+    if (!ok || len + 2 > cap) { free(out); return NULL; }
     out[len++] = ']';
     out[len] = '\0';
-    tags_array_free(tags);
     return out;
 }
 
@@ -794,9 +686,13 @@ bool check_event(const event_t *ev) {
     }
     
     /* Size the serialization buffer: fixed overhead + tags + escaped content */
-    char *canon_tags = ev->tags_json ? canonical_tags_json(ev->tags_json) : NULL;
-    if (ev->tags_json && !canon_tags) { free(escaped_content); return false; }
-    const char *tags_json = canon_tags ? canon_tags : "[]";
+    char *canon_tags = NULL;
+    const char *tags_json = "[]";
+    if (ev->tags_json) {
+        if (tags_json_is_canonical(ev->tags_json, strlen(ev->tags_json))) tags_json = ev->tags_json;
+        else if (!(canon_tags = canonical_tags_json(ev->tags_json))) { free(escaped_content); return false; }
+        else tags_json = canon_tags;
+    }
     size_t tags_len = strlen(tags_json);
     size_t buffer_cap;
     char *buffer = ng_size_add3(128 + 1, tags_len, strlen(escaped_content), &buffer_cap) ? (char *) malloc(buffer_cap) : NULL;

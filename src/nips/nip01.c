@@ -1,5 +1,6 @@
 #include "nip01.h"
 #include "../crypto.h"
+#include "../ng_config.h"
 #include "../storage.h"
 #include "nip_event.h"
 #include "nip_plugin.h"
@@ -71,28 +72,32 @@ nip01_process_result_t nip01_precheck_event(
         return result;
     }
     
-    /* Step 1: Validate event (ID, signature) */
+    /* Step 1: size caps (cheap, before any hashing). */
+    if (max_content_length > 0 && event->content_len > max_content_length) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "invalid: content is longer than %zu bytes", max_content_length);
+        return result;
+    }
+    if (json_serialized_event_size(event) > ng_limits.max_event_size) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "invalid: event is larger than %zu bytes", ng_limits.max_event_size);
+        return result;
+    }
+
+    if (json_event_tag_count(event) > (size_t) ng_limits.max_event_tags) {
+        result.accepted = false;
+        snprintf(result.response_msg, sizeof(result.response_msg),
+                "invalid: more than %d tags", ng_limits.max_event_tags);
+        return result;
+    }
+
+    /* Step 2: Validate event (ID, signature) */
     if (!nip01_validate_event(event)) {
         result.accepted = false;
         snprintf(result.response_msg, sizeof(result.response_msg),
                 "invalid: event id or signature is invalid");
-        return result;
-    }
-    
-    /* Step 2: Check content size */
-    if (max_content_length > 0 && event->content_len > max_content_length) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "invalid: content too large");
-        return result;
-    }
-
-    /* Step 2b: Policy cap on the delivered message size (NG_EVENT_JSON_MAX).
-     * The 160-byte margin covers the ["EVENT","<sub id>",...] wrapper. */
-    if (json_serialized_event_size(event) + 160 > NG_EVENT_JSON_MAX) {
-        result.accepted = false;
-        snprintf(result.response_msg, sizeof(result.response_msg),
-                "invalid: event serialization too large");
         return result;
     }
     

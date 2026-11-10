@@ -36,16 +36,12 @@
 /* Maximum length for a single JSON string value */
 #define MAX_JSON_STRING_VALUE 65536
 
-/* Policy: largest serialized ["EVENT", sub, {...}] message the relay will
- * store and deliver. Events whose serialization (+ wrapper) would exceed it
- * are rejected on publish (NIP-01 "invalid: event serialization too large"). */
-#define NG_EVENT_JSON_MAX 65536
-
 /* json_builder_t sizing: inline bytes, the hard output cap (any message the
- * relay builds, including events at NG_EVENT_JSON_MAX), and the heap buffer
+ * relay builds, including an ["EVENT", sub, {...}] at the largest
+ * configurable max_event_size, 4 MiB, see ng_config.h), and the heap buffer
  * size a reused (thread-local) builder may keep between messages. */
 #define JSON_BUILDER_INLINE 512
-#define JSON_BUILDER_MAX    (1024u * 1024u)
+#define JSON_BUILDER_MAX    (8u * 1024u * 1024u)
 #define JSON_BUILDER_KEEP   (128u * 1024u)
 
 /* ============================================================================
@@ -316,8 +312,11 @@ void json_serialize_event(const event_t *event, json_builder_t *builder);
  * (excluding the enclosing ["EVENT", sub, ...] wrapper).
  *
  * Callers can use this to reject, before storing or broadcasting, any event
- * whose serialization exceeds the NG_EVENT_JSON_MAX policy.
+ * whose serialization exceeds the max_event_size limit (ng_limits).
  */
 size_t json_serialized_event_size(const event_t *event);
+
+/* Number of tags in event->tags_json (0 when there are none). */
+size_t json_event_tag_count(const event_t *event);
 
 #endif /* JSON_UTIL_H_ */

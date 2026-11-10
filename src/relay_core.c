@@ -18,14 +18,9 @@
 #include "nips/nip_event.h"
 #include "nips/nip_plugin.h"
 #include "platform/ng_alloc.h"
+#include "ng_config.h"
 
-#define MAX_SUBSCRIPTIONS 20
-#define MAX_FILTERS 10
-#define MAX_SUB_ID_LENGTH 100
-#define MAX_WS_MESSAGE_LENGTH (5 * 1024 * 1024)
-#define MAX_EVENT_CONTENT_LENGTH (16 * 1024)
-#define MAX_EVENT_TAGS 100
-#define MAX_LIMIT 500
+/* Protocol limits: ng_limits (ng_config.h, nostrogotho.conf). */
 
 /* ============================================================================
  * NIP PLUGIN ARCHITECTURE
@@ -179,15 +174,15 @@ static size_t filter_keys(const filter_t *f, uint64_t *keys, size_t cap) {
 static bool index_add(int shard, subscription_t *s) {
     shard_index_t *ix = index_of(shard);
     if (!ix) return false;
-    uint64_t keys[MAX_FILTERS][64]; size_t nk[MAX_FILTERS]; size_t total = 0;
-    for (size_t i = 0; i < s->filters_count && i < MAX_FILTERS; i++) {
+    uint64_t keys[NG_MAX_FILTERS][64]; size_t nk[NG_MAX_FILTERS]; size_t total = 0;
+    for (size_t i = 0; i < s->filters_count && i < NG_MAX_FILTERS; i++) {
         nk[i] = filter_keys(&s->filters[i], keys[i], 64);
         total += nk[i] ? nk[i] : 1;
     }
     s->entries = (sub_entry_t *) calloc(total ? total : 1, sizeof(sub_entry_t));
     if (!s->entries) return false;
     size_t e = 0;
-    for (size_t i = 0; i < s->filters_count && i < MAX_FILTERS; i++) {
+    for (size_t i = 0; i < s->filters_count && i < NG_MAX_FILTERS; i++) {
         if (!nk[i]) { s->entries[e].sub = s; s->entries[e].filter = &s->filters[i]; entry_link(&ix->wild, &s->entries[e]); e++; continue; }
         for (size_t k = 0; k < nk[i]; k++) {
             s->entries[e].sub = s; s->entries[e].filter = &s->filters[i];
@@ -465,7 +460,7 @@ static bool collect_filters(json_value_t *values, size_t count, filter_t **out, 
         filter_capacity = inner_count;
         filters = (filter_t *) calloc(filter_capacity ? filter_capacity : 1, sizeof(*filters));
         if (!filters) return false;
-        for (size_t i = 0; i < inner_count && *out_count < MAX_FILTERS; i++) {
+        for (size_t i = 0; i < inner_count && *out_count < (size_t) ng_limits.max_filters; i++) {
             if (inner[i].type == JSON_TYPE_OBJECT && json_parse_filter(inner[i].value.string_val, &filters[*out_count])) (*out_count)++;
         }
         json_array_free(inner, inner_count);
@@ -473,7 +468,7 @@ static bool collect_filters(json_value_t *values, size_t count, filter_t **out, 
         filter_capacity = count > 2 ? count - 2 : 0;
         filters = (filter_t *) calloc(filter_capacity ? filter_capacity : 1, sizeof(*filters));
         if (!filters) return false;
-        for (size_t i = 2; i < count && *out_count < MAX_FILTERS; i++) {
+        for (size_t i = 2; i < count && *out_count < (size_t) ng_limits.max_filters; i++) {
             if (values[i].type == JSON_TYPE_OBJECT && json_parse_filter(values[i].value.string_val, &filters[*out_count])) (*out_count)++;
         }
     }
@@ -491,7 +486,7 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     const char *sub = json_array_get_string(values, count, 1);
     filter_t *filters = NULL;
     size_t filter_count = 0;
-    if (!sub || strlen(sub) > MAX_SUB_ID_LENGTH || count < 3 || !collect_filters(values, count, &filters, &filter_count)) {
+    if (!sub || strlen(sub) > (size_t) ng_limits.max_subid_length || count < 3 || !collect_filters(values, count, &filters, &filter_count)) {
         nip_plugin_send_status(connection, "CLOSED", sub, false, "error: invalid filter"); return;
     }
     const char *why = NULL;
@@ -507,7 +502,7 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     core_conn_t *cc = core_of(connection);
     int others = 0;
     for (subscription_t *s = cc->subs; s; s = s->conn_next) if (strcmp(s->id, sub) != 0) others++;
-    if (others >= MAX_SUBSCRIPTIONS) {
+    if (others >= ng_limits.max_subscriptions) {
         release_filters(filters, filter_count);
         nip_plugin_send_status(connection, "CLOSED", sub, false, "error: too many subscriptions"); return;
     }
@@ -585,7 +580,7 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
     bool guarded = !(event.kind >= 20000 && event.kind < 30000);
 
     /* CPU-bound, stateless: id hash, schnorr signature, size, timestamps. */
-    nip01_process_result_t result = nip01_precheck_event(&event, MAX_EVENT_CONTENT_LENGTH,
+    nip01_process_result_t result = nip01_precheck_event(&event, ng_limits.max_content_length,
         created_at_lower_limit, created_at_upper_limit, min_pow_difficulty);
     if (result.accepted && !plugins_accept_publish(connection, &event, reject_reason, sizeof(reject_reason))) {
         result.accepted = false;
@@ -631,7 +626,7 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
 void relay_core_on_message(relay_conn_t *connection, char *payload, size_t len) {
     json_value_t values[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
     size_t count; const char *method;
-    if (len > MAX_WS_MESSAGE_LENGTH) { nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: message too large"); return; }
+    if (len > ng_limits.max_message_length) { nip_plugin_send_status(connection, "NOTICE", NULL, false, "error: message too large"); return; }
     log_message(connection, "recv: %s", payload);
     count = json_array_parse(payload, values, MAX_JSON_ARRAY_ELEMENTS);
     method = json_array_get_string(values, count, 0);
@@ -711,15 +706,15 @@ void relay_core_configure(storage_context_t *storage, const char *relay_url, int
     memset(&config, 0, sizeof(config));
     config.service_url = service_url;
     config.storage = storage;
-    config.max_message_length = MAX_WS_MESSAGE_LENGTH;
-    config.max_subscriptions = MAX_SUBSCRIPTIONS;
-    config.max_filters = MAX_FILTERS;
-    config.max_subid_length = MAX_SUB_ID_LENGTH;
-    config.max_event_tags = MAX_EVENT_TAGS;
-    config.max_content_length = MAX_EVENT_CONTENT_LENGTH;
+    config.max_message_length = (int) ng_limits.max_message_length;
+    config.max_subscriptions = ng_limits.max_subscriptions;
+    config.max_filters = ng_limits.max_filters;
+    config.max_subid_length = ng_limits.max_subid_length;
+    config.max_event_tags = ng_limits.max_event_tags;
+    config.max_content_length = (int) ng_limits.max_content_length;
     config.min_pow_difficulty = min_pow_difficulty;
-    config.max_limit = MAX_LIMIT;
-    config.default_limit = MAX_LIMIT;
+    config.max_limit = ng_limits.max_limit;
+    config.default_limit = ng_limits.default_limit;
     config.created_at_lower_limit = created_at_lower_limit;
     config.created_at_upper_limit = created_at_upper_limit;
     config.auth_required = false;
