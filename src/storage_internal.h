@@ -6,7 +6,7 @@
  *                     WAL checkpoint, storage_context_t wiring
  *   storage_write.c   write path (the single writer thread): insert,
  *                     tombstones, replaceable admission, NIP-09/62 deletes,
- *                     NIP-40 purge, NIP-26 delegation index
+ *                     NIP-40 purge
  *   storage_query.c   query planner/builder: filter -> SQL + params (pure)
  *   storage_read.c    read path (worker threads): get_event_by_id,
  *                     send_records

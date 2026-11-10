@@ -28,7 +28,7 @@ bool nip01_validate_event(const event_t *ev) {
     if (!ev) return false;
     
     /* Delegate to crypto layer for full validation
-     * (ID verification, signature verification, delegation checking) */
+     * (ID verification, signature verification) */
     return check_event(ev);
 }
 
@@ -52,7 +52,7 @@ static bool plugin_listens_for(const nip_plugin_t *plugin, int kind) {
     return false;
 }
 
-/* Stateless, CPU-bound checks (id/sig/delegation, size, timestamps). Safe to
+/* Stateless, CPU-bound checks (id/sig, size, timestamps). Safe to
  * run on any worker thread; never touches storage. */
 nip01_process_result_t nip01_precheck_event(
     const event_t *event,
@@ -71,11 +71,11 @@ nip01_process_result_t nip01_precheck_event(
         return result;
     }
     
-    /* Step 1: Validate event (ID, signature, delegation) */
+    /* Step 1: Validate event (ID, signature) */
     if (!nip01_validate_event(event)) {
         result.accepted = false;
         snprintf(result.response_msg, sizeof(result.response_msg),
-                "invalid: event id, signature or delegation is invalid");
+                "invalid: event id or signature is invalid");
         return result;
     }
     

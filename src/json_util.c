@@ -742,11 +742,9 @@ static bool validate_event_tags(jstr_t tags) {
         size_t element_offset = 0;
         size_t element_count = 0;
         if (key.buf != NULL || ++tag_count > 100 || tag.len < 2 || tag.buf[0] != '[') return false;
-        /* Per-tag element cap must match parse_tags_json() in crypto.c: its
-         * scanner aborts (returning NULL) beyond MAX_TAG_ELEMENTS elements,
-         * which used to silently skip delegation-tag verification while the
-         * json_lite-based tag lookups still honored the tag. Keep both
-         * parsers in lockstep so anything accepted here is fully scanned. */
+        /* Per-tag element cap must match parse_tags_json() in crypto.c (the
+         * canonical id serialization), so anything accepted here is hashed
+         * over every element. */
         while ((element_offset = jl_next(tag, element_offset, &element_key, &element)) != 0) {
             char *string;
             if (element_key.buf != NULL || ++element_count > MAX_TAG_ELEMENTS) return false;

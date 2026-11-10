@@ -55,7 +55,6 @@ nostrogotho/
 │   ├── nip11.c/h              ← Relay Information Document (HTTP)
 │   ├── nip13.c/h              ← Proof of Work
 │   ├── nip17.c/h              ← Private Direct Messages
-│   ├── nip26.c/h              ← Delegated Event Signing
 │   ├── nip40.c/h              ← Expiration Timestamp
 │   ├── nip42.c/h              ← Client Authentication
 │   ├── nip45.c/h              ← Event Counts (COUNT queries)
@@ -88,7 +87,7 @@ nostrogotho/
 | **crypto.h/c** | Cryptography | 358 | `sha256`, `signature_verify`, `check_event` |
 | **storage.h/c** | Database | 476 | `insert_record`, `send_records`, SQLite ops |
 | **server.c** | WebSocket + NIP plugins | 295+ | ngws transport (backend_ngws.c), plugin hooks |
-| **NIP Plugins** | Protocol-specific logic | varies | nip01, nip09, nip11, nip13, nip17, nip26, nip40, nip42, nip45, nip62, nip67 |
+| **NIP Plugins** | Protocol-specific logic | varies | nip01, nip09, nip11, nip13, nip17, nip40, nip42, nip45, nip62, nip67 |
 
 ### Total: ~1,400+ lines of C99 code
 
@@ -134,7 +133,7 @@ Implemented NIPs (as of 2026-09-03 audit):
 | 13 | Proof of Work | ✅ Complete | Yes (via NIP-01) |
 | 16 | Event Treatment | ✅ Complete (→ NIP-01) | Yes |
 | 17 | Private Direct Messages | ✅ Complete | Yes |
-| 26 | Delegated Event Signing | ✅ Complete | Yes (via crypto) |
+| 26 | Delegated Event Signing | ❌ Removed (deprecated NIP) | — |
 | 33 | Parameterized Replaceable Events | ✅ Complete (→ NIP-01) | Yes |
 | 40 | Expiration Timestamp | ✅ Complete | Yes |
 | 42 | Client Authentication | ✅ Complete | Yes |

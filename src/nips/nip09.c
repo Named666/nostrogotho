@@ -99,9 +99,7 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
         return true;  /* Malformed "a" tag — nothing to act on. */
     }
 
-    /* Author-scoped: the "a" tag pubkey must match the deletion author,
-     * either directly or because the deletion author delegated to it
-     * (NIP-26: the delegator may delete delegatee events). */
+    /* Author-scoped: the "a" tag pubkey must match the deletion author. */
     if (strcmp(pubkey, event->pubkey) != 0) return true;
 
     /* Validate requested kind against any "k" tags. */
@@ -122,13 +120,9 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
 }
 
 /* Return true when `event` (the deletion author) is authorized to delete
- * `target`. Direct authorship matches, and per NIP-26 the delegator may
- * delete events published by their delegatee (target carries a delegation
- * tag naming the delegator). */
+ * `target`: only the target's author may delete it. */
 static bool deletion_authorized(const event_t *event, const event_t *target) {
-    if (strcmp(target->pubkey, event->pubkey) == 0) return true;
-    /* NIP-26: delegator can delete delegatee events. */
-    return nip_event_has_tag(target, "delegation", event->pubkey);
+    return strcmp(target->pubkey, event->pubkey) == 0;
 }
 
 /* Delete a specific event referenced by an "e" tag.
@@ -150,8 +144,7 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
     if (!target) return ok;  /* No knowledge of this event — nothing to do. */
 
     /* Author-scoped: only delete if the deletion author matches the target's
-     * pubkey (directly or via NIP-26 delegation), and (when "k" tags are
-     * present) the target's kind is requested. */
+     * pubkey, and (when "k" tags are present) the target's kind is requested. */
     if (deletion_authorized(event, target) &&
         kind_is_requested(event, target->kind)) {
         if (target->kind == 1059) {

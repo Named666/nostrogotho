@@ -38,7 +38,6 @@ nostrogotho/
     ├── nip11.c/h            Relay Information Document
     ├── nip13.c/h            Proof of Work
     ├── nip17.c/h            Private Direct Messages
-    ├── nip26.c/h            Delegated Event Signing
     ├── nip40.c/h            Expiration Timestamp
     ├── nip42.c/h            Client Authentication
     ├── nip45.c/h            Event Counts
@@ -96,7 +95,7 @@ The relay implements 13 NIPs. Status as of the 2026-09-03 audit:
 | 13 | Proof of Work | ✅ Complete | Yes |
 | 16 | Event Treatment | ✅ Complete (→ NIP-01) | Yes |
 | 17 | Private Direct Messages | ✅ Complete | Yes |
-| 26 | Delegated Event Signing | ✅ Complete | Yes |
+| 26 | Delegated Event Signing | ❌ Removed (deprecated) | — |
 | 33 | Parameterized Replaceable Events | ✅ Complete (→ NIP-01) | Yes |
 | 40 | Expiration Timestamp | ✅ Complete | Yes |
 | 42 | Client Authentication | ✅ Complete | Yes |
@@ -142,7 +141,7 @@ time ranges, and content search; stored events are delivered before EOSE.
 | 13 | Supported | Enforces an optional, configurable minimum proof-of-work difficulty. |
 | 16 | Supported | Replaces older events for replaceable event kinds. |
 | 17 | Supported | Restricts gift-wrap delivery, including stored query replay, to authenticated `p`-tag recipients. |
-| 26 | Supported | Verifies delegation signatures and delegation conditions. |
+| 26 | Not supported | Deprecated ("unrecommended") NIP; delegation tags are stored as ordinary tags and never honored. |
 | 33 | Supported | Replaces parameterized replaceable events using their `d` tag. |
 | 40 | Supported | Omits expired events from stored event queries. |
 | 42 | Supported | Issues cryptographically random challenges and verifies signed client authentication events. |

@@ -47,6 +47,23 @@ def tags():
     r.stop()
 
 
+@section
+def nip26():
+    """NIP-26 delegation is not supported (deprecated NIP, removed)."""
+    r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()
+    ev = delegatee.ev("delegated", 1, [["delegation", delegator.pk, "kind=1", "00" * 64]])
+    m = w.publish(ev)
+    check("event with a delegation tag is stored as a plain event (tag not verified)", m and m[2] is True, m)
+    evs, _ = w.req("d", {"authors": [delegator.pk]})
+    check("authors:[delegator] does not match delegated events", evs == [], evs)
+    evs, _ = w.req("d2", {"authors": [delegatee.pk]})
+    check("authors:[signer] matches", [e["id"] for e in evs] == [ev["id"]])
+    w.publish(delegator.ev("", 5, [["e", ev["id"]]]))
+    evs, _ = w.req("d3", {"ids": [ev["id"]]})
+    check("delegator cannot delete the delegatee's event", len(evs) == 1)
+    r.stop()
+
+
 if __name__ == "__main__":
     for name in sys.argv[1:] or SECTIONS:
         print(f"-- {name}: {SECTIONS[name].__doc__}")

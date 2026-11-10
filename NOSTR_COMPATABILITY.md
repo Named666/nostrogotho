@@ -7,7 +7,7 @@
 > **2026-09-03 audit:** NIP-16 and NIP-33 were consolidated into `nip01.c`
 > (both specs are `final mandatory` "Moved to NIP-01"); NIP-40 and NIP-45 were
 > wired into the request path; NIP-62 relay-tag enforcement, NIP-13 nonce
-> target validation, NIP-26 delegated-author queries and delegator deletion,
+> target validation, NIP-26 delegated-author queries and delegator deletion (NIP-26 was later removed),
 > NIP-42 `restricted` prefix, and NIP-67 `auth` hint were implemented. NIP-11
 > now derives `supported_nips` and `limitation` from real runtime values.
 >
@@ -32,7 +32,7 @@
 | [13](thirdparty/nips/13.md) | Proof of Work | ✅ Complete | (via NIP-01) | ✅ |
 | [16](thirdparty/nips/16.md) | Event Treatment | ✅ Complete (→ NIP-01) | `0, 3, 10000-19999` | ✅ |
 | [17](thirdparty/nips/17.md) | Private Direct Messages | ✅ Complete | gating only + `auth` hint | ✅ |
-| [26](thirdparty/nips/26.md) | Delegated Event Signing | ✅ Complete | (via crypto) | ✅ |
+| [26](thirdparty/nips/26.md) | Delegated Event Signing | ❌ Removed (deprecated NIP) | — | — |
 | [33](thirdparty/nips/33.md) | Parameterized Replaceable Events | ✅ Complete (→ NIP-01) | `30000-39999` | ✅ |
 | [40](thirdparty/nips/40.md) | Expiration Timestamp | ✅ Complete | — | ✅ |
 | [42](thirdparty/nips/42.md) | Client Authentication | ✅ Complete | `22242` (auth) | ✅ |

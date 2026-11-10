@@ -92,11 +92,6 @@ void storage_set_sync_full(bool full) { db_sync = full ? "FULL" : "NORMAL"; }
  *   - timeidx: on event.created_at DESC
  *   - kindidx: on event.kind
  *   - kindtimeidx: composite on (kind, created_at DESC)
- * Delegation side table (NIP-26):
- *   - delegation(event_id, delegator): PK on (event_id, delegator)
- *   - delegation_delegator_idx: on delegation(delegator) so REQ filters
- *     with {authors: [A]} resolve delegated events via index lookups
- *     instead of full-table LIKE scans over tags JSON.
  * Page size:
  *   - PRAGMA page_size = 1048576 (~1MB) set before any table exists; larger
  *     pages reduce B-tree depth and I/O for big events (content + tags JSON
@@ -199,17 +194,7 @@ static bool storage_init_sqlite3(const char *dsn) {
         /* NIP-09 tombstones: (id, deleting author). */
         "CREATE TABLE IF NOT EXISTS deleted_event ("
         "    id BLOB NOT NULL, pubkey BLOB NOT NULL, PRIMARY KEY (id, pubkey)"
-        ") WITHOUT ROWID;"
-        /* NIP-26 delegation side table: one row per (event, delegator).
-         * ON DELETE CASCADE keeps it in sync with event deletions because
-         * PRAGMA foreign_keys is enabled above. */
-        "CREATE TABLE IF NOT EXISTS delegation ("
-        "    event_id BLOB NOT NULL REFERENCES event(id) ON DELETE CASCADE,"
-        "    delegator BLOB NOT NULL,"
-        "    PRIMARY KEY (event_id, delegator)"
-        ");"
-        "CREATE INDEX IF NOT EXISTS delegation_delegator_idx "
-        "    ON delegation(delegator);";
+        ") WITHOUT ROWID;";
     
     errmsg = NULL;
     if (sqlite3_exec(ngdb_conn, schema_sql, NULL, NULL, &errmsg) != SQLITE_OK) {

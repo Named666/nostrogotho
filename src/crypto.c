@@ -1,6 +1,5 @@
 #include "platform/ng_platform.h"
 #include "crypto.h"
-#include "nips/nip26.h"
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
@@ -746,7 +745,6 @@ static char *canonical_tags_json(const char *raw) {
  * 2. Computes SHA256 of this JSON
  * 3. Verifies computed ID matches event.id
  * 4. Verifies signature with event.pubkey
- * 5. Validates any delegation tags present
  * 
  * Args: ev - event to validate (must not be NULL)
  * Returns: true if all checks pass, false if any check fails
@@ -840,38 +838,6 @@ bool check_event(const event_t *ev) {
     /* Verify signature */
     if (!signature_verify(ev->sig, ev->pubkey, digest)) {
         return false;
-    }
-    
-    /* Check delegation tags if present */
-    if (!ev->tags_json) {
-        /* No tags, skip delegation check */
-    } else {
-        tags_array_t *tags = parse_tags_json(ev->tags_json);
-        if (!tags) {
-            /* Fail closed: an unparseable tags blob must not skip
-             * delegation verification. Tags accepted by the parse-time
-             * gate always parse here, so this rejects only genuinely
-             * malformed input. */
-            return false;
-        }
-        {
-            for (size_t i = 0; i < tags->count; i++) {
-                tag_t *tag = &tags->tags[i];
-                
-                if (tag->elements && tag->count >= 4 && strcmp(tag->elements[0], "delegation") == 0) {
-                    const char *delegator_pubkey = tag->elements[1];
-                    const char *conditions = tag->elements[2];
-                    const char *delegation_sig = tag->elements[3];
-                    
-                    if (!nip26_check_delegation(ev, delegator_pubkey, conditions, delegation_sig)) {
-                        tags_array_free(tags);
-                        return false;
-                    }
-                }
-            }
-            
-            tags_array_free(tags);
-        }
     }
     
     return true;

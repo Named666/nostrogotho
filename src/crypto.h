@@ -10,7 +10,6 @@
  * 
  * Provides cryptographic functions for:
  * - Event validation (SHA256 hashing and Schnorr signature verification)
- * - Delegation verification (NIP-26)
  * - Proof of work validation (NIP-13)
  * 
  * Hashing: in-tree SHA-256 (Windows: CNG); signatures: libsecp256k1.
@@ -140,7 +139,7 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
                       const uint8_t digest[32]);
 
 /* ============================================================================
- * Event Validation (NIP-01, NIP-26)
+ * Event Validation (NIP-01)
  * ============================================================================ */
 
 /* check_event - Validate a complete Nostr event
@@ -148,7 +147,6 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
  * Performs full validation of a Nostr event:
  * 1. Verifies event ID is correct SHA256 hash of event data
  * 2. Verifies signature with public key
- * 3. If delegation tags present, verifies each delegation
  * 
  * Args: ev - event to validate (must not be NULL)
  * 
@@ -161,35 +159,6 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
  * Note: Does NOT check timestamps or proof-of-work; those are checked separately
  */
 bool check_event(const event_t *ev);
-
-/* check_delegation - Verify a delegation tag (NIP-26)
- * 
- * Validates a delegation tag that allows one key to act on behalf of another.
- * Checks both delegation conditions and signature.
- * 
- * Args:
- *   ev                  - event being delegated
- *   delegator_pubkey    - original key's pubkey (64-char hex)
- *   conditions          - conditions string (e.g., "kind=1&created_at<100")
- *   delegation_sig      - signature of delegation (64-char hex)
- * 
- * Returns: true if delegation is valid and conditions match, false otherwise
- * 
- * Conditions (NIP-26):
- *   - kind=N             event kind must equal N
- *   - kind=M&kind=N      event kind must be M or N (multiple kinds OR'd)
- *   - created_at<N       event created_at must be less than N
- *   - created_at>N       event created_at must be greater than N
- *   - Conditions are AND'd unless same key, then OR'd
- * 
- * Requirements:
- *   - crypto_init() must have been called
- *   - ev must be initialized with pubkey and created_at
- * 
- * Note: Empty conditions string is treated as "no restrictions"
- */
-bool check_delegation(const event_t *ev, const char *delegator_pubkey,
-                      const char *conditions, const char *delegation_sig);
 
 /* ============================================================================
  * Proof of Work (NIP-13)

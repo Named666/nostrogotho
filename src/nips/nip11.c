@@ -16,10 +16,10 @@ static char information_document[1024];
 
 /* NIPs implemented and wired into the request path:
  *   01 basic protocol, 09 deletion, 11 this document, 13 PoW,
- *   16 replaceable (via NIP-01), 17 gift-wrap gating, 26 delegation,
+ *   16 replaceable (via NIP-01), 17 gift-wrap gating,
  *   33 addressable (via NIP-01), 40 expiration, 42 auth, 45 COUNT,
  *   62 vanish. */
-static const int supported_nips[] = {1, 9, 11, 13, 16, 17, 26, 33, 40, 42, 45, 62};
+static const int supported_nips[] = {1, 9, 11, 13, 16, 17, 33, 40, 42, 45, 62};
 #define SUPPORTED_NIPS_COUNT (sizeof(supported_nips) / sizeof(supported_nips[0]))
 
 static struct {

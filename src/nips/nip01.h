@@ -34,7 +34,6 @@
  * Performs full validation of a Nostr event for protocol compliance:
  * 1. Verifies event ID is the correct SHA256 hash
  * 2. Verifies Schnorr signature with public key
- * 3. Validates any delegation tags present (NIP-26)
  * 
  * This is the primary validation function used when accepting events
  * from clients via EVENT messages.
@@ -43,7 +42,7 @@
  * 
  * Returns: 
  *   true if event passes all validation checks
- *   false if any check fails (id, signature, delegation, etc.)
+ *   false if any check fails (id or signature)
  * 
  * Requirements:
  *   - crypto_init() must have been called
@@ -116,7 +115,7 @@ typedef nip01_process_result_t (*nip01_event_listener_t)(
 /* nip01_process_event - Main entry point for event processing
  * 
  * Performs comprehensive event processing:
- * 1. Validates event (ID, signature, delegation)
+ * 1. Validates event (ID, signature)
  * 2. Checks content size limit
  * 3. Checks timestamp limits
  * 4. Checks proof-of-work difficulty

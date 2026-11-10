@@ -11,59 +11,6 @@
 #include "nips/nip40.h"
 #include "nips/nip_event.h"
 
-/* store_delegations - Index an event's NIP-26 delegation tags
- *
- * Scans the event's tags JSON for ["delegation", "<delegator>", ...] tags
- * and records (event_id, delegator) pairs in the normalized `delegation`
- * table. This replaces LIKE '%...%' scans over the tags column with an
- * indexed lookup: {authors: [A]} filters resolve delegators via
- * delegation(delegator) in O(log n) instead of a full table scan, which
- * matters at scale (users following/being followed by thousands of keys).
- *
- * Called only after the event row was inserted successfully; failures are
- * logged but never fail the publication (a missing delegation row only
- * makes that one delegated event unqueryable by delegator).
- */
-static void store_delegations(const event_t *ev) {
-    if (!ngdb_conn || !ev || !ev->tags_json || !ev->tags_json[0]) return;
-
-    static const char *insert_sql =
-        "INSERT OR IGNORE INTO delegation (event_id, delegator) VALUES (unhex(?), unhex(?))";
-
-    jstr_t key, t, tags_str = jl_str(ev->tags_json);
-    size_t offset = 0;
-    bool found_any = false;
-    sqlite3_stmt *stmt = NULL;
-
-    while ((offset = jl_next(tags_str, offset, &key, &t)) != 0) {
-        char *name = nip_tag_element(t, 0);
-        if (!name || strcmp(name, "delegation") != 0) { free(name); continue; }
-        free(name);
-
-        char *delegator = nip_tag_element(t, 1);
-        if (!delegator) continue;
-
-        if (!stmt) {
-            if (sqlite3_prepare_v2(ngdb_conn, insert_sql, -1, &stmt, NULL) != SQLITE_OK) {
-                fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
-                free(delegator);
-                return;
-            }
-        }
-        sqlite3_bind_text(stmt, 1, ev->id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, delegator, -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(ngdb_conn) > 0) {
-            found_any = true;
-        }
-        sqlite3_reset(stmt);
-        sqlite3_clear_bindings(stmt);
-        free(delegator);
-    }
-
-    if (stmt) sqlite3_finalize(stmt);
-    (void) found_any;
-}
-
 /* Bind one tag value: 64-char lowercase hex as a 32-byte blob (the form the
  * query side and the delete trigger use), anything else as text. */
 static void bind_tag_value(sqlite3_stmt *st, int idx, const char *v, size_t len) {
@@ -213,7 +160,7 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
         return STORAGE_PUT_FAILED;
     }
     if (changes == 0) return STORAGE_PUT_DUPLICATE;   /* ON CONFLICT(id) DO NOTHING */
-    /* The event row exists: index its tags (and delegation tags, FK). A
+    /* The event row exists: index its tags. A
      * failed tag index fails the insert; the writer rolls the batch back. */
     if (!store_tags(ev, sqlite3_last_insert_rowid(ngdb_conn))) {
         /* Undo the row (the delete trigger drops any tag rows written). */
@@ -225,7 +172,6 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
         }
         return STORAGE_PUT_FAILED;
     }
-    store_delegations(ev);
     return STORAGE_PUT_INSERTED;
 }
 
@@ -379,7 +325,7 @@ static bool delete_ids(char **ids, size_t n, size_t *deleted) {
     return ok;
 }
 
-/* Delete record by kind, pubkey, and delegation tag */
+/* Delete record by kind, pubkey and "d" tag value */
 bool ngdb_delete_record_by_kind_and_pubkey_and_dtag(int kind, const char *pubkey,
                                                       const tag_t *tag, time_t created_at,
                                                       size_t *deleted) {

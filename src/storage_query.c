@@ -181,15 +181,9 @@ ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit)
     }
     if (f->authors_count > 0) {
         NEXT();
-        /* NIP-26: {authors: [A]} matches the event pubkey or a delegator,
-         * resolved through the indexed delegation side table. */
-        sq_sql(q, "(e.pubkey IN (");
-        sq_list(q, "unhex(?)", f->authors_count);
-        sq_sql(q, ") OR e.id IN (SELECT event_id FROM delegation WHERE delegator IN (");
-        sq_list(q, "unhex(?)", f->authors_count);
-        sq_sql(q, ")))");
-        for (int pass = 0; pass < 2; pass++)
-            for (size_t i = 0; i < f->authors_count; i++) sq_text(q, f->authors[i]);
+        if (f->authors_count == 1) sq_sql(q, "e.pubkey = unhex(?)");
+        else { sq_sql(q, "e.pubkey IN ("); sq_list(q, "unhex(?)", f->authors_count); sq_sql(q, ")"); }
+        for (size_t i = 0; i < f->authors_count; i++) sq_text(q, f->authors[i]);
     }
     if (f->kinds_count > 0) {
         NEXT();

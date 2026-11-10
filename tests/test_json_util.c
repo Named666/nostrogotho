@@ -100,11 +100,9 @@ static void test_serialize_huge_tags_terminated(void) {
            pass ? "PASS" : "FAIL");
 }
 
-/* Regression: validate_event_tags() used to allow tags with unlimited
- * elements, while check_event()'s delegation scanner (parse_tags_json in
- * crypto.c) bails out past MAX_TAG_ELEMENTS elements -- silently skipping
- * delegation signature verification for such events. Both parsers must
- * agree; events carrying oversized tags must be rejected at parse time. */
+/* Regression: validate_event_tags() and check_event()'s tag scanner
+ * (parse_tags_json in crypto.c) must agree on the per-tag element cap;
+ * events carrying oversized tags must be rejected at parse time. */
 static void test_event_with_oversized_tag_rejected(void) {
     char *tags = (char *) malloc(65536);
     char *wire = (char *) malloc(65536 + 512);
@@ -113,8 +111,7 @@ static void test_event_with_oversized_tag_rejected(void) {
     for (int i = 0; i < 300; i++)
         off += (size_t) snprintf(tags + off, 65536 - off, "%s\"x\"", i ? "," : "");
     off += (size_t) snprintf(tags + off, 65536 - off, "],"
-            "[\"delegation\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
-            "\"kind=1\",\"%064d\"]]", 0);
+            "[\"p\",\"%064d\"]]", 0);
     (void) off;
 
     snprintf(wire, 65536 + 512,

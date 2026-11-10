@@ -34,11 +34,10 @@ static void test_count_authors_ids(void) {
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, true, 500);
     const char *want = "SELECT COUNT(*) FROM event e WHERE e.id IN (unhex(?),unhex(?)) AND "
-                       "(e.pubkey IN (unhex(?)) OR e.id IN (SELECT event_id FROM delegation WHERE delegator IN (unhex(?)))) "
-                       "AND e.created_at <= 5";
+                       "e.pubkey = unhex(?) AND e.created_at <= 5";
     check("COUNT ids+authors SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
-    check("COUNT ids+authors params (no LIMIT)", q.n == 4 && q.params[0].text == H1 && q.params[1].text == H2 &&
-          q.params[2].text == H2 && q.params[3].text == H2 && !q.params[0].owned, NULL);
+    check("COUNT ids+authors params (no LIMIT)", q.n == 3 && q.params[0].text == H1 && q.params[1].text == H2 &&
+          q.params[2].text == H2 && !q.params[0].owned, NULL);
     sq_free(&q);
 }
 
@@ -117,7 +116,7 @@ static void test_caps(void) {
     f.kinds = kinds; f.kinds_count = 256;
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 500);
-    check("256 ids + 256 authors + 256 kinds compile", st == NG_OK && q.n == 256 * 4 + 1, NULL);
+    check("256 ids + 256 authors + 256 kinds compile", st == NG_OK && q.n == 256 * 3 + 1, NULL);
     sq_free(&q);
 
     static char *vals[257];
