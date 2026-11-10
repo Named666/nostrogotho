@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import time
 
-BINARY = str(Path(__file__).resolve().parents[1] / "build/main")
+BINARY = os.environ.get("RELAY_BIN") or str(Path(__file__).resolve().parents[1] / "build/main")
 
 
 def check(text, valid, explicit=True):
@@ -60,6 +60,13 @@ for text, valid, explicit in [
     ("typo=normal\n", False, True),
     ("db_sync full\n", False, True),
     ("db_sync=" + "x" * 300, False, True),
+    ("conn_outbound_max = 2M\ntotal_outbound_max=512M\nworker_queue_max=8M\n"
+     "writer_queue_max=4096\nconn_pending_max=64\nio_threads=2\nworkers=auto\n", True, True),
+    ("conn_outbound_max = 1K\n", False, True),   # below the 64 KiB floor
+    ("total_outbound_max = lots\n", False, True),
+    ("writer_queue_max = 0\n", False, True),
+    ("io_threads = -1\n", False, True),
+    ("conn_pending_max = 5X\n", False, True),
 ]:
     check(text, valid, explicit)
-print("PASS: 11 runtime config startup cases")
+print("PASS: 17 runtime config startup cases")

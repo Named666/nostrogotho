@@ -26,7 +26,8 @@ error=None
 try:
  with tempfile.TemporaryDirectory(prefix='ng-diag-') as td:
   pathlib.Path(td+'/relay.conf').write_text('db_sync = full\n')
-  env=os.environ.copy(); env.update(NG_IO_THREADS='2',NG_WORKERS='4',NG_WRITER_STATS='1')
+  env=os.environ.copy(); env.setdefault('NG_IO_THREADS','2'); env.setdefault('NG_WORKERS','4'); env['NG_WRITER_STATS']='1'
+  if os.environ.get('NG_DEFAULT_THREADS')=='1': env.pop('NG_IO_THREADS'); env.pop('NG_WORKERS')
   relay=spawn(['taskset','-c','0-3',a.relay,'--port','17548','--db',td+'/relay.sqlite','--config',td+'/relay.conf'],'relay',td,env)
   for _ in range(10): tick()
   holder=spawn(['taskset','-c','4-7',str(ROOT/'build/ngload_soak'),'-p','17548','-c',str(a.idle),'-i',str(a.idle//15000+2),'-k','128','-t','4','-w','0','-d',str(a.duration+8),'-x',str(relay.pid),'hold'],'hold',td)

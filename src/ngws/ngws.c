@@ -38,6 +38,7 @@ enum { ST_HTTP = 0, ST_WS, ST_CLOSING, ST_CLOSED };
 typedef struct sockx {
     struct sockx *dprev, *dnext;      /* loop dirty list (needs flush) */
     struct sockx *aprev, *anext;      /* loop list of open WebSockets */
+    struct sockx *bprev, *bnext;      /* loop list of sockets owning a backlog buffer */
     struct us_socket_t *s;
     ngws_loop_t *loop;
     uint8_t state, msg_op, ping_sent, dirty, shutdown_after_flush, in_data, in_frame, frame_op, drain;
@@ -68,6 +69,7 @@ struct ngws_loop {
     atomic_bool wake_pending;
     sockx_t *dirty;                     /* head of dirty list */
     sockx_t *all;                       /* open WebSockets */
+    sockx_t *blog;                      /* sockets with a backlog buffer (obuf) */
     size_t n_open;
     arena_chunk_t *arena, *arena_cur;
     ionode_t *nodes; uint32_t n_nodes, cap_nodes;
@@ -81,6 +83,8 @@ struct ngws_server {
     int n_loops;
     ngws_loop_t loops[MAX_LOOPS];
     atomic_bool stopping;
+    atomic_size_t backlog_total;        /* sum of obuf capacities, all loops */
+    atomic_ullong closed_conn_limit, closed_total_limit;
     bool uncork;                        /* flush a socket at the end of its on_data */
 };
 
@@ -180,24 +184,53 @@ static bool node_add(sockx_t *x, const void *p, size_t n) {
     return true;
 }
 
+/* Grow the private backlog so that `need` bytes fit after compaction.
+ * Enforces the per-socket limit (max_backpressure) and the process-wide
+ * budget (max_total_backlog): once the budget is exhausted a socket that
+ * wants a backlog above the drain watermark is a slow reader and is refused
+ * (the caller terminates it). Capacity is accounted, not bytes in use, so
+ * the budget tracks real memory. */
+static bool obuf_room(sockx_t *x, size_t n) {
+    ngws_server_t *srv = SRV(x);
+    size_t pending = x->olen - x->ooff;
+    if (pending + n > srv->cfg.max_backpressure) { atomic_fetch_add_explicit(&srv->closed_conn_limit, 1, memory_order_relaxed); return false; }
+    if (x->olen + n <= x->ocap) return true;
+    if (x->ooff) { memmove(x->obuf, x->obuf + x->ooff, pending); x->olen = pending; x->ooff = 0; }
+    if (x->olen + n <= x->ocap) return true;
+    size_t nc = x->ocap ? x->ocap * 2 : 4096; while (nc < x->olen + n) nc *= 2;
+    size_t grow = nc - x->ocap;
+    if (srv->cfg.max_total_backlog && pending + n > SEND_WATERMARK &&
+        atomic_load_explicit(&srv->backlog_total, memory_order_relaxed) + grow > srv->cfg.max_total_backlog) {
+        atomic_fetch_add_explicit(&srv->closed_total_limit, 1, memory_order_relaxed);
+        return false;
+    }
+    char *nb = (char *) realloc(x->obuf, nc);
+    if (!nb) return false;
+    atomic_fetch_add_explicit(&srv->backlog_total, grow, memory_order_relaxed);
+    if (!x->ocap) {                                   /* join the loop's backlog list */
+        ngws_loop_t *l = x->loop;
+        x->bprev = NULL; x->bnext = l->blog;
+        if (l->blog) l->blog->bprev = x;
+        l->blog = x;
+    }
+    x->obuf = nb; x->ocap = nc;
+    return true;
+}
+
 /* Append to the private backlog buffer. */
 static bool backlog_append(sockx_t *x, const void *p, size_t n) {
-    size_t pending = x->olen - x->ooff;
-    if (pending + n > SRV(x)->cfg.max_backpressure) return false;
-    if (x->olen + n > x->ocap) {
-        if (x->ooff) { memmove(x->obuf, x->obuf + x->ooff, pending); x->olen = pending; x->ooff = 0; }
-        if (x->olen + n > x->ocap) {
-            size_t nc = x->ocap ? x->ocap * 2 : 4096; while (nc < x->olen + n) nc *= 2;
-            char *nb = (char *) realloc(x->obuf, nc);
-            if (!nb) return false;
-            x->obuf = nb; x->ocap = nc;
-        }
-    }
+    if (!obuf_room(x, n)) return false;
     memcpy(x->obuf + x->olen, p, n); x->olen += n;
     return true;
 }
 
 static void out_release(sockx_t *x) {
+    if (x->ocap) {
+        atomic_fetch_sub_explicit(&SRV(x)->backlog_total, x->ocap, memory_order_relaxed);
+        if (x->bprev) x->bprev->bnext = x->bnext; else x->loop->blog = x->bnext;
+        if (x->bnext) x->bnext->bprev = x->bprev;
+        x->bprev = x->bnext = NULL;
+    }
     free(x->obuf);
     x->obuf = NULL; x->olen = x->ooff = x->ocap = 0;
 }
@@ -205,21 +238,11 @@ static void out_release(sockx_t *x) {
 /* Reserve n writable bytes for this socket's output. NULL = limit/oom (socket terminated). */
 static char *out_reserve(sockx_t *x, size_t n) {
     if (x->olen > x->ooff) {                       /* backlog: keep order */
-        if (!backlog_append(x, "", 0) || x->olen - x->ooff + n > SRV(x)->cfg.max_backpressure) goto fail;
-        if (x->olen + n > x->ocap) {
-            size_t pending = x->olen - x->ooff;
-            if (x->ooff) { memmove(x->obuf, x->obuf + x->ooff, pending); x->olen = pending; x->ooff = 0; }
-            if (x->olen + n > x->ocap) {
-                size_t nc = x->ocap * 2; while (nc < x->olen + n) nc *= 2;
-                char *nb = (char *) realloc(x->obuf, nc);
-                if (!nb) goto fail;
-                x->obuf = nb; x->ocap = nc;
-            }
-        }
+        if (!obuf_room(x, n)) goto fail;
         char *p = x->obuf + x->olen; x->olen += n;
         return p;
     }
-    if (x->qbytes + n > SRV(x)->cfg.max_backpressure) goto fail;
+    if (x->qbytes + n > SRV(x)->cfg.max_backpressure) { atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, memory_order_relaxed); goto fail; }
     ngws_loop_t *l = x->loop;
     arena_chunk_t *c = l->arena_cur;
     if (x->qtail && c && c->used + n <= c->cap) {
@@ -256,7 +279,10 @@ static bool flush(sockx_t *x) {
         x->qhead = x->qtail = 0; x->qbytes = 0;
         return false;
     }
-    if (x->obuf) out_release(x);
+    if (x->obuf) {
+        out_release(x);
+        if (x->state == ST_WS && SRV(x)->cfg.on_drain) SRV(x)->cfg.on_drain((ngws_socket_t *) s);
+    }
     if (x->qhead) {
         int fd = (int) (intptr_t) us_socket_get_native_handle(0, s);
         uint32_t i = x->qhead;
@@ -309,7 +335,7 @@ static int send_direct(sockx_t *x, int op, const void *data, size_t len) {
     struct us_socket_t *s = x->s;
     unsigned char hdr[10];
     size_t h = ws_frame_header(hdr, op, len), total = h + len;
-    if (total > SRV(x)->cfg.max_backpressure) { ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
+    if (total > SRV(x)->cfg.max_backpressure) { atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, memory_order_relaxed); ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
     struct iovec iov[2] = { { hdr, h }, { (void *) data, len } };
     ssize_t w = writev((int) (intptr_t) us_socket_get_native_handle(0, s), iov, 2);
     if (w == (ssize_t) total) return NGWS_SEND_OK;
@@ -374,7 +400,7 @@ int ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len) {
         if (!backlog_append(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
         dirty_add(x);
     } else {
-        if (x->qbytes + len > SRV(x)->cfg.max_backpressure) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
+        if (x->qbytes + len > SRV(x)->cfg.max_backpressure) { atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, memory_order_relaxed); ngws_terminate(ws); return NGWS_SEND_DROPPED; }
         ionode_t *t = x->qtail ? &x->loop->nodes[x->qtail - 1] : NULL;
         if (t && (const char *) t->p + t->len == (const char *) frame) { t->len += len; x->qbytes += len; }  /* contiguous: one iovec */
         else if (!node_add(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
@@ -826,6 +852,36 @@ static struct us_socket_t *on_timeout(struct us_socket_t *s) {
 static struct us_socket_t *on_long_timeout(struct us_socket_t *s) { return s; }
 
 /* ------------------------------------------------------------- loop ----- */
+/* Load shedding: when the process-wide backlog passes 75% of
+ * max_total_backlog, close this loop's slowest readers (largest backlog
+ * first, only those above the drain watermark) until it is back under 50%.
+ * Without this, a few clients that never read could pin the budget and keep
+ * the relay refusing new work indefinitely. */
+typedef struct { size_t pending; sockx_t *x; } shed_t;
+static int shed_cmp(const void *a, const void *b) {
+    size_t x = ((const shed_t *) a)->pending, y = ((const shed_t *) b)->pending;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void shed_sweep(ngws_loop_t *l) {
+    ngws_server_t *srv = l->srv;
+    size_t cap = srv->cfg.max_total_backlog;
+    if (!cap || atomic_load_explicit(&srv->backlog_total, memory_order_relaxed) < cap / 4 * 3) return;
+    size_t n = 0, k = 0;
+    for (sockx_t *x = l->blog; x; x = x->bnext) n++;
+    shed_t *v = n ? (shed_t *) malloc(n * sizeof(*v)) : NULL;
+    if (!v) return;
+    for (sockx_t *x = l->blog; x; x = x->bnext) {
+        size_t p = x->olen - x->ooff + x->qbytes;
+        if (p > SEND_WATERMARK) { v[k].pending = p; v[k].x = x; k++; }
+    }
+    qsort(v, k, sizeof(*v), shed_cmp);
+    for (size_t i = 0; i < k && atomic_load_explicit(&srv->backlog_total, memory_order_relaxed) > cap / 2; i++) {
+        atomic_fetch_add_explicit(&srv->closed_total_limit, 1, memory_order_relaxed);
+        ngws_terminate((ngws_socket_t *) v[i].x->s);
+    }
+    free(v);
+}
+
 static void loop_pre(struct us_loop_t *ul) { (void) ul; }
 static void loop_post(struct us_loop_t *ul) {
     ngws_loop_t *l = *(ngws_loop_t **) us_loop_ext(ul);
@@ -837,6 +893,7 @@ static void loop_post(struct us_loop_t *ul) {
         x = next;
     }
     l->dirty = NULL;
+    shed_sweep(l);
     for (uint32_t i = 0; i < l->n_defer; i++) l->defer[i].fn(l->defer[i].arg);
     l->n_defer = 0;
     if (l->n_nodes || l->arena_cur != l->arena || (l->arena && l->arena->used)) arena_reset(l);
@@ -991,4 +1048,10 @@ void ngws_server_free(ngws_server_t *srv) {
 
 void *ngws_server_user(ngws_server_t *srv) { return srv->cfg.user; }
 int ngws_server_loop_count(ngws_server_t *srv) { return srv->n_loops; }
+size_t ngws_server_backlog_bytes(ngws_server_t *srv) { return atomic_load_explicit(&srv->backlog_total, memory_order_relaxed); }
+void ngws_server_stats(ngws_server_t *srv, ngws_stats_t *o) {
+    o->backlog_bytes = ngws_server_backlog_bytes(srv);
+    o->closed_conn_limit = atomic_load(&srv->closed_conn_limit);
+    o->closed_total_limit = atomic_load(&srv->closed_total_limit);
+}
 ngws_loop_t *ngws_server_loop(ngws_server_t *srv, int i) { return i >= 0 && i < srv->n_loops ? &srv->loops[i] : NULL; }

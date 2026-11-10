@@ -56,6 +56,16 @@ struct relay_bcast;
 typedef void (*relay_publish_fn)(relay_conn_t *conn, struct relay_bcast *bcast);
 void relay_core_set_publisher(relay_publish_fn fn);
 
+/* Admission control (load shedding), consulted before expensive work:
+ * REQ/COUNT before the query, EVENT before signature verification. On
+ * false the core answers CLOSED / OK false with *why ("error: ..."). */
+typedef enum { RELAY_ADMIT_REQ, RELAY_ADMIT_EVENT } relay_admit_kind_t;
+typedef bool (*relay_admit_fn)(relay_conn_t *conn, relay_admit_kind_t kind, const char **why);
+void relay_core_set_admission(relay_admit_fn fn);
+/* Max bytes of stored events one REQ may queue (0 = unlimited); results
+ * past it are dropped, EOSE still follows. */
+void relay_core_set_query_bytes_max(size_t n);
+
 nip01_process_result_t relay_core_commit_event(relay_conn_t *conn, const event_t *event);
 /* Writer: after a batch commits (or rolls back with r->accepted cleared),
  * move the event id from in-flight to known or release it. */

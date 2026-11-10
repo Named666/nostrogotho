@@ -40,13 +40,13 @@
 #include "ngws/ngws.h"
 #include "nips/nip_plugin.h"
 #include "dedupe.h"
+#include "json_lite.h"
 #include "relay_conn_internal.h"
 #include "relay_core.h"
 #include "server.h"
 #include "ws_proto.h"
 
 #define MAX_WS_MESSAGE   (5u * 1024 * 1024)
-#define MAX_OUT_BUFFER   (32u * 1024 * 1024)   /* slow-consumer cutoff */
 #define MAX_IO_LOOPS     64
 #define WRITER_BATCH     8192   /* hard cap; NG_BATCH_MAX tunes below it */
 #define OUTBOX_FLUSH     (256u * 1024)
@@ -56,7 +56,22 @@ typedef struct {
     relay_conn_t base;          /* must be first */
     ngws_loop_t *loop;
     ngws_socket_t *ws;          /* loop thread only; NULL once closed */
+    atomic_int pending;         /* messages queued to the worker, not yet handled */
+    atomic_size_t out_buffered; /* socket output backlog as last seen by its loop */
 } ng_conn_t;
+
+/* ------------------------------------------------------- runtime options --
+ * Set from nostrogotho.conf (server_config_set) before server_run(). The
+ * NG_IO_THREADS / NG_WORKERS environment variables still override the thread
+ * counts (benchmark scripts). Byte values accept K/M/G (binary) suffixes. */
+static struct {
+    int io_threads, workers;            /* 0 = auto */
+    size_t conn_out_max;                /* per-connection output backlog, then close */
+    size_t total_out_max;               /* process-wide output budget */
+    size_t worker_queue_max;            /* queued inbound bytes per worker */
+    int writer_queue_max;               /* EVENTs waiting for the writer */
+    int conn_pending_max;               /* queued messages per connection */
+} opt = { 0, 0, 4u << 20, 1u << 30, 16u << 20, 65536, 1024 };
 
 enum { J_OPEN, J_MSG, J_CLOSE, J_BSET };
 typedef struct job {
@@ -79,6 +94,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job_t *head, *tail;
+    _Alignas(64) atomic_size_t qbytes;  /* queued + in-progress inbound bytes (budget) */
 } worker_t;
 
 typedef struct wjob {
@@ -124,6 +140,9 @@ static atomic_bool stopping;
 static char *info_doc;
 static size_t info_doc_len;
 static atomic_llong stat_open_conns;
+static atomic_size_t out_task_bytes;    /* posted outbox bytes not yet run by a loop */
+static atomic_ullong stat_shed_loop, stat_shed_core, stat_shed_writer;
+static atomic_int writer_depth;          /* EVENTs queued for the writer */
 
 static pthread_t writer_th;
 static pthread_mutex_t writer_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -160,11 +179,17 @@ static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
                     ngws_send_shared(ws, "]", 1);
                 }
             }
+            if (c->ws) {                    /* mirror for admission; write only on change (shared line) */
+                size_t b = ngws_buffered(ws);
+                if (atomic_load_explicit(&c->out_buffered, memory_order_relaxed) != b)
+                    atomic_store_explicit(&c->out_buffered, b, memory_order_relaxed);
+            }
         }
         if (r->kind == R_EVENT) ngws_loop_defer(loop, body_release_cb, r->body);
         relay_conn_unref(&c->base);
         o += sizeof(rec_t) + ((r->len + 7) & ~(size_t) 7);
     }
+    atomic_fetch_sub_explicit(&out_task_bytes, t->len, memory_order_relaxed);
     ngws_loop_defer(loop, outtask_free, t);   /* frames are referenced until flushed */
 }
 
@@ -175,6 +200,7 @@ static void outbox_flush_loop(int i) {
     outtask_t *t = ob->t;
     ob->t = NULL; ob->cap = 0;
     t->task.run = run_outtask;
+    atomic_fetch_add_explicit(&out_task_bytes, t->len, memory_order_relaxed);
     ngws_loop_post(ngws_server_loop(srv, i), &t->task);
 }
 
@@ -261,9 +287,12 @@ static void loop_flush_jobs(void *arg) {
     }
 }
 
+static size_t job_cost(const job_t *j) { return sizeof(job_t) + (j->type == J_MSG ? j->len + 1 : 0); }
+
 /* queue from a loop thread; delivered at the end of the iteration */
 static void loop_queue_job(ngws_loop_t *loop, int w, job_t *j) {
     loop_ctx_t *lc = (loop_ctx_t *) ngws_loop_get_user(loop);
+    atomic_fetch_add_explicit(&workers[w].qbytes, job_cost(j), memory_order_relaxed);
     j->next = NULL;
     if (lc->tail[w]) lc->tail[w]->next = j; else lc->head[w] = j;
     lc->tail[w] = j;
@@ -320,12 +349,75 @@ static void on_open(ngws_socket_t *ws, const ngws_http_req_t *req) {
     if (j) { relay_conn_retain(&c->base); loop_queue_job(c->loop, c->base.shard, j); }
 }
 
+/* ------------------------------------------------------ load shedding ---
+ * Inline rejection on the I/O thread when a message cannot be queued (worker
+ * budget or per-connection pending limit). Never blocks, never parses more
+ * than the first two array elements: EVENT -> ["OK",<id>,false,msg],
+ * REQ/COUNT -> ["CLOSED",<sub>,msg], anything else -> NOTICE. */
+static const char overload_msg[] = "error: relay overloaded, try again later";
+
+static void shed_inline(ngws_socket_t *ws, const char *data, size_t len) {
+    atomic_fetch_add_explicit(&stat_shed_loop, 1, memory_order_relaxed);
+    while (len && (*data == ' ' || *data == '\t' || *data == '\r' || *data == '\n')) { data++; len--; }
+    jstr_t arr = jl_str_n(data, len), k, v0, v1;
+    char out[320];
+    int n = 0;
+    size_t o = jl_next(arr, 0, &k, &v0);
+    if (o && jl_next(arr, o, &k, &v1)) {
+        if (jl_tok_eq(v0, "EVENT") && v1.buf[0] == '{') {
+            jstr_t kk, vv; size_t q = 0;
+            while ((q = jl_next(v1, q, &kk, &vv)) != 0) {
+                if (kk.len == 4 && memcmp(kk.buf, "\"id\"", 4) == 0) {
+                    bool hex = vv.len == 66 && vv.buf[0] == '"' && vv.buf[65] == '"';
+                    for (size_t i = 1; hex && i < 65; i++) hex = (vv.buf[i] >= '0' && vv.buf[i] <= '9') || (vv.buf[i] >= 'a' && vv.buf[i] <= 'f');
+                    if (hex) n = snprintf(out, sizeof(out), "[\"OK\",%.*s,false,\"%s\"]", 66, vv.buf, overload_msg);
+                    break;
+                }
+            }
+        } else if ((jl_tok_eq(v0, "REQ") || jl_tok_eq(v0, "COUNT")) && v1.buf[0] == '"' && v1.len <= 2 + 200) {
+            bool clean = true;   /* echo the raw sub-id token only if it is plain */
+            for (size_t i = 1; clean && i + 1 < v1.len; i++) clean = (unsigned char) v1.buf[i] >= 0x20 && v1.buf[i] != '"' && v1.buf[i] != '\\';
+            if (clean) n = snprintf(out, sizeof(out), "[\"CLOSED\",%.*s,\"%s\"]", (int) v1.len, v1.buf, overload_msg);
+        }
+    }
+    if (n <= 0 || (size_t) n >= sizeof(out)) n = snprintf(out, sizeof(out), "[\"NOTICE\",\"%s\"]", overload_msg);
+    ngws_send(ws, out, (size_t) n, NGWS_OP_TEXT);
+}
+
+/* Worker-side admission (relay_core hook), checked before any expensive
+ * work: signature verification for EVENT, the query for REQ/COUNT. */
+static bool core_admit(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
+    ng_conn_t *c = (ng_conn_t *) rc;
+    size_t total = atomic_load_explicit(&out_task_bytes, memory_order_relaxed) + (srv ? ngws_server_backlog_bytes(srv) : 0);
+    bool ok = total < opt.total_out_max / 10 * 9;   /* 90%: shedding (75%, ngws) did not keep up */
+    if (ok && atomic_load_explicit(&c->out_buffered, memory_order_relaxed) > opt.conn_out_max / 2) {
+        ok = false; *why = "error: output backlog too large, read faster";   /* slow reader */
+    } else if (!ok) *why = overload_msg;
+    if (ok && kind == RELAY_ADMIT_EVENT && atomic_load_explicit(&writer_depth, memory_order_relaxed) >= opt.writer_queue_max) {
+        ok = false; *why = overload_msg;
+    }
+    if (!ok) atomic_fetch_add_explicit(&stat_shed_core, 1, memory_order_relaxed);
+    return ok;
+}
+
+static void on_drain(ngws_socket_t *ws) {
+    ng_conn_t *c = *(ng_conn_t **) ngws_user(ws);
+    if (c) atomic_store_explicit(&c->out_buffered, ngws_buffered(ws), memory_order_relaxed);
+}
+
 static void on_message(ngws_socket_t *ws, char *data, size_t len, int op) {
     (void) op;
     ng_conn_t *c = *(ng_conn_t **) ngws_user(ws);
     if (!c) return;
+    worker_t *wk = &workers[c->base.shard];
+    if (atomic_load_explicit(&c->pending, memory_order_relaxed) >= opt.conn_pending_max ||
+        atomic_load_explicit(&wk->qbytes, memory_order_relaxed) + sizeof(job_t) + len + 1 > opt.worker_queue_max) {
+        shed_inline(ws, data, len);
+        return;
+    }
+    atomic_fetch_add_explicit(&c->pending, 1, memory_order_relaxed);
     job_t *j = job_new(J_MSG, c, len + 1);
-    if (!j) return;
+    if (!j) { atomic_fetch_sub(&c->pending, 1); return; }
     memcpy(j->payload, data, len); j->payload[len] = '\0'; j->len = len;
     relay_conn_retain(&c->base);
     loop_queue_job(c->loop, c->base.shard, j);
@@ -374,12 +466,14 @@ static void *worker_thread(void *arg) {
             case J_OPEN: relay_core_on_open(rc); relay_conn_unref(rc); break;
             case J_MSG:
                 if (rc->core && !atomic_load(&rc->closed)) relay_core_on_message(rc, j->payload, j->len);
+                atomic_fetch_sub_explicit(&j->conn->pending, 1, memory_order_relaxed);
                 relay_conn_unref(rc); break;
             case J_CLOSE: if (rc->core) relay_core_on_close(rc); relay_conn_unref(rc); break;
             case J_BSET:
                 for (int i = 0; i < j->bset->n; i++) relay_core_broadcast_shard(wk->idx, j->bset->b[i]);
                 bset_unref(j->bset); break;
             }
+            if (j->type != J_BSET) atomic_fetch_sub_explicit(&wk->qbytes, job_cost(j), memory_order_relaxed);
             free(j);
             j = next;
             if (tl_outbox_dirty && !j) outbox_flush();
@@ -392,9 +486,16 @@ static void *worker_thread(void *arg) {
 }
 
 /* --------------------------------------------------------------- writer -- */
+/* Never blocks the caller: a full writer queue answers OK false. */
 static void publish_to_writer(relay_conn_t *rc, relay_bcast_t *bc) {
-    wjob_t *w = (wjob_t *) malloc(sizeof(*w));
-    if (!w) { dedupe_release(bc->ev.id); relay_bcast_free(bc); relay_conn_unref(rc); return; }
+    bool full = atomic_fetch_add(&writer_depth, 1) >= opt.writer_queue_max;
+    wjob_t *w = full ? NULL : (wjob_t *) malloc(sizeof(*w));
+    if (!w) {
+        atomic_fetch_sub(&writer_depth, 1);
+        if (full) atomic_fetch_add_explicit(&stat_shed_writer, 1, memory_order_relaxed);
+        nip_plugin_send_status(rc, "OK", bc->ev.id, false, full ? overload_msg : "error: out of memory");
+        dedupe_release(bc->ev.id); relay_bcast_free(bc); relay_conn_unref(rc); return;
+    }
     w->next = NULL; w->conn = (ng_conn_t *) rc; w->bc = bc;
     pthread_mutex_lock(&writer_mu);
     bool was_empty = writer_head == NULL;
@@ -489,6 +590,7 @@ static void *writer_thread(void *arg) {
             }
         }
         prev_n = n;
+        atomic_fetch_sub(&writer_depth, n);
         if (!writer_head) writer_tail = NULL;
         bool stop = atomic_load(&stopping) && n == 0;
         pthread_mutex_unlock(&writer_mu);
@@ -583,13 +685,41 @@ static void *checkpoint_thread(void *arg) {
 }
 
 /* ----------------------------------------------------------------- run --- */
+static bool parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
+    char *end; errno = 0;
+    unsigned long long x = strtoull(v, &end, 10);
+    if (end == v || errno || *v == '-') return false;
+    unsigned long long m = 1;
+    if (*end == 'K' || *end == 'k') { m = 1ull << 10; end++; }
+    else if (*end == 'M' || *end == 'm') { m = 1ull << 20; end++; }
+    else if (*end == 'G' || *end == 'g') { m = 1ull << 30; end++; }
+    if (*end || x > (unsigned long long) hi / m || x * m < lo) return false;
+    *out = (size_t) (x * m);
+    return true;
+}
+
+bool server_config_set(const char *key, const char *value) {
+    size_t v;
+    if (strcmp(key, "io_threads") == 0 || strcmp(key, "workers") == 0) {
+        if (!(strcmp(value, "auto") == 0 ? (v = 0, true) : parse_size(value, 1, strcmp(key, "workers") == 0 ? RELAY_MAX_SHARDS : MAX_IO_LOOPS, &v))) return false;
+        if (key[0] == 'i') opt.io_threads = (int) v; else opt.workers = (int) v;
+        return true;
+    }
+    if (strcmp(key, "conn_outbound_max") == 0) return parse_size(value, 64u << 10, (size_t) 1 << 32, &opt.conn_out_max);
+    if (strcmp(key, "total_outbound_max") == 0) return parse_size(value, 256u << 10, (size_t) 1 << 40, &opt.total_out_max);
+    if (strcmp(key, "worker_queue_max") == 0) return parse_size(value, 64u << 10, (size_t) 1 << 36, &opt.worker_queue_max);
+    if (strcmp(key, "writer_queue_max") == 0) { if (!parse_size(value, 1, 1u << 24, &v)) return false; opt.writer_queue_max = (int) v; return true; }
+    if (strcmp(key, "conn_pending_max") == 0) { if (!parse_size(value, 1, 1u << 20, &v)) return false; opt.conn_pending_max = (int) v; return true; }
+    return false;
+}
+
 
 bool server_run(int port) {
     if (!relay_core_storage() || port < 1 || port > 65535) return false;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu < 1) ncpu = 1;
-    n_loops = env_int("NG_IO_THREADS", ncpu >= 4 ? (int) (ncpu / 4) : 1);
-    n_workers = env_int("NG_WORKERS", (int) ncpu);
+    n_loops = env_int("NG_IO_THREADS", opt.io_threads ? opt.io_threads : ncpu >= 4 ? (int) (ncpu / 4) : 1);
+    n_workers = env_int("NG_WORKERS", opt.workers ? opt.workers : (int) ncpu);
     if (n_loops > MAX_IO_LOOPS) n_loops = MAX_IO_LOOPS;
     if (n_workers > RELAY_MAX_SHARDS) n_workers = RELAY_MAX_SHARDS;
 
@@ -597,6 +727,8 @@ bool server_run(int port) {
     if (doc) { info_doc = strdup(doc); info_doc_len = strlen(info_doc); }
     signal(SIGPIPE, SIG_IGN);
     relay_core_set_publisher(publish_to_writer);
+    relay_core_set_admission(core_admit);
+    relay_core_set_query_bytes_max(opt.conn_out_max / 2);
 
     for (int i = 0; i < n_workers; i++) {
         workers[i].idx = i;
@@ -611,11 +743,12 @@ bool server_run(int port) {
     cfg.port = port;
     cfg.loops = n_loops;
     cfg.max_payload = MAX_WS_MESSAGE;
-    cfg.max_backpressure = MAX_OUT_BUFFER;
+    cfg.max_backpressure = opt.conn_out_max;
+    cfg.max_total_backlog = opt.total_out_max;
     cfg.idle_timeout = (unsigned) env_int("NG_IDLE_TIMEOUT", 120);
     cfg.handshake_timeout = 16;
     cfg.user_size = sizeof(ng_conn_t *);
-    cfg.on_open = on_open; cfg.on_message = on_message; cfg.on_close = on_close;
+    cfg.on_open = on_open; cfg.on_message = on_message; cfg.on_close = on_close; cfg.on_drain = on_drain;
     cfg.on_http = on_http; cfg.on_loop_start = on_loop_start; cfg.on_loop_stop = on_loop_stop;
     srv = ngws_server_create(&cfg);
     fprintf(stderr, "nostrogotho (ngws) listening on :%d  io_loops=%d workers=%d writer=1\n",
@@ -631,6 +764,13 @@ bool server_run(int port) {
         pthread_cond_broadcast(&workers[i].cv);
         pthread_mutex_unlock(&workers[i].mu);
         pthread_join(workers[i].th, NULL);
+    }
+    if (srv) {
+        ngws_stats_t ns; ngws_server_stats(srv, &ns);
+        fprintf(stderr, "overload: shed_inline=%llu shed_admission=%llu shed_writer_full=%llu "
+                "closed_conn_limit=%llu closed_total_limit=%llu\n",
+                (unsigned long long) atomic_load(&stat_shed_loop), (unsigned long long) atomic_load(&stat_shed_core),
+                (unsigned long long) atomic_load(&stat_shed_writer), ns.closed_conn_limit, ns.closed_total_limit);
     }
     relay_core_shutdown();
     return ok;

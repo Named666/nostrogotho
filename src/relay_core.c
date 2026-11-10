@@ -80,16 +80,21 @@ static time_t created_at_upper_limit;
 static char service_url[256];
 static bool debug_logging;
 static relay_publish_fn publisher;
+static relay_admit_fn admission;
 
 /* Per-thread query context for the storage streaming callback. */
 static __thread relay_conn_t *query_connection;
 static __thread filter_t *query_filters;
 static __thread size_t query_filters_count;
+static __thread size_t query_bytes;
+static size_t query_bytes_max;    /* 0 = unlimited */
+void relay_core_set_query_bytes_max(size_t n) { query_bytes_max = n; }
 
 void relay_core_set_debug(bool enabled) { debug_logging = enabled; }
 bool relay_core_debug(void) { return debug_logging; }
 storage_context_t *relay_core_storage(void) { return storage_ctx; }
 void relay_core_set_publisher(relay_publish_fn fn) { publisher = fn; }
+void relay_core_set_admission(relay_admit_fn fn) { admission = fn; }
 
 static void log_message(relay_conn_t *connection, const char *fmt, ...) {
     va_list args;
@@ -372,14 +377,22 @@ static void query_sender(const char *json, const event_t *event) {
     for (size_t i = 0; i < query_filters_count && !matched; i++)
         if (matches_filter(&query_filters[i], event, &tags)) matched = true;
     relay_tags_free(&tags);
-    if (matched && plugins_can_deliver(event, query_connection))
-        relay_conn_send(query_connection, json, strlen(json));
+    if (matched && plugins_can_deliver(event, query_connection)) {
+        size_t n = strlen(json);
+        /* Byte budget per stored-event reply: a REQ may not queue more than
+         * the connection's output budget allows in one burst; the rest is
+         * dropped and the reply still ends with EOSE (clients paginate). */
+        if (query_bytes_max && query_bytes + n > query_bytes_max) return;
+        query_bytes += n;
+        relay_conn_send(query_connection, json, n);
+    }
 }
 
 static void query_events(relay_conn_t *connection, const char *sub,
                          filter_t *filters, size_t count, bool do_count) {
     int total_count = 0;
     query_connection = connection;
+    query_bytes = 0;
     query_filters = filters;
     query_filters_count = count;
     storage_ctx->send_records(query_sender, sub, filters, count, do_count,
@@ -462,6 +475,11 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     if (!sub || strlen(sub) > MAX_SUB_ID_LENGTH || count < 3 || !collect_filters(values, count, &filters, &filter_count)) {
         nip_plugin_send_status(connection, "CLOSED", sub, false, "error: invalid filter"); return;
     }
+    const char *why = NULL;
+    if (admission && !admission(connection, RELAY_ADMIT_REQ, &why)) {
+        release_filters(filters, filter_count);
+        nip_plugin_send_status(connection, "CLOSED", sub, false, why); return;
+    }
     if (do_count) {
         query_events(connection, sub, filters, filter_count, true);
         release_filters(filters, filter_count);
@@ -530,6 +548,13 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
     log_message(connection, "event kind=%d id=%.*s pubkey=%.*s created_at=%lld",
                 event.kind, (int) sizeof(event.id), event.id,
                 (int) sizeof(event.pubkey), event.pubkey, (long long) event.created_at);
+
+    const char *why = NULL;
+    if (admission && !admission(connection, RELAY_ADMIT_EVENT, &why)) {
+        nip_plugin_send_status(connection, "OK", event.id, false, why);
+        event_release(&event);
+        return;
+    }
 
     /* Ephemeral kinds are never stored, so they are exempt from dedupe. */
     bool guarded = !(event.kind >= 20000 && event.kind < 30000);

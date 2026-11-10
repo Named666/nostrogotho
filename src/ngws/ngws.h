@@ -55,7 +55,10 @@ typedef struct {
     const char *host;            /* NULL = any */
     int loops;                   /* event-loop threads (default 1) */
     size_t max_payload;          /* max message size, close 1009 (default 16 MiB) */
-    size_t max_backpressure;     /* buffered-bytes cutoff, close socket (default 16 MiB) */
+    size_t max_backpressure;     /* per-socket buffered-bytes cutoff, close socket (default 16 MiB) */
+    size_t max_total_backlog;    /* process-wide user-space backlog budget (bytes, 0 = none).
+                                  * Over it, any socket that must grow a backlog beyond the
+                                  * drain watermark (64 KiB), i.e. a slow reader, is closed. */
     unsigned idle_timeout;       /* seconds; 0 = off. A ping is sent at timeout,
                                   * the socket is closed if nothing arrives by the
                                   * next one. Must be a multiple of 4. */
@@ -72,6 +75,15 @@ void ngws_server_stop(ngws_server_t *srv);     /* thread-safe */
 void ngws_server_free(ngws_server_t *srv);
 void *ngws_server_user(ngws_server_t *srv);
 int ngws_server_loop_count(ngws_server_t *srv);
+/* Bytes currently held in socket backlogs (capacity of the private output
+ * buffers, i.e. memory), all loops. Any thread, relaxed. */
+size_t ngws_server_backlog_bytes(ngws_server_t *srv);
+typedef struct {
+    unsigned long long backlog_bytes;     /* as above */
+    unsigned long long closed_conn_limit; /* sockets closed: per-socket max_backpressure */
+    unsigned long long closed_total_limit;/* sockets closed: process-wide max_total_backlog */
+} ngws_stats_t;
+void ngws_server_stats(ngws_server_t *srv, ngws_stats_t *out);
 ngws_loop_t *ngws_server_loop(ngws_server_t *srv, int idx);
 
 /* --- loop thread only ----------------------------------------------------- */

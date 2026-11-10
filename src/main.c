@@ -51,14 +51,14 @@ static bool load_config(const char *path, bool required) {
         end = value + strlen(value);
         while (end > value && isspace((unsigned char)end[-1])) end--;
         *end = '\0';
-        if (strcmp(key, "db_sync") != 0 || !storage_set_db_sync(value)) {
+        if (strcmp(key, "db_sync") == 0 ? !storage_set_db_sync(value) : !server_config_set(key, value)) {
             ok = false;
             break;
         }
     }
     if (ferror(file)) ok = false;
     fclose(file);
-    if (!ok) fprintf(stderr, "%s:%u: invalid config (expected db_sync=full or normal)\n", path, number);
+    if (!ok) fprintf(stderr, "%s:%u: invalid config line (see nostrogotho.conf for keys and values)\n", path, number);
     return ok;
 }
 
