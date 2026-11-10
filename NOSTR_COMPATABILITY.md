@@ -106,7 +106,7 @@
 
 - **`nip45_build_count_response(sub_id, count)`** — builds a `["COUNT", qid,
   {"count": N}]` JSON array with the JSON builder.
-- **Wired end-to-end** — `send_records()` in `storage.c` now reports the
+- **Wired end-to-end** — `send_records()` in `storage_read.c` now reports the
   aggregated count via its `out_count` out-parameter instead of formatting the
   response itself; `query_events()` in `server.c` builds and sends the response
   through `nip45_build_count_response()`. The storage layer stays free of
@@ -217,6 +217,6 @@ source of truth for escaping) so all string fields are emitted correctly.
 
 - Implementation headers: `src/nips/nip<X>.h`
 - Reference specs: `thirdparty/nips/<X>.md`
-- Storage SQL / query helpers: `src/storage.c`, `src/storage.h`
+- Storage: `src/storage.h` (interface), `src/storage_sqlite.c` (schema/lifecycle), `src/storage_write.c`, `src/storage_query.c` (filter -> SQL), `src/storage_read.c`
 - Crypto (ID / signature / delegation / PoW): `src/crypto.c`, `src/crypto.h`
 - Server wiring: `src/server.c`, `src/main.c`

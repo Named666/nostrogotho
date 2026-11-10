@@ -12,9 +12,13 @@ I="-Ibuild -I. -Isrc -isystem thirdparty -isystem thirdparty/usockets/src -isyst
 FILES=${FILES:-$(ls src/*.c src/ngws/*.c src/nips/*.c tools/ngload.c tools/ngws_bench_server.c tests/*.c | grep -v nip_template.c)}
 OUT=${OUT:-/tmp/strict_check.log}; : > "$OUT"
 # zig cc (clang) cannot do -fsyntax-only; compile to a scratch object instead.
-case "$CC" in *zig*) MODE="-c -o /tmp/strict_check.$$.o" ;; *) MODE="-fsyntax-only" ;; esac
+# zig also caches objects and replays no warnings on a cache hit: use a fresh cache.
+case "$CC" in
+  *zig*) MODE="-c -o /tmp/strict_check.$$.o"; ZC=$(mktemp -d); export ZIG_LOCAL_CACHE_DIR=$ZC ZIG_GLOBAL_CACHE_DIR=$ZC ;;
+  *) MODE="-fsyntax-only" ;;
+esac
 for f in $FILES; do $CC -std=$STD $W $D $I -O2 $MODE "$f" >>"$OUT" 2>&1; done
-rm -f /tmp/strict_check.$$.o
+rm -f /tmp/strict_check.$$.o; [ -n "$ZC" ] && rm -rf "$ZC"
 grep 'warning:' "$OUT" | grep -v '^[^:]*thirdparty/' > "$OUT.ours"
 tot=$(wc -l < "$OUT.ours"); errs=$(grep -c 'error:' "$OUT")
 echo "total warnings: $tot, errors: $errs ($STD)"
