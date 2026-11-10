@@ -18,6 +18,7 @@ run nip13 env RELAY_BIN=$B $PY test_nip13.py
 run listen_backlog env RELAY_BIN=$B $PY tests/test_listen_backlog.py
 [ -f tests/test_overload.py ] && run overload env RELAY_BIN=$B $PY tests/test_overload.py
 run nips env RELAY_BIN=$B $PY tests/test_nips.py
+run durability env RELAY_BIN=$B $PY tests/test_durability.py
 SB=build/ngws_bench_server${2:-}; pkill -f "$SB 9001" 2>/dev/null
 $SB 9001 2 echo >/tmp/echo.log 2>&1 & E=$!; sleep 0.5
 run rfc6455 env STRICT=1 $PY tests/rfc6455_conformance.py 127.0.0.1 9001

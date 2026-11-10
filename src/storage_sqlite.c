@@ -1,5 +1,6 @@
 /* storage_sqlite - SQLite backend lifecycle (see storage_internal.h). */
 #include "storage_internal.h"
+#include "storage_vfs.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +107,7 @@ void storage_set_sync_full(bool full) { db_sync = full ? "FULL" : "NORMAL"; }
  */
 static bool storage_init_sqlite3(const char *dsn) {
     snprintf(db_dsn, sizeof(db_dsn), "%s", dsn ? dsn : "");
+    if (!ngdb_vfs_register()) fprintf(stderr, "warning: WAL write coalescing unavailable\n");
     if (ngdb_conn) {
         sqlite3_close_v2(ngdb_conn);
     }
