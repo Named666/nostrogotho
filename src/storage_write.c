@@ -484,6 +484,83 @@ bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *he
     return true;
 }
 
+bool ngdb_delete_by_id(const char *id, size_t *deleted) {
+    sqlite3_stmt *stmt = ngdb_ps(PS_DEL_ID);
+    if (!stmt || !id) return false;
+    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    if (deleted) *deleted = rc == SQLITE_DONE ? (size_t) sqlite3_changes(ngdb_conn) : 0;
+    sqlite3_reset(stmt);
+    return rc == SQLITE_DONE;
+}
+
+/* The tag table stores 64-char lowercase hex values as 32-byte blobs. */
+static void bind_tag_value_text(sqlite3_stmt *st, int i, const char *v) {
+    size_t n = strlen(v);
+    bool hex = n == 64;
+    for (size_t k = 0; hex && k < n; k++) hex = (v[k] >= '0' && v[k] <= '9') || (v[k] >= 'a' && v[k] <= 'f');
+    if (!hex) { sqlite3_bind_text(st, i, v, (int) n, SQLITE_TRANSIENT); return; }
+    unsigned char b[32];
+    for (size_t k = 0; k < 32; k++) {
+        int hi = v[2 * k] <= '9' ? v[2 * k] - '0' : v[2 * k] - 'a' + 10;
+        int lo = v[2 * k + 1] <= '9' ? v[2 * k + 1] - '0' : v[2 * k + 1] - 'a' + 10;
+        b[k] = (unsigned char) (hi * 16 + lo);
+    }
+    sqlite3_bind_blob(st, i, b, 32, SQLITE_TRANSIENT);
+}
+
+bool ngdb_delete_by_tag(char name, const char *value, void (*forget)(const char *hex_id), size_t *deleted) {
+    sqlite3_stmt *stmt;
+    char n[2] = { name, '\0' };
+    if (!ngdb_conn || !value) return false;
+    if (forget) {
+        if (!prepare("SELECT lower(hex(e.id)) FROM tag t JOIN event e ON e.seq = t.ev WHERE t.name = ? AND t.value = ?", &stmt))
+            return false;
+        sqlite3_bind_text(stmt, 1, n, 1, SQLITE_TRANSIENT);
+        bind_tag_value_text(stmt, 2, value);
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *id = (const char *) sqlite3_column_text(stmt, 0);
+            if (id) forget(id);
+        }
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) return false;
+    }
+    if (!prepare("DELETE FROM event WHERE seq IN (SELECT ev FROM tag WHERE name = ? AND value = ?)", &stmt))
+        return false;
+    sqlite3_bind_text(stmt, 1, n, 1, SQLITE_TRANSIENT);
+    bind_tag_value_text(stmt, 2, value);
+    return run_delete(stmt, deleted);
+}
+
+bool ngdb_scan_kinds(const int *kinds, size_t n, void (*cb)(const event_t *ev, void *arg), void *arg) {
+    if (!ngdb_conn || !kinds || !n || n > 64 || !cb) return false;
+    char sql[1024];
+    size_t len = (size_t) snprintf(sql, sizeof sql, "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, "
+                                   "content, lower(hex(sig)) FROM event WHERE kind IN (");
+    for (size_t i = 0; i < n && len < sizeof sql - 32; i++)
+        len += (size_t) snprintf(sql + len, sizeof sql - len, i ? ",%d" : "%d", kinds[i]);
+    snprintf(sql + len, sizeof sql - len, ") ORDER BY seq");
+    sqlite3_stmt *stmt;
+    if (!prepare(sql, &stmt)) return false;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        event_t ev; memset(&ev, 0, sizeof ev);
+        snprintf(ev.id, sizeof ev.id, "%s", (const char *) sqlite3_column_text(stmt, 0));
+        snprintf(ev.pubkey, sizeof ev.pubkey, "%s", (const char *) sqlite3_column_text(stmt, 1));
+        ev.created_at = (time_t) sqlite3_column_int64(stmt, 2);
+        ev.kind = sqlite3_column_int(stmt, 3);
+        ev.tags_json = (char *) sqlite3_column_text(stmt, 4);
+        ev.tags_json_len = ev.tags_json ? (size_t) sqlite3_column_bytes(stmt, 4) : 0;
+        ev.content = (char *) sqlite3_column_text(stmt, 5);
+        ev.content_len = ev.content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
+        snprintf(ev.sig, sizeof ev.sig, "%s", (const char *) sqlite3_column_text(stmt, 6));
+        cb(&ev, arg);
+    }
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE;
+}
+
 /* ngdb_purge_expired - Garbage-collect NIP-40 expired events (background)
  *
  * Deletes every stored row whose `tags` column carries an

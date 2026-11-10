@@ -469,6 +469,107 @@ def nip70():
     r.stop()
 
 
+RELAY_SK = "0000000000000000000000000000000000000000000000000000000000000003"
+RELAY_PK = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+
+
+def keyed_relay(extra=""):
+    import os, tempfile
+    d = tempfile.mkdtemp(); kf = os.path.join(d, "relay.key")
+    open(kf, "w").write(RELAY_SK + "\n"); os.chmod(kf, 0o600)
+    return Relay("relay_secret_key_file = %s\n%s" % (kf, extra))
+
+
+@section
+def nip29():
+    """NIP-29 relay-based groups (step 11, slice B)."""
+    import signal
+    r = keyed_relay(); w = WS(r.port)
+    alice, bob, carol = Key(), Key(), Key()
+    _, d = nip11_doc(r)
+    check("NIP-11: self is the relay key, 29 declared", d.get("self") == RELAY_PK and 29 in d.get("supported_nips", []), d)
+    m = w.publish(alice.ev("", 9007, [["h", "pizza"]]))
+    check("create-group (9007)", m[2] is True, m)
+    evs, _ = w.req("st", {"kinds": [39000, 39001, 39002, 39003], "#d": ["pizza"]})
+    by = {e["kind"]: e for e in evs}
+    check("relay publishes 39000-39003 signed by its own key", sorted(by) == [39000, 39001, 39002, 39003] and
+          all(e["pubkey"] == RELAY_PK for e in evs), [(e["kind"], e["pubkey"][:8]) for e in evs])
+    check("creator is admin (39001)", ["p", alice.pk, "admin"] in by[39001]["tags"], by[39001]["tags"])
+    m = w.publish(bob.ev("", 9007, [["h", "pizza"]]))
+    check("create of an existing id -> duplicate:", m[2] is False and m[3].startswith("duplicate:"), m)
+    m = w.publish(bob.ev("", 39000, [["d", "pizza"], ["name", "pwned"]]))
+    check("39000 from anyone but the relay -> blocked:", m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(bob.ev("hi", 9, [["h", "nogroup"]]))
+    check("h tag of an unknown group -> invalid:", m[2] is False and m[3].startswith("invalid:"), m)
+    m = w.publish(bob.ev("open hello", 9, [["h", "pizza"]]))
+    check("open group: anyone may write", m[2] is True, m)
+    m = w.publish(bob.ev("", 9002, [["h", "pizza"], ["name", "Hacked"]]))
+    check("edit-metadata by a non-admin -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(alice.ev("", 9002, [["h", "pizza"], ["name", "Pizza Lovers"], ["private"], ["restricted"], ["closed"]]))
+    check("edit-metadata by the admin", m[2] is True, m)
+    evs, _ = w.req("m", {"kinds": [39000], "#d": ["pizza"]})
+    check("39000 updated", evs and ["name", "Pizza Lovers"] in evs[0]["tags"] and ["private"] in evs[0]["tags"], evs)
+    m = w.publish(bob.ev("again", 9, [["h", "pizza"]]))
+    check("restricted group: non-member write -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(bob.ev("", 9021, [["h", "pizza"]]))
+    check("closed group: join without code -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(alice.ev("", 9009, [["h", "pizza"], ["code", "abc123"]]))
+    check("create-invite by the admin", m[2] is True, m)
+    m = w.publish(bob.ev("", 9021, [["h", "pizza"], ["code", "abc123"]]))
+    check("join with the invite code", m[2] is True, m)
+    a0 = WS(r.port); a0.auth(alice, "ws://127.0.0.1")
+    evs, _ = a0.req("pu", {"kinds": [9000], "#h": ["pizza"], "#p": [bob.pk]})
+    check("relay answers the join with a signed put-user (9000)", len(evs) == 1 and evs[0]["pubkey"] == RELAY_PK, evs)
+    m = w.publish(bob.ev("", 9021, [["h", "pizza"], ["code", "abc123"]]))
+    check("join as a member -> duplicate:", m[3].startswith("duplicate:"), m)
+    msg = bob.ev("member hello", 9, [["h", "pizza"]])
+    m = w.publish(msg)
+    check("member writes", m[2] is True, m)
+    c = WS(r.port)
+    _, end = c.req("p1", {"#h": ["pizza"]})
+    check("private group, unauthenticated REQ -> CLOSED auth-required:", end[0] == "CLOSED" and end[2].startswith("auth-required:"), end)
+    c.auth(carol, "ws://127.0.0.1")
+    evs, _ = c.req("p2", {"#h": ["pizza"]})
+    check("private group, authenticated non-member reads nothing", evs == [], len(evs))
+    b = WS(r.port); b.auth(bob, "ws://127.0.0.1")
+    evs, _ = b.req("p3", {"#h": ["pizza"], "kinds": [9]})
+    check("member reads the group", msg["id"] in [e["id"] for e in evs], len(evs))
+    m = w.publish(bob.ev("", 9000, [["h", "pizza"], ["p", carol.pk]]))
+    check("put-user by a plain member -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(alice.ev("", 9000, [["h", "pizza"], ["p", carol.pk, "moderator"]]))
+    check("admin adds a moderator", m[2] is True, m)
+    m = w.publish(carol.ev("", 9005, [["h", "pizza"], ["e", msg["id"]]]))
+    check("moderator deletes a message (9005)", m[2] is True, m)
+    evs, _ = b.req("p4", {"ids": [msg["id"]]})
+    check("... it is gone", evs == [], evs)
+    m = w.publish(bob.ev("", 9022, [["h", "pizza"]]))
+    check("leave (9022)", m[2] is True, m)
+    m = w.publish(bob.ev("after leaving", 9, [["h", "pizza"]]))
+    check("after leaving: write -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    r.stop(signal.SIGKILL); r.start(); w = WS(r.port)
+    m = w.publish(bob.ev("after restart", 9, [["h", "pizza"]]))
+    check("restart: state replayed (left member still out)", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(carol.ev("mod still here", 9, [["h", "pizza"]]))
+    check("restart: moderator still a member", m[2] is True, m)
+    _, end = WS(r.port).req("p5", {"#h": ["pizza"]})
+    check("restart: still private", end[0] == "CLOSED", end)
+    m = w.publish(alice.ev("", 9008, [["h", "pizza"]]))
+    check("delete-group (9008) by the admin", m[2] is True, m)
+    a = WS(r.port); a.auth(alice, "ws://127.0.0.1")
+    evs, _ = a.req("p6", {"#h": ["pizza"], "kinds": [9]})
+    evs2, _ = a.req("p7", {"#d": ["pizza"], "kinds": [39000]})
+    check("its events and state are gone", evs == [] and evs2 == [], (len(evs), len(evs2)))
+    m = w.publish(alice.ev("x", 9, [["h", "pizza"]]))
+    check("writing to the deleted group -> invalid:", m[2] is False and m[3].startswith("invalid:"), m)
+    r.stop()
+    r = Relay(); w = WS(r.port)
+    m = w.publish(alice.ev("", 9007, [["h", "g"]]))
+    _, d = nip11_doc(r)
+    check("without a relay key: unsupported:, 29 not declared", m[2] is False and m[3].startswith("unsupported:") and
+          29 not in d.get("supported_nips", []), m)
+    r.stop()
+
+
 @section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""

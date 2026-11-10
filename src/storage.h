@@ -207,6 +207,18 @@ typedef struct {
     bool (*vanish)(const char *pubkey, time_t until, void (*forget)(const char *hex_id),
                    size_t *deleted);
     
+    /* Group primitives (NIP-29; writer thread only):
+     * delete_by_id: delete one event whatever its author (moderation);
+     * delete_by_tag: delete every event carrying the single-letter tag
+     *   [name, value] (tag index), calling forget(id) for each first;
+     * scan_kinds: call cb for every stored event of the given kinds in
+     *   insertion order (state replay at startup). */
+    bool (*delete_by_id)(const char *id, size_t *deleted);
+    bool (*delete_by_tag)(char name, const char *value, void (*forget)(const char *hex_id),
+                          size_t *deleted);
+    bool (*scan_kinds)(const int *kinds, size_t n, void (*cb)(const event_t *ev, void *arg),
+                       void *arg);
+
     /* purge_expired - Delete NIP-40 expired events (background GC)
      * 
      * Deletes every stored event whose ["expiration", "<timestamp>"] tag has

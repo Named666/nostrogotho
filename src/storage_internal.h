@@ -49,6 +49,9 @@ bool ngdb_delete_all_events_by_pubkey(const char *pubkey, time_t created_at, int
                                       size_t *deleted);
 bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *hex_id),
                  size_t *deleted);
+bool ngdb_delete_by_id(const char *id, size_t *deleted);
+bool ngdb_delete_by_tag(char name, const char *value, void (*forget)(const char *hex_id), size_t *deleted);
+bool ngdb_scan_kinds(const int *kinds, size_t n, void (*cb)(const event_t *ev, void *arg), void *arg);
 bool ngdb_purge_expired(time_t now, size_t *deleted);
 /* Free the writer thread's tag-index scratch (thread close). */
 void ngdb_write_scratch_free(void);

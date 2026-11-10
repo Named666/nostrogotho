@@ -6,6 +6,7 @@
 #include <string.h>
 #include "../json_util.h"
 #include "../ng_config.h"
+#include "../crypto.h"
 
 /* ============================================================================
  * NIP-11: Relay Information Document
@@ -23,9 +24,9 @@ static char *information_document;
  *   01 basic protocol, 09 deletion, 11 this document, 13 PoW,
  *   16 replaceable (via NIP-01), 17 gift-wrap gating,
  *   33 addressable (via NIP-01), 40 expiration, 42 auth, 45 COUNT,
- *   50 search (unless search = 0), 62 vanish, 70 protected events
+ *   29 groups (only with relay_secret_key_file), 50 search (unless search = 0), 62 vanish, 70 protected events
  *   (via 42). */
-static const int supported_nips[] = {1, 9, 11, 13, 16, 17, 33, 40, 42, 45, 50, 62, 70};
+static const int supported_nips[] = {1, 9, 11, 13, 16, 17, 29, 33, 40, 42, 45, 50, 62, 70};
 #define SUPPORTED_NIPS_COUNT (sizeof(supported_nips) / sizeof(supported_nips[0]))
 
 static void key_str(json_builder_t *b, const char *key, const char *value) {
@@ -70,7 +71,8 @@ static char *render(const relay_config_t *c) {
     json_builder_object_key(&b, "supported_nips");
     json_builder_start_array(&b);
     for (size_t i = 0; i < SUPPORTED_NIPS_COUNT; i++)
-        if (supported_nips[i] != 50 || ng_limits.search) json_builder_append_number(&b, supported_nips[i]);
+        if ((supported_nips[i] != 50 || ng_limits.search) && (supported_nips[i] != 29 || crypto_relay_pubkey()))
+            json_builder_append_number(&b, supported_nips[i]);
     json_builder_end_array(&b);
     key_str(&b, "software", info->software);
     key_str(&b, "version", info->version);

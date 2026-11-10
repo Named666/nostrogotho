@@ -44,6 +44,9 @@ static int query(storage_context_t *s, const char *filter_json, bool do_count) {
     return ok ? (do_count ? n : rows) : -1;
 }
 
+static int scanned;
+static void count_scan(const event_t *ev, void *arg) { (void) arg; if (ev && ev->kind == 9) scanned++; }
+
 static int tag_rows(void) {
     sqlite3_stmt *st; int n = -1;
     if (sqlite3_prepare_v2(ngdb_conn, "SELECT COUNT(*) FROM tag", -1, &st, NULL) != SQLITE_OK) return -1;
@@ -133,6 +136,21 @@ int main(void) {
     check("... any kind but 62", s.insert_event(&v3) == STORAGE_PUT_VANISHED, NULL);
     memset(v3.pubkey, 'c', 64);
     check("other pubkeys unaffected", s.insert_event(&v3) == STORAGE_PUT_INSERTED, NULL);
+
+    /* NIP-29 moderation ops. */
+    event_t g1 = mk(30, 9, 6000, "[[\"h\",\"pizza\"]]"), g2 = mk(31, 9, 6001, "[[\"h\",\"pizza\"]]"),
+            g3 = mk(32, 9, 6002, "[[\"h\",\"other\"]]");
+    memset(g1.pubkey, 'c', 64); memset(g2.pubkey, 'c', 64); memset(g3.pubkey, 'c', 64);
+    check("groups: setup", s.insert_event(&g1) == STORAGE_PUT_INSERTED && s.insert_event(&g2) == STORAGE_PUT_INSERTED &&
+          s.insert_event(&g3) == STORAGE_PUT_INSERTED, NULL);
+    int k9 = 9; scanned = 0;
+    check("scan_kinds", s.scan_kinds(&k9, 1, count_scan, NULL) && scanned == 3, NULL);
+    d = 0;
+    check("delete_by_id", s.delete_by_id(g1.id, &d) && d == 1, NULL);
+    d = 0;
+    check("delete_by_tag h", s.delete_by_tag('h', "pizza", NULL, &d) && d == 1, NULL);
+    check("... other groups untouched", query(&s, "{\"#h\":[\"other\"]}", false) == 1 &&
+          query(&s, "{\"#h\":[\"pizza\"]}", false) == 0, NULL);
 
     s.deinit();
     char side[96];
