@@ -63,8 +63,19 @@ static bool nip17_filter_only_p(const filter_t *filter, const char *pubkey) {
 static bool nip17_plugin_accept_query(relay_conn_t *connection, filter_t *filters, size_t count,
                                       bool is_count, char *reason, size_t reason_size, void *ctx) {
     (void) ctx;
-    if (!is_count) return true;
     const char *me = nip42_authenticated_pubkey(connection);
+    if (!is_count) {
+        /* NIP-42 flow: a subscription to gift wraps before AUTH is closed
+         * with "auth-required:" and a fresh challenge; after AUTH only the
+         * recipient's own wraps are delivered (can_deliver). */
+        for (size_t i = 0; i < count && !me; i++) {
+            if (!nip17_filter_targets_gift_wraps(&filters[i])) continue;
+            nip17_send_challenge(connection);
+            snprintf(reason, reason_size, "auth-required: we can't serve DMs to unauthenticated users");
+            return false;
+        }
+        return true;
+    }
     for (size_t i = 0; i < count; i++) {
         filter_t *f = &filters[i];
         if (!nip17_filter_targets_gift_wraps(f)) {

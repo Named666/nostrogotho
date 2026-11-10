@@ -278,6 +278,43 @@ def nip45():
 
 
 @section
+def nip17():
+    """NIP-17/59 gift wraps: auth-required CLOSED, recipient deletion (step 5)."""
+    r = Relay(); w = WS(r.port); pub = WS(r.port); me = Key(); other = Key()
+    wrapper = Key()
+    mine = [Key().ev("wrap", 1059, [["p", me.pk]]) for _ in range(2)] + [wrapper.ev("wrap3", 1059, [["p", me.pk]])]
+    theirs = Key().ev("wrap", 1059, [["p", other.pk]])
+    for e in mine + [theirs]: pub.publish(e)
+    w.challenge = None
+    _, end = w.req("dm", {"kinds": [1059], "#p": [me.pk]})
+    check("REQ kind 1059 before AUTH -> CLOSED auth-required:", end and end[0] == "CLOSED" and end[2].startswith("auth-required:"), end)
+    check("... with an AUTH challenge to answer", w.challenge is not None)
+    evs, end = w.req("any", {"limit": 50})
+    check("kind-less REQ before AUTH never returns gift wraps", end and end[0] == "EOSE" and all(e["kind"] != 1059 for e in evs), end)
+    m = w.auth(me, "ws://127.0.0.1")
+    check("AUTH ok", m and m[2] is True, m)
+    evs, end = w.req("dm2", {"kinds": [1059]})
+    check("after AUTH only the recipient's own wraps are delivered", sorted(e["id"] for e in evs) == sorted(e["id"] for e in mine), len(evs))
+    live_mine = Key().ev("live", 1059, [["p", me.pk]]); live_other = Key().ev("live", 1059, [["p", other.pk]])
+    pub.publish(live_other); pub.publish(live_mine)
+    m = w.recv()
+    check("live: only the wrap addressed to me", m and m[0] == "EVENT" and m[2]["id"] == live_mine["id"], m)
+    w.send(["CLOSE", "dm2"])
+    m = pub.publish(other.ev("", 5, [["e", mine[0]["id"]]]))
+    evs, _ = w.req("chk", {"ids": [mine[0]["id"]]})
+    check("non-recipient cannot delete my gift wrap", len(evs) == 1)
+    m = pub.publish(me.ev("", 5, [["e", mine[0]["id"]], ["k", "1059"]]))
+    evs, _ = w.req("chk2", {"ids": [mine[0]["id"]]})
+    check("recipient deletes a gift wrap (NIP-59)", m and m[2] is True and evs == [], (m, evs))
+    m = pub.publish(mine[0])
+    check("re-publishing the deleted wrap -> OK false blocked:", m and m[2] is False and m[3].startswith("blocked:"), m)
+    pub.publish(wrapper.ev("", 5, [["e", mine[2]["id"]]]))
+    evs, _ = w.req("chk3", {"ids": [mine[2]["id"]]})
+    check("the wrap's own author can still delete it", evs == [], evs)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

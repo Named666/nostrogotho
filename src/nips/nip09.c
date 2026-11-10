@@ -119,10 +119,17 @@ static bool delete_a_target(const event_t *event, storage_context_t *storage,
     return ok;
 }
 
+/* The deletion's author is the "p"-tagged recipient of a gift wrap
+ * (NIP-59: wraps are signed by a throwaway key, so only the recipient can
+ * ask for their removal). */
+static bool deletion_by_recipient(const event_t *event, const event_t *target) {
+    return target->kind == 1059 && nip_event_has_tag(target, "p", event->pubkey);
+}
+
 /* Return true when `event` (the deletion author) is authorized to delete
- * `target`: only the target's author may delete it. */
+ * `target`: its author, or the recipient of a gift wrap. */
 static bool deletion_authorized(const event_t *event, const event_t *target) {
-    return strcmp(target->pubkey, event->pubkey) == 0;
+    return strcmp(target->pubkey, event->pubkey) == 0 || deletion_by_recipient(event, target);
 }
 
 /* Delete a specific event referenced by an "e" tag.
@@ -147,10 +154,13 @@ static bool delete_e_target(const event_t *event, storage_context_t *storage,
      * pubkey, and (when "k" tags are present) the target's kind is requested. */
     if (deletion_authorized(event, target) &&
         kind_is_requested(event, target->kind)) {
-        if (target->kind == 1059) {
+        if (strcmp(target->pubkey, event->pubkey) != 0) {   /* gift wrap recipient */
             tag_t recipient = {(char *[]) {"p", (char *) event->pubkey}, 2, 2};
             done = storage->delete_record_by_id_and_kind_and_ptag(
                 id, 1059, &recipient, &n);
+            /* Block re-publication of the same wrap (tombstones are keyed
+             * by the event author). */
+            if (done && storage->add_tombstone && !storage->add_tombstone(id, target->pubkey)) ok = false;
         } else {
             done = storage->delete_record_by_id_and_pubkey(id, event->pubkey, &n);
         }
