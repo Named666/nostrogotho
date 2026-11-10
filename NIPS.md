@@ -7,6 +7,52 @@ below point to `https://github.com/nostr-protocol/nips/blob/master/NN.md`.
 
 Scope decision (owner, 2026-11-10 13:08 CST): implement everything below **except NIP-86 (management API) and NIP-77 (negentropy)**, which are intentionally out of scope.
 
+## Final status (2026-11-10, branch `usockets`, local only, not pushed)
+
+Everything in this audit is done except NIP-86 and NIP-77, which the owner put out of scope. The tables further down are the **baseline audit at `d2f276e`**. They are kept for reference and no longer describe the code.
+
+| Item | Status | Commit(s) | Notes / remaining |
+|---|---|---|---|
+| A1 NIP-01 `#tag` filters | **done** | 182fe68, 755e00d | `tag` table + delete trigger; WAL write-coalescing VFS (`ngwal`) recovers most of the write cost |
+| A2 `limit:0` | **done** | 94aeaf6 | |
+| A3/B7 tag count, sizes | **done** | 2d5e673 | configurable (`max_event_tags`, `max_content_length`, ...) |
+| A4 OK for invalid events | **done** | 9257dad | NIP-01 prefixes |
+| A5/A6 CLOSED, home-feed REQs | **done** | 734b4c4 | |
+| A7 NIP-11 | **done** | d340020, a682d05 | supported_nips = 1, 9, 11, 13, 16, 17, 29\*, 33, 40, 42, 43\*, 45, 50\*, 62, 67, 70 (\* when enabled) |
+| A8 NIP-09 | **done** | 76c3042 | recipient deletes gift wraps |
+| A9 NIP-42 | **done** | d340020 | works without SERVICE_URL |
+| A10-A12 | **done** | (baseline) | id tie-break covered in A1 ordering |
+| B1 NIP-50 | **done** | 2f1138c | FTS5 external content; `search = 0` turns it off (publish cost, see perf) |
+| B2 NIP-45 | **done** | c2cd747 | gift-wrap gating, HyperLogLog |
+| B3 NIP-17/59 | **done** | 76c3042, fe947c5 | `auth-required:` CLOSED; NIP-67 `auth` hint |
+| B4 NIP-70 | **done** | a682d05 | declared; reposts embedding protected events blocked |
+| B5 NIP-62 | **done** | c046669 | durable `vanished` table |
+| B6 NIP-40, B9 NIP-13 | **done**, declared | a682d05 | |
+| B10 rate limits / bans | **done** | f7846d6 | GCRA lock-free per IP (/64 for v6) and pubkey; `rate-limited:` / `blocked:`; ban lists load at startup only |
+| B11 NIP-86 | **out of scope** | – | owner decision |
+| NIP-77 | **out of scope** | – | owner decision |
+| NIP-26 | **removed** | e822225 | unrecommended |
+| NIP-29 groups | **done (core spec)** | 6ec0dbe, cd73744, 0dc4ea3, 63bf842 | needs `relay_secret_key_file`. Moderation kinds 9000-9002, 9005, 9007-9010 (others in 9000-9020 refused `invalid:`), join/leave 9021/9022, relay-signed 39000-39003 and 39005, private/restricted/hidden/closed, `previous` references checked, late publication (`group_max_age`, default 3600 s). **Not done (optional parts of the spec):** subgroups (`parent`/`child`), LiveKit (39004 and `/.well-known/nip29/livekit`), join requests held for admin review |
+| NIP-43 | **done** | 6b8f91d | `nip43 = 1`; 28934/28936, relay-signed 13534/8000/8001, `members_only`. **Not done:** 33534 roles, 28935 claims (these need NIP-86 `createclaim`) |
+| NIP-67 | **done** | fe947c5 | `finish` / `more` (LIMIT n+1 probe, byte budget) / `auth`. **Not done:** moving the cursor past created_at ties (a SHOULD) |
+
+Known limitations:
+- NIP-29/43 in-memory state is updated before COMMIT. If a writer COMMIT fails, the relay-generated events roll back, but the in-memory state does not until restart, when the state is replayed from the DB.
+- IP limits use the socket peer address. There is no X-Forwarded-For / proxy support.
+- Ban lists are read at startup only, because changing them at runtime would need NIP-86.
+
+Durability: `tools/fsync_check/` (LD_PRELOAD tracer) shows that every `OK true` is sent only after an fdatasync of the WAL that started after the event's frames were written. This holds with coalescing on and off. The `db_sync = normal` negative control is caught. Results are in `tools/fsync_check` output at 1f961ac: 2400/2400 OKs covered, 0 violations; 704 WAL pwrites / 668 syncs with coalescing, 19211 pwrites without; the NORMAL control flags all 2400.
+
+Publish events/s, FULL sync, 64 conns × pipeline 16, relay on CPUs 0-3. Median of 3 interleaved runs (individual runs in `/workspace/bench/gate-results/nips-final-pub-*.txt`, 2026-11-10 17:16 CST):
+
+| dataset | d2f276e (base) | 182fe68 (tag index) | 755e00d (+ WAL shim) | HEAD | HEAD `search = 0` |
+|---|---|---|---|---|---|
+| ev1500k (1 tag, content "0") | 42,977 | 39,754 | 53,618 | 29,847 | 52,211 |
+| ev400k_tags (4 tags with hints) | 36,550 | 19,270 | 24,346 | 17,328 | 25,044 |
+| ev400k_text (25-word content) | 32,094 | 17,397 | 23,332 | 15,411 | 23,631 |
+
+Reading: the tag index costs about 45% on tagged/text events, and the WAL shim recovers about a quarter of that. Comparing HEAD with `search = 0` against 755e00d shows the NIP-50 FTS5 index accounts for almost all of the further drop (−34 to −45%). Everything else added since 755e00d is within noise. Gate at 3f18090: gcc/clang strict 0 warnings, cppcheck 0, full suite + 11 C tests pass, ASan+UBSan and TSan suites pass with 0 reports.
+
 Method:
 1. Read the code (file:function references below).
 2. Run live probes against a throwaway relay (`SERVICE_URL=ws://127.0.0.1:7460 build/main --port 7460 --db /tmp/nipchk.sqlite`), using the probe scripts in `/tmp/nipchk/chk*.py`, which are not in the repo.
@@ -83,9 +129,9 @@ These items break mainstream clients today. Most are NIP-01 core bugs, not new N
 | NIP | Status | Notes / effort / perf |
 |---|---|---|
 | ~~[NIP-77](https://github.com/nostr-protocol/nips/blob/master/77.md) Negentropy~~ | **intentionally out of scope** (owner decision, 2026-11-10) | Not implemented by design. Original notes: Used by strfry-to-strfry sync and some clients (Amethyst and nostrudel have experimented) **(?) adoption**. Effort M–L (3–5 d; vendor a C negentropy implementation or port the reference, plus an id+created_at range scan). Perf: per-session memory for the sorted (created_at, id) set, capped by a max-records limit. Read-only, so the writer is unaffected. |
-| [NIP-29](https://github.com/nostr-protocol/nips/blob/master/29.md) relay-based groups | missing | A large feature: `h`-tag enforcement, membership/roles state, moderation kinds 9000–9020, join/leave 9021/9022, relay-signed 39000–39003 metadata (needs a relay keypair and NIP-11 `self`), late-publication/timeline-ref checks, read gating. Effort L (1–2 wk). Only needed if you target Flotilla/Chachi/0xchat groups. Perf: group state checks on every write in a group (in-memory cache; the writer signs metadata events). |
-| [NIP-43](https://github.com/nostr-protocol/nips/blob/master/43.md) relay access metadata/requests | missing | Only for membership/paid relays. S–M. |
-| [NIP-67](https://github.com/nostr-protocol/nips/blob/master/67.md) EOSE completeness hint (draft) | not emitted | `finish`/`auth` hints are cheap (S). `more` needs an extra-row probe (`LIMIT n+1`). |
+| [NIP-29](https://github.com/nostr-protocol/nips/blob/master/29.md) relay-based groups | missing at baseline, **done** (see Final status) | A large feature: `h`-tag enforcement, membership/roles state, moderation kinds 9000–9020, join/leave 9021/9022, relay-signed 39000–39003 metadata (needs a relay keypair and NIP-11 `self`), late-publication/timeline-ref checks, read gating. Effort L (1–2 wk). Only needed if you target Flotilla/Chachi/0xchat groups. Perf: group state checks on every write in a group (in-memory cache; the writer signs metadata events). |
+| [NIP-43](https://github.com/nostr-protocol/nips/blob/master/43.md) relay access metadata/requests | missing at baseline, **done** (see Final status) | Only for membership/paid relays. S–M. |
+| [NIP-67](https://github.com/nostr-protocol/nips/blob/master/67.md) EOSE completeness hint (draft) | not emitted at baseline, **done** (see Final status) | `finish`/`auth` hints are cheap (S). `more` needs an extra-row probe (`LIMIT n+1`). |
 | [NIP-66](https://github.com/nostr-protocol/nips/blob/master/66.md) relay discovery | n/a (relay-side nothing required) | Monitors read NIP-11; A7 helps. |
 | [NIP-26](https://github.com/nostr-protocol/nips/blob/master/26.md) delegation | implemented (`src/nips/nip26.c`, delegation table, `authors` OR-join) | **Unrecommended** in the official index. Consider dropping it from `supported_nips` and the authors query path: every `authors` filter pays an extra `OR pubkey IN (SELECT … FROM delegation)` subquery. |
 | NIP-11 pay-to-relay fields (`fees`, `payments_url`) | missing | Only for paid relays. |
