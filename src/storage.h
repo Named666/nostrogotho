@@ -38,6 +38,7 @@ typedef enum {
     STORAGE_PUT_INSERTED,    /* stored */
     STORAGE_PUT_DUPLICATE,   /* id already stored (UNIQUE index is authoritative) */
     STORAGE_PUT_TOMBSTONED,  /* a NIP-09 tombstone from the same author blocks it */
+    STORAGE_PUT_VANISHED,    /* NIP-62: the author vanished at or after created_at */
     STORAGE_PUT_FAILED       /* database error (details on stderr) */
 } storage_put_t;
 
@@ -193,6 +194,18 @@ typedef struct {
      */
     bool (*delete_all_events_by_pubkey)(const char *pubkey, time_t created_at,
                                         int exclude_kind, size_t *deleted);
+
+    /* vanish - NIP-62 Request to Vanish (writer thread only, inside the
+     * batch transaction so it commits atomically with the request).
+     * Records (pubkey, until) durably in the `vanished` table (until only
+     * ever grows), deletes the author's events with created_at <= until
+     * except kind 62 requests, and every kind 1059 gift wrap p-tagging the
+     * pubkey. From then on insert_event answers STORAGE_PUT_VANISHED for
+     * any non-62 event by that author with created_at <= until, across
+     * restarts. forget (may be NULL) is called with each deleted id before
+     * the delete, so the caller can drop it from its dedupe set. */
+    bool (*vanish)(const char *pubkey, time_t until, void (*forget)(const char *hex_id),
+                   size_t *deleted);
     
     /* purge_expired - Delete NIP-40 expired events (background GC)
      * 

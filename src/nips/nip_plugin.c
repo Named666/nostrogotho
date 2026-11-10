@@ -96,6 +96,7 @@ nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage
     case STORAGE_PUT_INSERTED:   return nip_plugin_accept();
     case STORAGE_PUT_DUPLICATE:  return nip_plugin_duplicate("duplicate: already have this event");
     case STORAGE_PUT_TOMBSTONED: return nip_plugin_reject("blocked: this event was deleted by its author");
+    case STORAGE_PUT_VANISHED: return nip_plugin_reject("blocked: this pubkey requested to vanish from this relay");
     case STORAGE_PUT_FAILED:     break;
     }
     return nip_plugin_reject("error: failed to store event");

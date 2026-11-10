@@ -59,7 +59,13 @@ static bool tag_rows_reserve(size_t rows, size_t bytes) {
     return true;
 }
 
+/* Writer-thread cache: -1 unknown, 0 the vanished table is empty, 1 not.
+ * Only the writer inserts into `vanished`, so once 1 it stays 1. A rolled
+ * back vanish leaves it 1, which only costs an extra point lookup. */
+static NG_THREAD_LOCAL int vanished_state = -1;
+
 void ngdb_write_scratch_free(void) {
+    vanished_state = -1;
     free(tr_rows); free(tr_buf);
     tr_rows = NULL; tr_buf = NULL; tr_cap = tr_buf_cap = 0;
 }
@@ -130,6 +136,17 @@ static bool store_tags(const event_t *ev, sqlite3_int64 seq) {
  * 
  * Note: Does NOT duplicate-check before insert (relies on DB unique constraint)
  */
+static int vanished_any(void) {
+    if (vanished_state >= 0) return vanished_state;
+    sqlite3_stmt *s;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT EXISTS(SELECT 1 FROM vanished)", -1, &s, NULL) != SQLITE_OK)
+        return -1;
+    int rc = sqlite3_step(s);
+    if (rc == SQLITE_ROW) vanished_state = sqlite3_column_int(s, 0) ? 1 : 0;
+    sqlite3_finalize(s);
+    return vanished_state;
+}
+
 storage_put_t ngdb_insert_event(const event_t *ev) {
     if (!ngdb_conn || !ev) return STORAGE_PUT_FAILED;
 
@@ -142,6 +159,23 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
     sqlite3_reset(t);
     if (rc == SQLITE_ROW) return STORAGE_PUT_TOMBSTONED;
     if (rc != SQLITE_DONE) return STORAGE_PUT_FAILED;
+
+    /* NIP-62: a vanished author cannot re-publish what it asked to erase.
+     * Skipped (one cached flag) while the table is empty. */
+    if (ev->kind != 62) {
+        int v = vanished_any();
+        if (v < 0) return STORAGE_PUT_FAILED;
+        if (v) {
+            t = ngdb_ps(PS_VANISH_CHECK);
+            if (!t) return STORAGE_PUT_FAILED;
+            sqlite3_bind_text(t, 1, ev->pubkey, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(t, 2, (sqlite3_int64) ev->created_at);
+            rc = sqlite3_step(t);
+            sqlite3_reset(t);
+            if (rc == SQLITE_ROW) return STORAGE_PUT_VANISHED;
+            if (rc != SQLITE_DONE) return STORAGE_PUT_FAILED;
+        }
+    }
 
     sqlite3_stmt *stmt = ngdb_ps(PS_INSERT);
     if (!stmt) return STORAGE_PUT_FAILED;
@@ -400,6 +434,55 @@ bool ngdb_delete_all_events_by_pubkey(const char *pubkey, time_t created_at,
     return run_delete(stmt, deleted);
 }
 
+
+/* ngdb_vanish - NIP-62: durable vanish record plus the deletes (see
+ * storage.h). Runs inside the writer's batch transaction. */
+#define VANISH_AUTHOR "pubkey = unhex(?1) AND created_at <= ?2 AND kind != 62"
+#define VANISH_WRAPS "seq IN (SELECT ev FROM tag WHERE name = 'p' AND value = unhex(?1) AND kind = 1059)"
+
+bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *hex_id),
+                 size_t *deleted) {
+    sqlite3_stmt *stmt;
+    size_t n = 0, m = 0;
+    if (!ngdb_conn || !pubkey) return false;
+    if (forget) {
+        if (!prepare("SELECT lower(hex(id)) FROM event WHERE " VANISH_AUTHOR
+                     " UNION ALL SELECT lower(hex(id)) FROM event WHERE " VANISH_WRAPS, &stmt))
+            return false;
+        sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, (sqlite3_int64) until);
+        int rc;
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *id = (const char *) sqlite3_column_text(stmt, 0);
+            if (id) forget(id);
+        }
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) return false;
+    }
+    if (!prepare("INSERT INTO vanished (pubkey, until) VALUES (unhex(?), ?) "
+                 "ON CONFLICT(pubkey) DO UPDATE SET until = max(until, excluded.until)", &stmt))
+        return false;
+    sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64) until);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        return false;
+    }
+    vanished_state = 1;
+    if (!prepare("DELETE FROM event WHERE " VANISH_AUTHOR, &stmt)) return false;
+    sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64) until);
+    if (!run_delete(stmt, &n)) return false;
+    /* "Relays SHOULD delete all NIP-59 Gift Wraps that p-tagged the
+     * .pubkey": every one stored now, whatever its (randomised) created_at. */
+    if (!prepare("DELETE FROM event WHERE " VANISH_WRAPS, &stmt)) return false;
+    sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
+    if (!run_delete(stmt, &m)) return false;
+    if (deleted) *deleted = n + m;
+    return true;
+}
 
 /* ngdb_purge_expired - Garbage-collect NIP-40 expired events (background)
  *

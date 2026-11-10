@@ -33,6 +33,7 @@ static const char *const ps_sql[PS_COUNT] = {
     [PS_TAG_INSERT] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES (?, ?, ?, ?, ?)",
     [PS_TAG_INSERT_CHUNK] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES "
                             "(?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
+    [PS_VANISH_CHECK] = "SELECT 1 FROM vanished WHERE pubkey = unhex(?) AND until >= ?",
 };
 static NG_THREAD_LOCAL sqlite3_stmt *ps[PS_COUNT];
 
@@ -194,6 +195,11 @@ static bool storage_init_sqlite3(const char *dsn) {
         /* NIP-09 tombstones: (id, deleting author). */
         "CREATE TABLE IF NOT EXISTS deleted_event ("
         "    id BLOB NOT NULL, pubkey BLOB NOT NULL, PRIMARY KEY (id, pubkey)"
+        ") WITHOUT ROWID;"
+        /* NIP-62 vanished pubkeys: events by `pubkey` with created_at <=
+         * `until` (other than kind 62 requests) are refused on ingest. */
+        "CREATE TABLE IF NOT EXISTS vanished ("
+        "    pubkey BLOB PRIMARY KEY CHECK (length(pubkey) = 32), until INTEGER NOT NULL"
         ") WITHOUT ROWID;";
     
     errmsg = NULL;
@@ -342,6 +348,7 @@ void storage_context_init_sqlite3(storage_context_t *ctx) {
     ctx->delete_record_by_kind_and_pubkey_and_dtag = ngdb_delete_record_by_kind_and_pubkey_and_dtag;
     ctx->delete_record_by_id_and_kind_and_ptag = ngdb_delete_record_by_id_and_kind_and_ptag;
     ctx->delete_all_events_by_pubkey = ngdb_delete_all_events_by_pubkey;
+    ctx->vanish = ngdb_vanish;
     ctx->send_records = ngdb_send_records;
     ctx->count_hll = ngdb_count_hll;
     ctx->purge_expired = ngdb_purge_expired;

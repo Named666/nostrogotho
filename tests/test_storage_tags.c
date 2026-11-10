@@ -112,6 +112,28 @@ int main(void) {
     check("delete all by pubkey", s.delete_all_events_by_pubkey(PK, 999999, 0, &d), NULL);
     check("tag table empty", tag_rows() == 0, NULL);
 
+    /* NIP-62: durable vanish. */
+    event_t v1 = mk(20, 1, 3000, "[]"), v2 = mk(21, 1, 5000, "[]"), req = mk(22, 62, 4000, "[]");
+    char wt[128]; snprintf(wt, sizeof(wt), "[[\"p\",\"%s\"]]", PK);
+    event_t wrap = mk(23, 1059, 9000, wt);
+    memset(wrap.pubkey, 'c', 64);
+    check("vanish: setup", s.insert_event(&v1) == STORAGE_PUT_INSERTED &&
+          s.insert_event(&wrap) == STORAGE_PUT_INSERTED, NULL);
+    check("vanish", s.vanish(PK, 4000, NULL, &d) && d == 2, NULL);
+    check("vanish request stored", s.insert_event(&req) == STORAGE_PUT_INSERTED, NULL);
+    check("older event refused", s.insert_event(&v1) == STORAGE_PUT_VANISHED, NULL);
+    check("newer event accepted", s.insert_event(&v2) == STORAGE_PUT_INSERTED, NULL);
+    check("vanish until never shrinks", s.vanish(PK, 100, NULL, &d), NULL);
+    s.deinit();
+    memset(&s, 0, sizeof(s));
+    storage_context_init_sqlite3(&s);
+    check("reopen", s.init(dsn), NULL);
+    check("vanish survives restart", s.insert_event(&v1) == STORAGE_PUT_VANISHED, NULL);
+    event_t v3 = mk(24, 7, 3999, "[]");
+    check("... any kind but 62", s.insert_event(&v3) == STORAGE_PUT_VANISHED, NULL);
+    memset(v3.pubkey, 'c', 64);
+    check("other pubkeys unaffected", s.insert_event(&v3) == STORAGE_PUT_INSERTED, NULL);
+
     s.deinit();
     char side[96];
     unlink(path);

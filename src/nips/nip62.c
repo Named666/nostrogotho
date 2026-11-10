@@ -4,6 +4,7 @@
 #include "nip01.h"
 #include "nip_plugin.h"
 #include "../storage.h"
+#include "../dedupe.h"
 
 bool nip62_should_vanish(const event_t *event, const char *service_url) {
     return nip_event_has_tag(event, "relay", "ALL_RELAYS") ||
@@ -30,11 +31,10 @@ static nip01_process_result_t nip62_listener(
     }
 
     if (nip62_should_vanish(event, relay_url)) {
-        /* Delete all of the author's events except the vanish request itself
-         * (kind 62). The exclusion is a NIP-62 policy decision, so it lives
-         * here in the plugin — the storage layer stays generic. */
-        if (!storage->delete_all_events_by_pubkey(event->pubkey, event->created_at,
-                                                  event->kind, NULL)) {
+        /* Durable: the (pubkey, created_at) record commits in the same
+         * batch transaction as the deletes and the stored request, before
+         * OK true, and blocks re-publication across restarts. */
+        if (!storage->vanish(event->pubkey, event->created_at, dedupe_forget, NULL)) {
             return nip_plugin_reject("error: failed to vanish events");
         }
     }

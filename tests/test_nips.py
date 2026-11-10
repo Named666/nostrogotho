@@ -315,6 +315,35 @@ def nip17():
 
 
 @section
+def nip62():
+    """NIP-62 durable vanish: blocks re-publication across a SIGKILL restart (step 6)."""
+    import signal
+    r = Relay(); w = WS(r.port); k = Key(); other = Key(); now = int(time.time())
+    old = k.ev("old", 1, [], ca=now - 100)
+    wrap = Key().ev("wrap", 1059, [["p", k.pk]])
+    for e in (old, wrap): w.publish(e)
+    m = w.publish(k.ev("bye", 62, [["relay", "ALL_RELAYS"]], ca=now - 50))
+    check("vanish request accepted", m and m[2] is True, m)
+    evs, _ = w.req("a", {"ids": [old["id"], wrap["id"]]})
+    check("author's events and wraps p-tagging them are gone", evs == [], evs)
+    m = w.publish(old)
+    check("re-publishing an erased event -> blocked:", m and m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(k.ev("also old", 7, [["e", old["id"]]], ca=now - 60))
+    check("any older event by the author -> blocked:", m and m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(k.ev("new", 1, [], ca=now))
+    check("events after the request are accepted", m and m[2] is True, m)
+    m = w.publish(other.ev("x", 1, [], ca=now - 100))
+    check("other authors unaffected", m and m[2] is True, m)
+    r.stop(signal.SIGKILL); r.start(); w = WS(r.port)
+    m = w.publish(old)
+    check("vanish survives a SIGKILL restart", m and m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(k.ev("not ours", 62, [["relay", "wss://elsewhere.example"]], ca=now + 1))
+    evs, _ = w.req("b", {"authors": [k.pk], "kinds": [1]})
+    check("a vanish for another relay deletes nothing", len(evs) == 1, evs)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()
