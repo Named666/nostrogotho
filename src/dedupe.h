@@ -11,8 +11,9 @@
  * Lock-striped open addressing; ids are 64-hex strings stored as 32 bytes.
  *
  * Threading: init/free single-threaded (startup/shutdown); every other call
- * is thread-safe and never blocks beyond one stripe lock. Not-hex ids are
- * treated as absent / not claimable.
+ * is thread-safe and never blocks beyond one stripe lock. Ids that are not
+ * 64 hex chars are never stored: lookup says absent and claim succeeds
+ * (the writer batch set and the UNIQUE index still decide).
  * Errors: dedupe_init on allocation failure leaves the set disabled (every
  * lookup absent, every claim succeeds), so the remaining guards (writer
  * batch set, UNIQUE index) still hold. */

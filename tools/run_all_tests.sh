@@ -1,7 +1,8 @@
 #!/bin/bash
 # Full functional suite against build/${1:-main}:
 # test_core, test_ws, dedupe (both modes), config, nip13, overload (slow
-# reader / budgets) and RFC 6455 strict conformance (ngws echo server).
+# reader / budgets), RFC 6455 strict conformance and the randomized
+# fragmentation/split fuzz (ngws echo server).
 cd "$(dirname "$0")/.."
 B=$PWD/build/${1:-main}; PY=${PY:-/workspace/ngvenv/bin/python}; rc=0
 run() { echo "== $1"; shift; "$@" || { echo "!! FAILED"; rc=1; }; }
@@ -19,5 +20,6 @@ run listen_backlog env RELAY_BIN=$B $PY tests/test_listen_backlog.py
 SB=build/ngws_bench_server${2:-}; pkill -f "$SB 9001" 2>/dev/null
 $SB 9001 2 echo >/tmp/echo.log 2>&1 & E=$!; sleep 0.5
 run rfc6455 env STRICT=1 $PY tests/rfc6455_conformance.py 127.0.0.1 9001
+run ws_split_fuzz timeout 120 $PY tests/ws_split_fuzz.py 9001 200 1
 kill $E; wait $E 2>/dev/null
 exit $rc

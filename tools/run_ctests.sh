@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")/.."
 mkdir -p build/tests
 F="${CT_OPT:--O1} -g -std=gnu99 -D_GNU_SOURCE -DSECP256K1_STATIC -DENABLE_MODULE_EXTRAKEYS=1 -DENABLE_MODULE_SCHNORRSIG=1 -DENABLE_MODULE_ECDH=1 -DENABLE_MODULE_RECOVERY=1 -DECMULT_WINDOW_SIZE=15 -DCOMB_BLOCKS=43 -DCOMB_TEETH=6 -I. -Isrc -Ithirdparty -Ithirdparty/secp256k1/include -Ithirdparty/secp256k1 -Ithirdparty/secp256k1/src -w"
-LIB="src/ng_config.c src/relay_wire.c src/json_lite.c src/json_util.c src/nostrogotho.c src/crypto.c src/relay_conn.c src/nips/*.c src/schnorr_batch.c thirdparty/secp256k1/src/precomputed_ecmult.c thirdparty/secp256k1/src/precomputed_ecmult_gen.c"
+LIB="src/ng_config.c src/relay_wire.c src/ws_proto.c src/json_lite.c src/json_util.c src/nostrogotho.c src/crypto.c src/relay_conn.c src/nips/*.c src/schnorr_batch.c thirdparty/secp256k1/src/precomputed_ecmult.c thirdparty/secp256k1/src/precomputed_ecmult_gen.c"
 [ -f build/tests/sqlite3.o ] || cc -O2 -w -c thirdparty/sqlite3.c -o build/tests/sqlite3.o
 rc=0
 for t in tests/test_*.c; do

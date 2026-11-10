@@ -59,7 +59,15 @@ void dedupe_init(size_t cap) {
         pthread_mutex_init(&s->mu, NULL);
         s->slots = calloc(n, sizeof(slot_t)); s->mask = n - 1; s->used = 0;
         s->ring = ng_malloc_array(per, 32); s->ring_cap = per; s->ring_head = s->ring_len = 0;
-        if (!s->slots || !s->ring) { dedupe_free(); enabled = false; return; }   /* all or nothing */
+        if (!s->slots || !s->ring) {                                 /* all or nothing */
+            for (int j = 0; j <= k; j++) {                           /* only stripes initialized so far */
+                free(stripes[j].slots); free(stripes[j].ring);
+                stripes[j].slots = NULL; stripes[j].ring = NULL;
+                pthread_mutex_destroy(&stripes[j].mu);
+            }
+            enabled = false;
+            return;
+        }
     }
 }
 
