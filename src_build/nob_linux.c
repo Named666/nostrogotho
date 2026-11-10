@@ -49,24 +49,51 @@ static void opt_flags(Cmd *cmd)
     for (char *tok = strtok(dup, " "); tok; tok = strtok(NULL, " ")) nob_cmd_append(cmd, tok);
 }
 
-static void common_flags(Cmd *cmd, const char *std)
+/* Defines shared by first-party and vendored code. */
+static void defines(Cmd *cmd)
 {
-    nob_cc(cmd);
-    nob_cc_flags(cmd);
-    opt_flags(cmd);
-    nob_cmd_append(cmd, std, "-D_GNU_SOURCE", "-DSECP256K1_STATIC",
+    nob_cmd_append(cmd, "-D_GNU_SOURCE", "-DSECP256K1_STATIC",
                    "-DLIBUS_NO_SSL",
                    "-DENABLE_MODULE_ECDH=1", "-DENABLE_MODULE_EXTRAKEYS=1",
                    "-DENABLE_MODULE_SCHNORRSIG=1", "-DENABLE_MODULE_MUSIG=1",
                    "-DENABLE_MODULE_ELLSWIFT=1",
                    "-DENABLE_MODULE_SILENTPAYMENTS=1",
                    "-DENABLE_MODULE_RECOVERY=1", "-DECMULT_WINDOW_SIZE=15",
-                   "-DCOMB_BLOCKS=43", "-DCOMB_TEETH=6",
-                   "-I"BUILD_FOLDER, "-I.", "-I"SRC_FOLDER,
-                   "-I"THIRD_PARTY_FOLDER,
-                   "-I"THIRD_PARTY_FOLDER"usockets/src",
-                   "-I"THIRD_PARTY_FOLDER"secp256k1/include",
-                   "-I"THIRD_PARTY_FOLDER"secp256k1",
+                   "-DCOMB_BLOCKS=43", "-DCOMB_TEETH=6");
+}
+
+/* First-party code: the platform contract (PLATFORM.md) is C99 + POSIX +
+ * GCC/Clang builtins, built as gnu99 with the strict warning set. Vendored
+ * headers come in through -isystem so their warnings are not reported as
+ * ours. NG_WERROR=1 turns our warnings into errors. */
+static void common_flags(Cmd *cmd)
+{
+    nob_cc(cmd);
+    nob_cmd_append(cmd, "-std=gnu99", "-Wall", "-Wextra", "-Wpedantic", "-Wconversion",
+                   "-Wshadow", "-Wstrict-prototypes", "-Wmissing-prototypes");
+    const char *werror = getenv("NG_WERROR");
+    if (werror && strcmp(werror, "1") == 0) nob_cmd_append(cmd, "-Werror");
+    opt_flags(cmd);
+    defines(cmd);
+    nob_cmd_append(cmd, "-I"BUILD_FOLDER, "-I.", "-I"SRC_FOLDER,
+                   "-isystem", THIRD_PARTY_FOLDER,
+                   "-isystem", THIRD_PARTY_FOLDER"usockets/src",
+                   "-isystem", THIRD_PARTY_FOLDER"secp256k1/include",
+                   "-isystem", THIRD_PARTY_FOLDER"secp256k1",
+                   "-isystem", THIRD_PARTY_FOLDER"secp256k1/src");
+}
+
+/* Vendored code (thirdparty/, see VENDOR.md): compiled to objects with its
+ * own language level and the default warnings, never with ours. */
+static void vendor_flags(Cmd *cmd)
+{
+    nob_cc(cmd);
+    nob_cc_flags(cmd);
+    opt_flags(cmd);
+    nob_cmd_append(cmd, "-std=gnu11");
+    defines(cmd);
+    nob_cmd_append(cmd, "-I"THIRD_PARTY_FOLDER, "-I"THIRD_PARTY_FOLDER"usockets/src",
+                   "-I"THIRD_PARTY_FOLDER"secp256k1/include", "-I"THIRD_PARTY_FOLDER"secp256k1",
                    "-I"THIRD_PARTY_FOLDER"secp256k1/src");
 }
 
@@ -87,46 +114,80 @@ static void pgo_flags(Cmd *cmd)
 }
 
 #define US THIRD_PARTY_FOLDER"usockets/src/"
-#define NGWS_SOURCES \
-    SRC_FOLDER"ngws/ngws.c", SRC_FOLDER"ws_proto.c", \
-    US"bsd.c", US"context.c", US"loop.c", US"socket.c", US"udp.c", US"eventing/epoll_kqueue.c"
+#define NGWS_SOURCES SRC_FOLDER"ngws/ngws.c", SRC_FOLDER"ws_proto.c"
 
 #define CORE_SOURCES \
     SRC_FOLDER"main.c", SRC_FOLDER"relay_core.c", SRC_FOLDER"relay_conn.c", \
     SRC_FOLDER"backend_ngws.c", SRC_FOLDER"dedupe.c", \
     SRC_FOLDER"json_lite.c", SRC_FOLDER"crypto.c", SRC_FOLDER"storage.c", \
-    SRC_FOLDER"nostrogotho.c", SRC_FOLDER"json_util.c", THIRD_PARTY_FOLDER"sqlite3.c", \
-    SRC_FOLDER"schnorr_batch.c", /* includes the vendored secp256k1.c TU */ \
-    THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult.c", \
-    THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult_gen.c"
+    SRC_FOLDER"nostrogotho.c", SRC_FOLDER"json_util.c", \
+    SRC_FOLDER"schnorr_batch.c" /* includes the vendored secp256k1.c TU (as a system header) */
+
+/* Vendored translation units, built once per variant into BUILD_FOLDER"obj<suffix>/". */
+static const char *const US_VENDOR[] = {
+    US"bsd.c", US"context.c", US"loop.c", US"socket.c", US"udp.c", US"eventing/epoll_kqueue.c",
+};
+static const char *const CORE_VENDOR[] = {
+    THIRD_PARTY_FOLDER"sqlite3.c",
+    THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult.c",
+    THIRD_PARTY_FOLDER"secp256k1/src/precomputed_ecmult_gen.c",
+};
+
+/* Compile n vendored sources to objects under dir and append the objects
+ * to out. pgo: also apply the NG_PGO flags (bench server variant). */
+static bool vendor_objects(const char *dir, const char *const *srcs, size_t n, bool pgo, Cmd *out)
+{
+    if (!nob_mkdir_if_not_exists(dir)) return false;
+    Cmd cmd = {0};
+    for (size_t i = 0; i < n; i++) {
+        const char *base = path_name(srcs[i]);
+        const char *obj = nob_temp_sprintf("%s/%.*s.o", dir, (int) (strlen(base) - 2), base);
+        cmd.count = 0;
+        vendor_flags(&cmd);
+        if (pgo) pgo_flags(&cmd);
+        nob_cmd_append(&cmd, "-c", srcs[i], "-o", obj);
+        if (!cmd_run(&cmd)) return false;
+        nob_cmd_append(out, obj);
+    }
+    free(cmd.items);
+    return true;
+}
+
+#define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 
 int main(void)
 {
     Cmd cmd = {0};
     const char *san = getenv("NG_SAN");
     const char *suffix = san && *san ? nob_temp_sprintf("_%s", san) : "";
+    const char *pgo = getenv("NG_PGO");
+    const char *objdir = nob_temp_sprintf(BUILD_FOLDER"obj%s", suffix);
+    const char *pgodir = nob_temp_sprintf(BUILD_FOLDER"obj%s_pgo%s", suffix, pgo && *pgo ? pgo : "none");
 
     /* build/main: the relay (ngws on uSockets, pure C, no TLS).
      * NG_TOOLS_ONLY=1 skips it (fast rebuilds of the bench tools). */
     const char *tools_only = getenv("NG_TOOLS_ONLY");
     if (!(tools_only && strcmp(tools_only, "1") == 0)) {
-    common_flags(&cmd, "-std=gnu11");
-    nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"main%s", suffix));
-    nob_cc_inputs(&cmd, CORE_SOURCES, NGWS_SOURCES);
-    if (!append_nips(&cmd)) return 1;
-    nob_cmd_append(&cmd, "-lpthread", "-lm", "-ldl");
-    if (!cmd_run(&cmd)) return 1;
+        common_flags(&cmd);
+        nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"main%s", suffix));
+        nob_cc_inputs(&cmd, CORE_SOURCES, NGWS_SOURCES);
+        if (!append_nips(&cmd)) return 1;
+        if (!vendor_objects(objdir, CORE_VENDOR, COUNT(CORE_VENDOR), false, &cmd)) return 1;
+        if (!vendor_objects(objdir, US_VENDOR, COUNT(US_VENDOR), false, &cmd)) return 1;
+        nob_cmd_append(&cmd, "-lpthread", "-lm", "-ldl");
+        if (!cmd_run(&cmd)) return 1;
     }
 
     /* tools: ngws benchmark server and the ngload load generator */
-    common_flags(&cmd, "-std=gnu11");
+    common_flags(&cmd);
     pgo_flags(&cmd);
     nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"ngws_bench_server%s", suffix));
     nob_cc_inputs(&cmd, "tools/ngws_bench_server.c", NGWS_SOURCES);
+    if (!vendor_objects(pgodir, US_VENDOR, COUNT(US_VENDOR), true, &cmd)) return 1;
     nob_cmd_append(&cmd, "-lpthread");
     if (!cmd_run(&cmd)) return 1;
 
-    common_flags(&cmd, "-std=gnu11");
+    common_flags(&cmd);
     nob_cc_output(&cmd, nob_temp_sprintf(BUILD_FOLDER"ngload%s", suffix));
     nob_cc_inputs(&cmd, "tools/ngload.c");
     nob_cmd_append(&cmd, "-lpthread", "-lm");

@@ -1,3 +1,4 @@
+#include "platform/ng_platform.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,10 +84,10 @@ static relay_publish_fn publisher;
 static relay_admit_fn admission;
 
 /* Per-thread query context for the storage streaming callback. */
-static __thread relay_conn_t *query_connection;
-static __thread filter_t *query_filters;
-static __thread size_t query_filters_count;
-static __thread size_t query_bytes;
+static NG_THREAD_LOCAL relay_conn_t *query_connection;
+static NG_THREAD_LOCAL filter_t *query_filters;
+static NG_THREAD_LOCAL size_t query_filters_count;
+static NG_THREAD_LOCAL size_t query_bytes;
 static size_t query_bytes_max;    /* 0 = unlimited */
 void relay_core_set_query_bytes_max(size_t n) { query_bytes_max = n; }
 
@@ -322,7 +323,7 @@ relay_bcast_t *relay_bcast_new(event_t *ev) {
     relay_bcast_t *b = (relay_bcast_t *) calloc(1, sizeof(*b));
     if (!b) return NULL;
     b->ev = *ev;                       /* ownership of tags/content moves */
-    static __thread json_builder_t body;
+    static NG_THREAD_LOCAL json_builder_t body;
     json_builder_start(&body);
     json_serialize_event(&b->ev, &body);
     const char *j = json_builder_finish(&body);   /* "[{...}]" */

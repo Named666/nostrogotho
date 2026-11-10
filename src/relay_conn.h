@@ -21,7 +21,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdatomic.h>
+#include "platform/ng_atomic.h"
 
 typedef struct relay_conn relay_conn_t;
 
@@ -31,7 +31,7 @@ typedef struct relay_conn relay_conn_t;
  * delivery of one broadcast: serialized once, framed per subscription with a
  * small prefix, and written with zero copies. */
 typedef struct relay_body {
-    _Atomic int refs;
+    ng_atomic_int refs;
     size_t len;
     char json[];
 } relay_body_t;

@@ -1,3 +1,4 @@
+#include "platform/ng_platform.h"
 #include "storage.h"
 #include "json_util.h"
 #include "nips/nip40.h"
@@ -24,7 +25,7 @@
 /* One SQLite connection per thread. The main/writer thread owns the
  * read-write connection opened by init(); reader threads call
  * thread_open(true) to get their own read-only WAL connection. */
-static __thread sqlite3 *db_conn = NULL;
+static NG_THREAD_LOCAL sqlite3 *db_conn = NULL;
 
 /* Per-connection prepared statements for the hot write path (reused across
  * every event: sqlite3_reset instead of prepare/finalize per insert). */
@@ -37,7 +38,7 @@ static const char *const ps_sql[PS_COUNT] = {
     "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = unhex(?) AND kind = ?",
     "DELETE FROM event WHERE id = unhex(?)",
 };
-static __thread sqlite3_stmt *ps[PS_COUNT];
+static NG_THREAD_LOCAL sqlite3_stmt *ps[PS_COUNT];
 
 static sqlite3_stmt *ps_get(int which) {
     if (!db_conn) return NULL;

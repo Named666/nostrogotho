@@ -1,7 +1,7 @@
 #ifndef RELAY_CONN_INTERNAL_H_
 #define RELAY_CONN_INTERNAL_H_
 
-#include <stdatomic.h>
+#include "platform/ng_atomic.h"
 #include "relay_conn.h"
 
 /* Backend operations. One backend is linked per binary. */
@@ -18,8 +18,8 @@ struct relay_conn {
     const relay_backend_ops_t *ops;
     void *backend;            /* backend-specific */
     int shard;                /* worker / loop index owning protocol state */
-    atomic_int refs;          /* backend ref + in-flight jobs */
-    atomic_bool closed;
+    ng_atomic_int refs;          /* backend ref + in-flight jobs */
+    ng_atomic_bool closed;
     void *slots[RELAY_CONN_MAX_SLOTS];
     char peer[64];
     void *core;               /* relay core per-connection state */

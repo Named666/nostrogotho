@@ -1,3 +1,4 @@
+#include "platform/ng_platform.h"
 #include "crypto.h"
 #include "nips/nip26.h"
 #include <string.h>
@@ -199,9 +200,9 @@ void crypto_deinit(void) {
 #define PV_SLOTS 4096                         /* power of two, > 2 * max batch */
 #define PV_MAX_BATCH 256
 typedef struct { uint8_t sig[64], pk[32], msg[32]; unsigned gen; } pv_slot_t;
-static __thread pv_slot_t *pv_tab;
-static __thread unsigned pv_gen = 1, pv_count;
-static __thread ng_batch_scratch_t *pv_scratch;
+static NG_THREAD_LOCAL pv_slot_t *pv_tab;
+static NG_THREAD_LOCAL unsigned pv_gen = 1, pv_count;
+static NG_THREAD_LOCAL ng_batch_scratch_t *pv_scratch;
 
 static size_t pv_hash(const uint8_t *sig) { uint64_t h; memcpy(&h, sig + 32, 8); return (size_t) (h * 0x9E3779B97F4A7C15ull >> 52) & (PV_SLOTS - 1); }
 

@@ -10,7 +10,7 @@
 #endif
 #include <pthread.h>
 #include <signal.h>
-#include <stdatomic.h>
+#include "../platform/ng_atomic.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,7 +67,7 @@ struct ngws_loop {
     pthread_t th;
     pthread_mutex_t mu;
     ngws_task_t *head, *tail;
-    atomic_bool wake_pending;
+    ng_atomic_bool wake_pending;
     sockx_t *dirty;                     /* head of dirty list */
     sockx_t *all;                       /* open WebSockets */
     sockx_t *blog;                      /* sockets with a backlog buffer (obuf) */
@@ -83,9 +83,9 @@ struct ngws_server {
     ngws_config_t cfg;
     int n_loops;
     ngws_loop_t loops[MAX_LOOPS];
-    atomic_bool stopping;
-    atomic_size_t backlog_total;        /* sum of obuf capacities, all loops */
-    atomic_ullong closed_conn_limit, closed_total_limit;
+    ng_atomic_bool stopping;
+    ng_atomic_size backlog_total;        /* sum of obuf capacities, all loops */
+    ng_atomic_ullong closed_conn_limit, closed_total_limit;
     bool uncork;                        /* flush a socket at the end of its on_data */
 };
 
@@ -194,20 +194,20 @@ static bool node_add(sockx_t *x, const void *p, size_t n) {
 static bool obuf_room(sockx_t *x, size_t n) {
     ngws_server_t *srv = SRV(x);
     size_t pending = x->olen - x->ooff;
-    if (pending + n > srv->cfg.max_backpressure) { atomic_fetch_add_explicit(&srv->closed_conn_limit, 1, memory_order_relaxed); return false; }
+    if (pending + n > srv->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&srv->closed_conn_limit, 1, NG_MO_RELAXED); return false; }
     if (x->olen + n <= x->ocap) return true;
     if (x->ooff) { memmove(x->obuf, x->obuf + x->ooff, pending); x->olen = pending; x->ooff = 0; }
     if (x->olen + n <= x->ocap) return true;
     size_t nc = x->ocap ? x->ocap * 2 : 4096; while (nc < x->olen + n) nc *= 2;
     size_t grow = nc - x->ocap;
     if (srv->cfg.max_total_backlog && pending + n > SEND_WATERMARK &&
-        atomic_load_explicit(&srv->backlog_total, memory_order_relaxed) + grow > srv->cfg.max_total_backlog) {
-        atomic_fetch_add_explicit(&srv->closed_total_limit, 1, memory_order_relaxed);
+        ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED) + grow > srv->cfg.max_total_backlog) {
+        ng_atomic_fetch_add_explicit(&srv->closed_total_limit, 1, NG_MO_RELAXED);
         return false;
     }
     char *nb = (char *) realloc(x->obuf, nc);
     if (!nb) return false;
-    atomic_fetch_add_explicit(&srv->backlog_total, grow, memory_order_relaxed);
+    ng_atomic_fetch_add_explicit(&srv->backlog_total, grow, NG_MO_RELAXED);
     if (!x->ocap) {                                   /* join the loop's backlog list */
         ngws_loop_t *l = x->loop;
         x->bprev = NULL; x->bnext = l->blog;
@@ -227,7 +227,7 @@ static bool backlog_append(sockx_t *x, const void *p, size_t n) {
 
 static void out_release(sockx_t *x) {
     if (x->ocap) {
-        atomic_fetch_sub_explicit(&SRV(x)->backlog_total, x->ocap, memory_order_relaxed);
+        ng_atomic_fetch_sub_explicit(&SRV(x)->backlog_total, x->ocap, NG_MO_RELAXED);
         if (x->bprev) x->bprev->bnext = x->bnext; else x->loop->blog = x->bnext;
         if (x->bnext) x->bnext->bprev = x->bprev;
         x->bprev = x->bnext = NULL;
@@ -243,7 +243,7 @@ static char *out_reserve(sockx_t *x, size_t n) {
         char *p = x->obuf + x->olen; x->olen += n;
         return p;
     }
-    if (x->qbytes + n > SRV(x)->cfg.max_backpressure) { atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, memory_order_relaxed); goto fail; }
+    if (x->qbytes + n > SRV(x)->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, NG_MO_RELAXED); goto fail; }
     ngws_loop_t *l = x->loop;
     arena_chunk_t *c = l->arena_cur;
     if (x->qtail && c && c->used + n <= c->cap) {
@@ -336,7 +336,7 @@ static int send_direct(sockx_t *x, int op, const void *data, size_t len) {
     struct us_socket_t *s = x->s;
     unsigned char hdr[10];
     size_t h = ws_frame_header(hdr, op, len), total = h + len;
-    if (total > SRV(x)->cfg.max_backpressure) { atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, memory_order_relaxed); ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
+    if (total > SRV(x)->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, NG_MO_RELAXED); ngws_terminate((ngws_socket_t *) s); return NGWS_SEND_DROPPED; }
     struct iovec iov[2] = { { hdr, h }, { (void *) data, len } };
     ssize_t w = writev((int) (intptr_t) us_socket_get_native_handle(0, s), iov, 2);
     if (w == (ssize_t) total) return NGWS_SEND_OK;
@@ -401,7 +401,7 @@ int ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len) {
         if (!backlog_append(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
         dirty_add(x);
     } else {
-        if (x->qbytes + len > SRV(x)->cfg.max_backpressure) { atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, memory_order_relaxed); ngws_terminate(ws); return NGWS_SEND_DROPPED; }
+        if (x->qbytes + len > SRV(x)->cfg.max_backpressure) { ng_atomic_fetch_add_explicit(&SRV(x)->closed_conn_limit, 1, NG_MO_RELAXED); ngws_terminate(ws); return NGWS_SEND_DROPPED; }
         ionode_t *t = x->qtail ? &x->loop->nodes[x->qtail - 1] : NULL;
         if (t && (const char *) t->p + t->len == (const char *) frame) { t->len += len; x->qbytes += len; }  /* contiguous: one iovec */
         else if (!node_add(x, frame, len)) { ngws_terminate(ws); return NGWS_SEND_DROPPED; }
@@ -866,7 +866,7 @@ static int shed_cmp(const void *a, const void *b) {
 static void shed_sweep(ngws_loop_t *l) {
     ngws_server_t *srv = l->srv;
     size_t cap = srv->cfg.max_total_backlog;
-    if (!cap || atomic_load_explicit(&srv->backlog_total, memory_order_relaxed) < cap / 4 * 3) return;
+    if (!cap || ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED) < cap / 4 * 3) return;
     size_t n = 0, k = 0;
     for (sockx_t *x = l->blog; x; x = x->bnext) n++;
     shed_t *v = n ? (shed_t *) malloc(n * sizeof(*v)) : NULL;
@@ -876,8 +876,8 @@ static void shed_sweep(ngws_loop_t *l) {
         if (p > SEND_WATERMARK) { v[k].pending = p; v[k].x = x; k++; }
     }
     qsort(v, k, sizeof(*v), shed_cmp);
-    for (size_t i = 0; i < k && atomic_load_explicit(&srv->backlog_total, memory_order_relaxed) > cap / 2; i++) {
-        atomic_fetch_add_explicit(&srv->closed_total_limit, 1, memory_order_relaxed);
+    for (size_t i = 0; i < k && ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED) > cap / 2; i++) {
+        ng_atomic_fetch_add_explicit(&srv->closed_total_limit, 1, NG_MO_RELAXED);
         ngws_terminate((ngws_socket_t *) v[i].x->s);
     }
     free(v);
@@ -910,13 +910,13 @@ static void loop_stop_listening(ngws_loop_t *l) {
 
 static void wakeup_cb(struct us_loop_t *ul) {
     ngws_loop_t *l = *(ngws_loop_t **) us_loop_ext(ul);
-    atomic_store(&l->wake_pending, false);
+    ng_atomic_store(&l->wake_pending, false);
     pthread_mutex_lock(&l->mu);
     ngws_task_t *t = l->head;
     l->head = l->tail = NULL;
     pthread_mutex_unlock(&l->mu);
     while (t) { ngws_task_t *n = t->next; t->run(t, l); t = n; }
-    if (atomic_load(&l->srv->stopping)) loop_stop_listening(l);
+    if (ng_atomic_load(&l->srv->stopping)) loop_stop_listening(l);
 }
 
 void ngws_loop_post(ngws_loop_t *l, ngws_task_t *t) {
@@ -925,7 +925,7 @@ void ngws_loop_post(ngws_loop_t *l, ngws_task_t *t) {
     if (l->tail) l->tail->next = t; else l->head = t;
     l->tail = t;
     pthread_mutex_unlock(&l->mu);
-    if (!atomic_exchange(&l->wake_pending, true)) us_wakeup_loop(l->loop);
+    if (!ng_atomic_exchange(&l->wake_pending, true)) us_wakeup_loop(l->loop);
 }
 
 void ngws_loop_foreach(ngws_loop_t *l, void (*fn)(ngws_socket_t *, void *), void *arg) {
@@ -950,7 +950,7 @@ static void *loop_thread(void *arg) {
      * first listeners already accept) skipped them in ngws_server_stop:
      * stopping was stored before it read the not-yet-set loop pointer, so it
      * is visible here. Without this check those loops never exited. */
-    if (atomic_load(&l->srv->stopping)) loop_stop_listening(l);
+    if (ng_atomic_load(&l->srv->stopping)) loop_stop_listening(l);
     us_loop_run(l->loop);
     if (l->srv->cfg.on_loop_stop) l->srv->cfg.on_loop_stop(l);
     return NULL;
@@ -1051,7 +1051,7 @@ bool ngws_server_run(ngws_server_t *srv) {
 }
 
 void ngws_server_stop(ngws_server_t *srv) {
-    atomic_store(&srv->stopping, true);
+    ng_atomic_store(&srv->stopping, true);
     for (int i = 0; i < srv->n_loops; i++) if (srv->loops[i].loop) us_wakeup_loop(srv->loops[i].loop);
 }
 
@@ -1072,10 +1072,10 @@ void ngws_server_free(ngws_server_t *srv) {
 
 void *ngws_server_user(ngws_server_t *srv) { return srv->cfg.user; }
 int ngws_server_loop_count(ngws_server_t *srv) { return srv->n_loops; }
-size_t ngws_server_backlog_bytes(ngws_server_t *srv) { return atomic_load_explicit(&srv->backlog_total, memory_order_relaxed); }
+size_t ngws_server_backlog_bytes(ngws_server_t *srv) { return ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED); }
 void ngws_server_stats(ngws_server_t *srv, ngws_stats_t *o) {
     o->backlog_bytes = ngws_server_backlog_bytes(srv);
-    o->closed_conn_limit = atomic_load(&srv->closed_conn_limit);
-    o->closed_total_limit = atomic_load(&srv->closed_total_limit);
+    o->closed_conn_limit = ng_atomic_load(&srv->closed_conn_limit);
+    o->closed_total_limit = ng_atomic_load(&srv->closed_total_limit);
 }
 ngws_loop_t *ngws_server_loop(ngws_server_t *srv, int i) { return i >= 0 && i < srv->n_loops ? &srv->loops[i] : NULL; }

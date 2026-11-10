@@ -80,11 +80,6 @@ void nip40_garbage_collect(void *arg) {
  * the relay references this module.
  * ============================================================================ */
 
-static void nip40_plugin_init(const relay_config_t *config, void *ctx) {
-    (void) config; /* No configuration needed. */
-    (void) ctx;
-}
-
 /* Publish policy: "Relays SHOULD drop any events that are published to them
  * if they are expired." */
 static bool nip40_accept_publish(relay_conn_t *connection,

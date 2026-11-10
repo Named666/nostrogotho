@@ -25,6 +25,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
+#include "../src/platform/ng_platform.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -32,7 +33,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
-#include <stdatomic.h>
+#include "../src/platform/ng_atomic.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -54,7 +55,7 @@ static double rate; static int warmup = 1, cbatch = 256, quiet, server_pid, mode
 static const char *evfile;
 static char **events; static size_t nevents;
 static uint64_t *ev_sent_ns;        /* fanout: send time per event index */
-static atomic_size_t ev_next;        /* next event index to send */
+static ng_atomic_size ev_next;        /* next event index to send */
 
 static const uint8_t MASK[4] = { 0x37, 0xfa, 0x21, 0x3d };
 
@@ -110,11 +111,11 @@ typedef struct {
 } thr_t;
 
 static thr_t *T;
-static atomic_int phase;          /* 0 connect, 1 run, 2 stop */
-static atomic_int total_open, total_failed;
-static atomic_uint connect_errno[256];
-static atomic_bool measuring;
-static atomic_ullong npub_acked;     /* OKs counted while measuring (main's early stop) */
+static ng_atomic_int phase;          /* 0 connect, 1 run, 2 stop */
+static ng_atomic_int total_open, total_failed;
+static ng_atomic_uint connect_errno[256];
+static ng_atomic_bool measuring;
+static ng_atomic_ullong npub_acked;     /* OKs counted while measuring (main's early stop) */
 static struct sockaddr_in dst;
 
 static void wb_append(conn_t *c, const void *p, size_t n) {
@@ -140,11 +141,11 @@ static void kill_conn(thr_t *t, conn_t *c) {
     if (c->state == C_CONNECTING) {
         int err = 0; socklen_t el = sizeof(err);
         if (!getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el) && err > 0 && err < 256)
-            atomic_fetch_add(&connect_errno[err], 1);
+            ng_atomic_fetch_add(&connect_errno[err], 1);
     }
-    if (c->state == C_OPEN) { t->open--; atomic_fetch_sub(&total_open, 1); }
+    if (c->state == C_OPEN) { t->open--; ng_atomic_fetch_sub(&total_open, 1); }
     else { t->connecting--; }
-    t->failed++; atomic_fetch_add(&total_failed, 1);
+    t->failed++; ng_atomic_fetch_add(&total_failed, 1);
     epoll_ctl(t->ep, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd); c->state = C_DEAD;
 }
@@ -178,7 +179,7 @@ static void send_frame(conn_t *c, int op, const uint8_t *p, size_t n) {
 
 static uint8_t *echo_payload;
 static void recycle(thr_t *t, conn_t *c);
-static __thread uint8_t *tl_echo;
+static NG_THREAD_LOCAL uint8_t *tl_echo;
 static void send_echo(conn_t *c) {
     if (!tl_echo) { tl_echo = malloc((size_t) msgsize + 8); memcpy(tl_echo, echo_payload, (size_t) msgsize); }
     if (msgsize >= 8) { uint64_t ts = now_ns(); memcpy(tl_echo, &ts, 8); }   /* latency stamp */
@@ -195,7 +196,7 @@ static void send_bcast(conn_t *c) {
 
 static bool send_next_event(conn_t *c, bool fanout) {
     size_t i;
-    if (fanout) { i = atomic_fetch_add(&ev_next, 1); if (i >= nevents) return false; ev_sent_ns[i] = now_ns(); }
+    if (fanout) { i = ng_atomic_fetch_add(&ev_next, 1); if (i >= nevents) return false; ev_sent_ns[i] = now_ns(); }
     else { if (c->ev_pos >= c->ev_hi) return false; i = c->ev_pos++; c->sent[c->st++ & 63] = now_ns(); }
     send_frame(c, 1, (const uint8_t *) events[i], strlen(events[i]));
     c->inflight++;
@@ -203,7 +204,7 @@ static bool send_next_event(conn_t *c, bool fanout) {
 }
 
 static void on_open(thr_t *t, conn_t *c) {
-    c->state = C_OPEN; t->connecting--; t->open++; atomic_fetch_add(&total_open, 1);
+    c->state = C_OPEN; t->connecting--; t->open++; ng_atomic_fetch_add(&total_open, 1);
     if (mode == M_NFAN && c->role == R_SUB) {
         static const char req[] = "[\"REQ\",\"f\",{\"kinds\":[1],\"limit\":0}]";
         send_frame(c, 1, (const uint8_t *) req, sizeof(req) - 1);
@@ -230,7 +231,7 @@ static long parse_index_from_event(const uint8_t *p, size_t n) {
 }
 
 static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
-    bool m = atomic_load_explicit(&measuring, memory_order_relaxed);
+    bool m = ng_atomic_load_explicit(&measuring, NG_MO_RELAXED);
     if (op == 9) { send_frame(c, 10, p, n); return; }
     if (op >= 8) return;
     switch (mode) {
@@ -240,7 +241,7 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
             t->msgs++; t->bytes += n;
             if (n >= 8) { uint64_t ts; memcpy(&ts, p, 8); hadd(&t->hist, now_ns() - ts); }
         }
-        if (atomic_load(&phase) == 1 && rate <= 0) send_echo(c);
+        if (ng_atomic_load(&phase) == 1 && rate <= 0) send_echo(c);
         break;
     case M_BCAST:
         if (n >= 8) {
@@ -250,7 +251,7 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
         if (c->role == R_PUB && rate <= 0) {
             /* closed loop: each own message echoed back releases a slot */
             c->inflight--;
-            if (atomic_load(&phase) == 1) send_bcast(c);
+            if (ng_atomic_load(&phase) == 1) send_bcast(c);
         }
         break;
     case M_NPUB:
@@ -259,8 +260,8 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
             bool ok = memmem(p, n, "\",true,", 7) != NULL;
             uint64_t sent_at = c->sh != c->st ? c->sent[c->sh++ & 63] : 0;
             if (m) { if (ok) t->oks++; else t->fails++; t->msgs++; if (sent_at) hadd(&t->hist, now_ns() - sent_at);
-                    atomic_fetch_add_explicit(&npub_acked, 1, memory_order_relaxed); }
-            if (atomic_load(&phase) == 1) send_next_event(c, false);
+                    ng_atomic_fetch_add_explicit(&npub_acked, 1, NG_MO_RELAXED); }
+            if (ng_atomic_load(&phase) == 1) send_next_event(c, false);
         }
         break;
     case M_NFAN:
@@ -293,12 +294,12 @@ static void do_read(thr_t *t, conn_t *c) {
         if (c->rlen < 12 || memcmp(c->rb + 9, "101", 3) != 0) { kill_conn(t, c); return; }
         off = (size_t) (e + 4 - c->rb);
         on_open(t, c);
-        if (mode == M_CHURN && atomic_load(&phase) == 1) {
-            if (atomic_load_explicit(&measuring, memory_order_relaxed)) { t->msgs++; hadd(&t->hist, now_ns() - c->conn_start_ns); }
+        if (mode == M_CHURN && ng_atomic_load(&phase) == 1) {
+            if (ng_atomic_load_explicit(&measuring, NG_MO_RELAXED)) { t->msgs++; hadd(&t->hist, now_ns() - c->conn_start_ns); }
             recycle(t, c);
             return;
         }
-        if (atomic_load(&phase) == 1) start_traffic(t, c);
+        if (ng_atomic_load(&phase) == 1) start_traffic(t, c);
     }
     while (c->rlen - off >= 2) {
         uint8_t *b = c->rb + off; size_t avail = c->rlen - off;
@@ -325,14 +326,14 @@ static void recycle(thr_t *t, conn_t *c) {
     setsockopt(c->fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
     epoll_ctl(t->ep, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
-    if (c->state == C_OPEN) { t->open--; atomic_fetch_sub(&total_open, 1); } else t->connecting--;
+    if (c->state == C_OPEN) { t->open--; ng_atomic_fetch_sub(&total_open, 1); } else t->connecting--;
     c->rlen = 0; c->wlen = c->woff = 0;
     start_connect(t, c, c->gi);
 }
 
 static void start_connect(thr_t *t, conn_t *c, int global_idx) {
     int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (fd < 0) { if (errno < 256) atomic_fetch_add(&connect_errno[errno], 1); c->state = C_DEAD; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
+    if (fd < 0) { if (errno < 256) ng_atomic_fetch_add(&connect_errno[errno], 1); c->state = C_DEAD; t->failed++; ng_atomic_fetch_add(&total_failed, 1); return; }
     int one = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 #ifdef IP_BIND_ADDRESS_NO_PORT
@@ -342,13 +343,13 @@ static void start_connect(thr_t *t, conn_t *c, int global_idx) {
         struct sockaddr_in src = { .sin_family = AF_INET };
         src.sin_addr.s_addr = htonl(0x7F000002u + (uint32_t) (global_idx % nsrc));
         if (bind(fd, (struct sockaddr *) &src, sizeof(src)) < 0) {
-            if (errno < 256) atomic_fetch_add(&connect_errno[errno], 1);
-            close(fd); c->state = C_DEAD; t->failed++; atomic_fetch_add(&total_failed, 1); return;
+            if (errno < 256) ng_atomic_fetch_add(&connect_errno[errno], 1);
+            close(fd); c->state = C_DEAD; t->failed++; ng_atomic_fetch_add(&total_failed, 1); return;
         }
     }
     c->fd = fd; c->state = C_CONNECTING; t->connecting++; c->gi = global_idx; c->conn_start_ns = now_ns();
     int r = connect(fd, (struct sockaddr *) &dst, sizeof(dst));
-    if (r < 0 && errno != EINPROGRESS) { if (errno < 256) atomic_fetch_add(&connect_errno[errno], 1); close(fd); c->state = C_DEAD; t->connecting--; t->failed++; atomic_fetch_add(&total_failed, 1); return; }
+    if (r < 0 && errno != EINPROGRESS) { if (errno < 256) ng_atomic_fetch_add(&connect_errno[errno], 1); close(fd); c->state = C_DEAD; t->connecting--; t->failed++; ng_atomic_fetch_add(&total_failed, 1); return; }
     struct epoll_event e = { .events = EPOLLOUT | EPOLLIN, .data.ptr = c };
     c->want_out = true;
     epoll_ctl(t->ep, EPOLL_CTL_ADD, fd, &e);
@@ -357,7 +358,7 @@ static void start_connect(thr_t *t, conn_t *c, int global_idx) {
 static void handshake_send(thr_t *t, conn_t *c) {
     int err = 0; socklen_t el = sizeof(err);
     getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &el);
-    if (err) { if (err < 256) atomic_fetch_add(&connect_errno[err], 1); kill_conn(t, c); return; }
+    if (err) { if (err < 256) ng_atomic_fetch_add(&connect_errno[err], 1); kill_conn(t, c); return; }
     char req[256];
     int n = snprintf(req, sizeof(req), "GET / HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", host, port);
@@ -373,7 +374,7 @@ static void *thr_main(void *arg) {
     bool started = false;
     uint64_t last_tick = now_ns();
     for (;;) {
-        int ph = atomic_load(&phase);
+        int ph = ng_atomic_load(&phase);
         if (ph == 2) break;
         while (t->next_to_connect < t->n && t->connecting < cbatch) {
             int i = t->next_to_connect++;
@@ -506,7 +507,7 @@ int main(int argc, char **argv) {
     int last = -1; uint64_t stall = now_ns();
     for (;;) {
         usleep(20000);
-        int o = atomic_load(&total_open), f = atomic_load(&total_failed);
+        int o = ng_atomic_load(&total_open), f = ng_atomic_load(&total_failed);
         if (o + f >= nconns) break;
         if (o != last) { last = o; stall = now_ns(); }
         if (now_ns() - stall > 15000000000ull) { fprintf(stderr, "connect stalled at %d/%d\n", o, nconns); break; }
@@ -514,29 +515,29 @@ int main(int argc, char **argv) {
     double connect_s = (now_ns() - t0) / 1e9;
     if (mode == M_NFAN) usleep(500000 + (useconds_t) nconns * 20);   /* let REQs register */
     long rss1 = server_pid ? rss_kb(server_pid) : -1;
-    if (!quiet) fprintf(stderr, "connected %d (failed %d) in %.2fs\n", atomic_load(&total_open), atomic_load(&total_failed), connect_s);
+    if (!quiet) fprintf(stderr, "connected %d (failed %d) in %.2fs\n", ng_atomic_load(&total_open), ng_atomic_load(&total_failed), connect_s);
 
-    int connected = atomic_load(&total_open);
-    atomic_store(&phase, 1);
+    int connected = ng_atomic_load(&total_open);
+    ng_atomic_store(&phase, 1);
     sleep((unsigned) warmup);
     uint64_t m0 = 0, b0 = 0;
     for (int k = 0; k < nthreads; k++) { m0 += T[k].msgs; b0 += T[k].bytes; }
     double sc0 = server_pid ? cpu_s(server_pid) : 0, cc0 = self_cpu_s();
-    atomic_store(&measuring, true);
+    ng_atomic_store(&measuring, true);
     uint64_t w0 = now_ns();
     for (int s = 0; s < duration * 10; s++) {
         usleep(100000);
         if (mode == M_NPUB) {     /* stop early when all events acked */
-            uint64_t m = atomic_load_explicit(&npub_acked, memory_order_relaxed);
+            uint64_t m = ng_atomic_load_explicit(&npub_acked, NG_MO_RELAXED);
             if (m >= nevents - (nevents % (size_t) nconns)) break;
         }
-        if (mode == M_NFAN && atomic_load(&ev_next) >= nevents) { usleep(300000); break; }
+        if (mode == M_NFAN && ng_atomic_load(&ev_next) >= nevents) { usleep(300000); break; }
     }
-    atomic_store(&measuring, false);
+    ng_atomic_store(&measuring, false);
     double secs = (now_ns() - w0) / 1e9;
     double sc1 = server_pid ? cpu_s(server_pid) : 0, cc1 = self_cpu_s();
     long rss2 = server_pid ? rss_kb(server_pid) : -1;
-    atomic_store(&phase, 2);
+    ng_atomic_store(&phase, 2);
     for (int k = 0; k < nthreads; k++) pthread_join(T[k].th, NULL);
 
     uint64_t msgs = 0, bytes = 0, oks = 0, fails = 0;
@@ -548,16 +549,16 @@ int main(int argc, char **argv) {
     }
     (void) m0; (void) b0;
     printf("mode=%s conns=%d open=%d failed=%d threads=%d src_ips=%d connect_s=%.2f",
-           ms, nconns, atomic_load(&total_open), atomic_load(&total_failed), nthreads, nsrc, connect_s);
-    printf(" connected=%d dropped=%d", connected, connected - atomic_load(&total_open));
-    for (int i = 1; i < 256; i++) { unsigned n = atomic_load(&connect_errno[i]); if (n) printf(" errno_%d=%u", i, n); }
+           ms, nconns, ng_atomic_load(&total_open), ng_atomic_load(&total_failed), nthreads, nsrc, connect_s);
+    printf(" connected=%d dropped=%d", connected, connected - ng_atomic_load(&total_open));
+    for (int i = 1; i < 256; i++) { unsigned n = ng_atomic_load(&connect_errno[i]); if (n) printf(" errno_%d=%u", i, n); }
     if (mode != M_HOLD)
         printf(" secs=%.2f msgs=%llu msgs_s=%.0f MB_s=%.1f", secs, (unsigned long long) msgs, msgs / secs, bytes / secs / 1e6);
     if (mode == M_NPUB || mode == M_NFAN) printf(" ok=%llu rejected=%llu", (unsigned long long) oks, (unsigned long long) fails);
     if (h->n) printf(" lat_us_p50=%.0f p99=%.0f p999=%.0f max=%.0f", hq(h, .5) / 1e3, hq(h, .99) / 1e3, hq(h, .999) / 1e3, h->max / 1e3);
     if (server_pid) {
         printf(" srv_rss_base_mb=%.1f srv_rss_conn_mb=%.1f bytes_per_conn=%.0f srv_rss_end_mb=%.1f srv_cpu_pct=%.0f",
-               rss0 / 1024.0, rss1 / 1024.0, (rss1 - rss0) * 1024.0 / (atomic_load(&total_open) ? atomic_load(&total_open) : 1),
+               rss0 / 1024.0, rss1 / 1024.0, (rss1 - rss0) * 1024.0 / (ng_atomic_load(&total_open) ? ng_atomic_load(&total_open) : 1),
                rss2 / 1024.0, (sc1 - sc0) / secs * 100);
     }
     printf(" client_cpu_pct=%.0f\n", (cc1 - cc0) / secs * 100);

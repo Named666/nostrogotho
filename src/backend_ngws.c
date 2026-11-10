@@ -30,11 +30,12 @@
  *                   records (see ngb_destroy, outbox_commit_ref); a socket's
  *                   frames from one loop iteration go out in one send().
  * ============================================================================ */
+#include "platform/ng_platform.h"
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sched.h>
-#include <stdatomic.h>
+#include "platform/ng_atomic.h"
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,8 +73,8 @@ typedef struct {
     ngws_loop_t *loop;
     ngws_socket_t *ws;          /* loop thread only; NULL once closed */
     ngws_task_t free_task;      /* final free runs on the owning loop (see ngb_destroy) */
-    atomic_int pending;         /* messages queued to the worker, not yet handled */
-    atomic_size_t out_buffered; /* socket output backlog as last seen by its loop */
+    ng_atomic_int pending;         /* messages queued to the worker, not yet handled */
+    ng_atomic_size out_buffered; /* socket output backlog as last seen by its loop */
 } ng_conn_t;
 
 /* ------------------------------------------------------- runtime options --
@@ -103,7 +104,7 @@ typedef struct job {
 
 /* One committed batch's broadcasts, shared by every worker (one job per
  * worker per batch); the last worker to finish frees it. */
-typedef struct bset { atomic_int refs; int n; relay_bcast_t *b[]; } bset_t;
+typedef struct bset { ng_atomic_int refs; int n; relay_bcast_t *b[]; } bset_t;
 
 typedef struct {
     int idx;
@@ -111,7 +112,7 @@ typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job_t *head, *tail;
-    _Alignas(64) atomic_size_t qbytes;  /* queued + in-progress inbound bytes (budget) */
+    NG_ALIGNED(64) ng_atomic_size qbytes;  /* queued + in-progress inbound bytes (budget) */
 } worker_t;
 
 typedef struct wjob {
@@ -156,22 +157,22 @@ static int n_loops;
 static worker_t workers[RELAY_MAX_SHARDS];
 static int n_workers;
 static bool batch_verify = true;        /* NG_BATCH_VERIFY=0 disables (A/B benchmarks) */
-static atomic_ullong next_conn_id = 1;
-static atomic_bool stopping;
+static ng_atomic_ullong next_conn_id = { 1 };
+static ng_atomic_bool stopping;
 static char *info_doc;
 static size_t info_doc_len;
-static atomic_llong stat_open_conns;
-static atomic_size_t out_task_bytes;    /* posted outbox bytes not yet run by a loop */
-static atomic_ullong stat_shed_loop, stat_shed_core, stat_shed_writer, stat_preverified;
-static atomic_int writer_depth;          /* EVENTs queued for the writer */
+static ng_atomic_llong stat_open_conns;
+static ng_atomic_size out_task_bytes;    /* posted outbox bytes not yet run by a loop */
+static ng_atomic_ullong stat_shed_loop, stat_shed_core, stat_shed_writer, stat_preverified;
+static ng_atomic_int writer_depth;          /* EVENTs queued for the writer */
 
 static pthread_t writer_th;
 static pthread_mutex_t writer_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t writer_cv = PTHREAD_COND_INITIALIZER;
 static wjob_t *writer_head, *writer_tail;
 
-static __thread outbox_t tl_outbox[MAX_IO_LOOPS];
-static __thread uint64_t tl_outbox_dirty;
+static NG_THREAD_LOCAL outbox_t tl_outbox[MAX_IO_LOOPS];
+static NG_THREAD_LOCAL uint64_t tl_outbox_dirty;
 
 /* --------------------------------------------------------- loop side ----- */
 static void run_outtask(ngws_task_t *t, ngws_loop_t *loop);
@@ -201,7 +202,7 @@ static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
         char *d = (char *) (r + 1);
         ng_conn_t *c = r->conn;
         ngws_socket_t *ws = c->ws;
-        if (ws && !atomic_load_explicit(&c->base.closed, memory_order_relaxed)) {
+        if (ws && !ng_atomic_load_explicit(&c->base.closed, NG_MO_RELAXED)) {
             if (r->kind == R_FRAME) ngws_send_shared(ws, d, r->len);
             else if (r->kind == R_CLOSE) ngws_close(ws, 1000, NULL);
             else if (r->kind == R_EVENT) {
@@ -216,8 +217,8 @@ static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
             }
             if (c->ws) {                    /* mirror for admission; write only on change (shared line) */
                 size_t b = ngws_buffered(ws);
-                if (atomic_load_explicit(&c->out_buffered, memory_order_relaxed) != b)
-                    atomic_store_explicit(&c->out_buffered, b, memory_order_relaxed);
+                if (ng_atomic_load_explicit(&c->out_buffered, NG_MO_RELAXED) != b)
+                    ng_atomic_store_explicit(&c->out_buffered, b, NG_MO_RELAXED);
             }
         }
         /* No per-record connection reference: a connection is only freed by
@@ -225,7 +226,7 @@ static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
          * hold a record for it has flushed its outbox (see ngb_destroy). */
         o += sizeof(rec_t) + ((r->len + 7) & ~(size_t) 7);
     }
-    atomic_fetch_sub_explicit(&out_task_bytes, t->len, memory_order_relaxed);
+    ng_atomic_fetch_sub_explicit(&out_task_bytes, t->len, NG_MO_RELAXED);
     ngws_loop_defer(loop, outtask_free, t);   /* frames/bodies are referenced until flushed */
 }
 
@@ -246,7 +247,7 @@ static void outbox_flush_loop(int i) {
     outtask_t *t = ob->t;
     ob->t = NULL; ob->cap = 0;
     t->task.run = run_outtask;
-    atomic_fetch_add_explicit(&out_task_bytes, t->len, memory_order_relaxed);
+    ng_atomic_fetch_add_explicit(&out_task_bytes, t->len, NG_MO_RELAXED);
     ngws_loop_post(ngws_server_loop(srv, i), &t->task);
 }
 
@@ -325,7 +326,7 @@ static void ngb_destroy(relay_conn_t *rc) {
 
 /* Deferred unref: workers/writer release connection references only after
  * flushing their outbox (required by ngb_destroy's ordering argument). */
-static __thread relay_conn_t **tl_unref; static __thread size_t tl_unref_n, tl_unref_cap;
+static NG_THREAD_LOCAL relay_conn_t **tl_unref; static NG_THREAD_LOCAL size_t tl_unref_n, tl_unref_cap;
 static void unref_later(relay_conn_t *rc) {
     if (tl_unref_n == tl_unref_cap) {
         size_t nc = tl_unref_cap ? tl_unref_cap * 2 : 1024;
@@ -376,7 +377,7 @@ static size_t job_cost(const job_t *j) { return sizeof(job_t) + (j->type == J_MS
 /* queue from a loop thread; delivered at the end of the iteration */
 static void loop_queue_job(ngws_loop_t *loop, int w, job_t *j) {
     loop_ctx_t *lc = (loop_ctx_t *) ngws_loop_get_user(loop);
-    atomic_fetch_add_explicit(&workers[w].qbytes, job_cost(j), memory_order_relaxed);
+    ng_atomic_fetch_add_explicit(&workers[w].qbytes, job_cost(j), NG_MO_RELAXED);
     j->next = NULL;
     if (lc->tail[w]) lc->tail[w]->next = j; else lc->head[w] = j;
     lc->tail[w] = j;
@@ -419,16 +420,16 @@ static void on_open(ngws_socket_t *ws, const ngws_http_req_t *req) {
     (void) req;
     ng_conn_t *c = (ng_conn_t *) calloc(1, sizeof(*c));
     if (!c) { ngws_terminate(ws); return; }
-    c->base.id = atomic_fetch_add(&next_conn_id, 1);
+    c->base.id = ng_atomic_fetch_add(&next_conn_id, 1);
     c->base.ops = &ng_ops;
     c->base.backend = c;
     c->base.shard = (int) (c->base.id % (uint64_t) n_workers);
-    atomic_init(&c->base.refs, 1);            /* held by the socket */
+    ng_atomic_init(&c->base.refs, 1);            /* held by the socket */
     c->loop = ngws_socket_loop(ws);
     c->ws = ws;
     ngws_remote_address(ws, c->base.peer, sizeof(c->base.peer));
     *(ng_conn_t **) ngws_user(ws) = c;
-    atomic_fetch_add(&stat_open_conns, 1);
+    ng_atomic_fetch_add(&stat_open_conns, 1);
     job_t *j = job_new(J_OPEN, c, 0);
     if (j) { relay_conn_retain(&c->base); loop_queue_job(c->loop, c->base.shard, j); }
 }
@@ -441,7 +442,7 @@ static void on_open(ngws_socket_t *ws, const ngws_http_req_t *req) {
 static const char overload_msg[] = "error: relay overloaded, try again later";
 
 static void shed_inline(ngws_socket_t *ws, const char *data, size_t len) {
-    atomic_fetch_add_explicit(&stat_shed_loop, 1, memory_order_relaxed);
+    ng_atomic_fetch_add_explicit(&stat_shed_loop, 1, NG_MO_RELAXED);
     while (len && (*data == ' ' || *data == '\t' || *data == '\r' || *data == '\n')) { data++; len--; }
     jstr_t arr = jl_str_n(data, len), k, v0, v1;
     char out[320];
@@ -472,25 +473,25 @@ static void shed_inline(ngws_socket_t *ws, const char *data, size_t len) {
  * work: signature verification for EVENT, the query for REQ/COUNT. */
 static bool admit_quiet(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
     ng_conn_t *c = (ng_conn_t *) rc;
-    size_t total = atomic_load_explicit(&out_task_bytes, memory_order_relaxed) + (srv ? ngws_server_backlog_bytes(srv) : 0);
+    size_t total = ng_atomic_load_explicit(&out_task_bytes, NG_MO_RELAXED) + (srv ? ngws_server_backlog_bytes(srv) : 0);
     bool ok = total < opt.total_out_max / 10 * 9;   /* 90%: shedding (75%, ngws) did not keep up */
-    if (ok && atomic_load_explicit(&c->out_buffered, memory_order_relaxed) > opt.conn_out_max / 2) {
+    if (ok && ng_atomic_load_explicit(&c->out_buffered, NG_MO_RELAXED) > opt.conn_out_max / 2) {
         ok = false; *why = "error: output backlog too large, read faster";   /* slow reader */
     } else if (!ok) *why = overload_msg;
-    if (ok && kind == RELAY_ADMIT_EVENT && atomic_load_explicit(&writer_depth, memory_order_relaxed) >= opt.writer_queue_max) {
+    if (ok && kind == RELAY_ADMIT_EVENT && ng_atomic_load_explicit(&writer_depth, NG_MO_RELAXED) >= opt.writer_queue_max) {
         ok = false; *why = overload_msg;
     }
     return ok;
 }
 static bool core_admit(relay_conn_t *rc, relay_admit_kind_t kind, const char **why) {
     bool ok = admit_quiet(rc, kind, why);
-    if (!ok) atomic_fetch_add_explicit(&stat_shed_core, 1, memory_order_relaxed);
+    if (!ok) ng_atomic_fetch_add_explicit(&stat_shed_core, 1, NG_MO_RELAXED);
     return ok;
 }
 
 static void on_drain(ngws_socket_t *ws) {
     ng_conn_t *c = *(ng_conn_t **) ngws_user(ws);
-    if (c) atomic_store_explicit(&c->out_buffered, ngws_buffered(ws), memory_order_relaxed);
+    if (c) ng_atomic_store_explicit(&c->out_buffered, ngws_buffered(ws), NG_MO_RELAXED);
 }
 
 static void on_message(ngws_socket_t *ws, char *data, size_t len, int op) {
@@ -498,14 +499,14 @@ static void on_message(ngws_socket_t *ws, char *data, size_t len, int op) {
     ng_conn_t *c = *(ng_conn_t **) ngws_user(ws);
     if (!c) return;
     worker_t *wk = &workers[c->base.shard];
-    if (atomic_load_explicit(&c->pending, memory_order_relaxed) >= opt.conn_pending_max ||
-        atomic_load_explicit(&wk->qbytes, memory_order_relaxed) + sizeof(job_t) + len + 1 > opt.worker_queue_max) {
+    if (ng_atomic_load_explicit(&c->pending, NG_MO_RELAXED) >= opt.conn_pending_max ||
+        ng_atomic_load_explicit(&wk->qbytes, NG_MO_RELAXED) + sizeof(job_t) + len + 1 > opt.worker_queue_max) {
         shed_inline(ws, data, len);
         return;
     }
-    atomic_fetch_add_explicit(&c->pending, 1, memory_order_relaxed);
+    ng_atomic_fetch_add_explicit(&c->pending, 1, NG_MO_RELAXED);
     job_t *j = job_new(J_MSG, c, len + 1);
-    if (!j) { atomic_fetch_sub(&c->pending, 1); return; }
+    if (!j) { ng_atomic_fetch_sub(&c->pending, 1); return; }
     memcpy(j->payload, data, len); j->payload[len] = '\0'; j->len = len;
     relay_conn_retain(&c->base);
     loop_queue_job(c->loop, c->base.shard, j);
@@ -517,8 +518,8 @@ static void on_close(ngws_socket_t *ws, int code) {
     if (!c) return;
     *(ng_conn_t **) ngws_user(ws) = NULL;
     c->ws = NULL;
-    atomic_store(&c->base.closed, true);
-    atomic_fetch_sub(&stat_open_conns, 1);
+    ng_atomic_store(&c->base.closed, true);
+    ng_atomic_fetch_sub(&stat_open_conns, 1);
     job_t *j = job_new(J_CLOSE, c, 0);       /* inherits the socket's ref */
     if (j) loop_queue_job(c->loop, c->base.shard, j);
     else relay_conn_unref(&c->base);
@@ -539,13 +540,13 @@ static bool hex_field(jstr_t v, size_t nbytes, uint8_t *out) {
     return v.len == 2 * nbytes + 2 && v.buf[0] == '"' && hex_to_bytes(v.buf + 1, 2 * nbytes, out, nbytes, &got) && got == nbytes;
 }
 typedef struct { uint8_t sig[64], pk[32], id[32]; } pv_item_t;
-static __thread pv_item_t *pv;
-static __thread const uint8_t **ps, **pm, **pp;
+static NG_THREAD_LOCAL pv_item_t *pv;
+static NG_THREAD_LOCAL const uint8_t **ps, **pm, **pp;
 static void preverify_free(void) { free(pv); free(ps); free(pm); free(pp); pv = NULL; ps = pm = pp = NULL; }
 static void preverify_events(job_t *j) {
     size_t n = 0;
     for (; j && n < PREVERIFY_MAX; j = j->next) {
-        if (j->type != J_MSG || j->len < 16 || atomic_load_explicit(&j->conn->base.closed, memory_order_relaxed)) continue;
+        if (j->type != J_MSG || j->len < 16 || ng_atomic_load_explicit(&j->conn->base.closed, NG_MO_RELAXED)) continue;
         const char *d = j->payload; size_t len = j->len;
         while (len && (*d == ' ' || *d == '\t' || *d == '\r' || *d == '\n')) { d++; len--; }
         if (len < 10 || memcmp(d, "[\"EVENT\"", 8) != 0) continue;
@@ -568,11 +569,11 @@ static void preverify_events(job_t *j) {
         if (!admit_quiet(&j->conn->base, RELAY_ADMIT_EVENT, &why)) continue;
         ps[n] = pv[n].sig; pm[n] = pv[n].id; pp[n] = pv[n].pk; n++;
     }
-    if (n >= 2) atomic_fetch_add_explicit(&stat_preverified, crypto_batch_verify(ps, pm, pp, n), memory_order_relaxed);
+    if (n >= 2) ng_atomic_fetch_add_explicit(&stat_preverified, crypto_batch_verify(ps, pm, pp, n), NG_MO_RELAXED);
 }
 
 static void bset_unref(bset_t *s) {
-    if (atomic_fetch_sub(&s->refs, 1) == 1) {
+    if (ng_atomic_fetch_sub(&s->refs, 1) == 1) {
         for (int i = 0; i < s->n; i++) relay_bcast_free(s->b[i]);
         free(s);
     }
@@ -588,11 +589,11 @@ static void *worker_thread(void *arg) {
     if (st->thread_open && !st->thread_open(true)) fprintf(stderr, "worker %d: no reader db\n", wk->idx);
     for (;;) {
         pthread_mutex_lock(&wk->mu);
-        while (!wk->head && !atomic_load(&stopping)) pthread_cond_wait(&wk->cv, &wk->mu);
+        while (!wk->head && !ng_atomic_load(&stopping)) pthread_cond_wait(&wk->cv, &wk->mu);
         job_t *j = wk->head;
         wk->head = wk->tail = NULL;
         pthread_mutex_unlock(&wk->mu);
-        if (!j && atomic_load(&stopping)) break;
+        if (!j && ng_atomic_load(&stopping)) break;
         if (batch_verify) preverify_events(j);
         while (j) {
             job_t *next = j->next;
@@ -600,8 +601,8 @@ static void *worker_thread(void *arg) {
             switch (j->type) {
             case J_OPEN: relay_core_on_open(rc); unref_later(rc); break;
             case J_MSG:
-                if (rc->core && !atomic_load(&rc->closed)) relay_core_on_message(rc, j->payload, j->len);
-                atomic_fetch_sub_explicit(&j->conn->pending, 1, memory_order_relaxed);
+                if (rc->core && !ng_atomic_load(&rc->closed)) relay_core_on_message(rc, j->payload, j->len);
+                ng_atomic_fetch_sub_explicit(&j->conn->pending, 1, NG_MO_RELAXED);
                 unref_later(rc); break;
             case J_CLOSE: if (rc->core) relay_core_on_close(rc); unref_later(rc); break;
             case J_BSET:
@@ -611,7 +612,7 @@ static void *worker_thread(void *arg) {
                 }
                 bset_unref(j->bset); break;
             }
-            if (j->type != J_BSET) atomic_fetch_sub_explicit(&wk->qbytes, job_cost(j), memory_order_relaxed);
+            if (j->type != J_BSET) ng_atomic_fetch_sub_explicit(&wk->qbytes, job_cost(j), NG_MO_RELAXED);
             free(j);
             j = next;
         }
@@ -628,11 +629,11 @@ static void *worker_thread(void *arg) {
 /* --------------------------------------------------------------- writer -- */
 /* Never blocks the caller: a full writer queue answers OK false. */
 static void publish_to_writer(relay_conn_t *rc, relay_bcast_t *bc) {
-    bool full = atomic_fetch_add(&writer_depth, 1) >= opt.writer_queue_max;
+    bool full = ng_atomic_fetch_add(&writer_depth, 1) >= opt.writer_queue_max;
     wjob_t *w = full ? NULL : (wjob_t *) malloc(sizeof(*w));
     if (!w) {
-        atomic_fetch_sub(&writer_depth, 1);
-        if (full) atomic_fetch_add_explicit(&stat_shed_writer, 1, memory_order_relaxed);
+        ng_atomic_fetch_sub(&writer_depth, 1);
+        if (full) ng_atomic_fetch_add_explicit(&stat_shed_writer, 1, NG_MO_RELAXED);
         nip_plugin_send_status(rc, "OK", bc->ev.id, false, full ? overload_msg : "error: out of memory");
         dedupe_release(bc->ev.id); relay_bcast_free(bc); unref_later(rc); return;   /* worker thread */
     }
@@ -697,7 +698,7 @@ static void *writer_thread(void *arg) {
     int prev_n = 0;
     for (;;) {
         pthread_mutex_lock(&writer_mu);
-        while (!writer_head && !atomic_load(&stopping)) {
+        while (!writer_head && !ng_atomic_load(&stopping)) {
             if (!interval) { pthread_cond_wait(&writer_cv, &writer_mu); continue; }
             long long wait = next_timer - now_ms();
             if (wait <= 0) break;
@@ -713,7 +714,7 @@ static void *writer_thread(void *arg) {
          * (>= linger_min events), wait up to linger_us for the batch to reach
          * batch_min, amortizing COMMIT over more events. Idle/light traffic
          * never waits, so OK latency stays at one commit. */
-        if (n > 0 && n < batch_min && prev_n >= linger_min && linger_us > 0 && !atomic_load(&stopping)) {
+        if (n > 0 && n < batch_min && prev_n >= linger_min && linger_us > 0 && !ng_atomic_load(&stopping)) {
             long long deadline = now_us() + linger_us;
             while (n < batch_min) {
                 if (!writer_head) {
@@ -730,9 +731,9 @@ static void *writer_thread(void *arg) {
             }
         }
         prev_n = n;
-        atomic_fetch_sub(&writer_depth, n);
+        ng_atomic_fetch_sub(&writer_depth, n);
         if (!writer_head) writer_tail = NULL;
-        bool stop = atomic_load(&stopping) && n == 0;
+        bool stop = ng_atomic_load(&stopping) && n == 0;
         pthread_mutex_unlock(&writer_mu);
         if (stop) break;
 
@@ -780,7 +781,7 @@ static void *writer_thread(void *arg) {
             free(batch[i]);
         }
         if (set && set->n) {
-            atomic_init(&set->refs, n_workers);
+            ng_atomic_init(&set->refs, n_workers);
             for (int w = 0; w < n_workers; w++) {
                 job_t *j = job_new(J_BSET, NULL, 0);
                 if (!j) { bset_unref(set); continue; }
@@ -814,7 +815,7 @@ static void *checkpoint_thread(void *arg) {
     if (!st->checkpoint || (st->thread_open && !st->thread_open(false))) return NULL;
     int ms = 250;
     { const char *v = getenv("NG_CKPT_MS"); if (v && atoi(v) > 0) ms = atoi(v); }
-    while (!atomic_load(&stopping)) {
+    while (!ng_atomic_load(&stopping)) {
         struct timespec ts = { ms / 1000, (long) (ms % 1000) * 1000000L };
         nanosleep(&ts, NULL);
         st->checkpoint();
@@ -906,7 +907,7 @@ bool server_run(int port) {
             port, n_loops, n_workers, ngws_listen_backlog(&cfg));
     bool ok = srv && ngws_server_run(srv);
 
-    atomic_store(&stopping, true);
+    ng_atomic_store(&stopping, true);
     pthread_mutex_lock(&writer_mu); pthread_cond_broadcast(&writer_cv); pthread_mutex_unlock(&writer_mu);
     pthread_join(writer_th, NULL);
     pthread_join(ckpt_th, NULL);
@@ -920,14 +921,14 @@ bool server_run(int port) {
         ngws_stats_t ns; ngws_server_stats(srv, &ns);
         fprintf(stderr, "overload: shed_inline=%llu shed_admission=%llu shed_writer_full=%llu "
                 "closed_conn_limit=%llu closed_total_limit=%llu batch_verified=%llu\n",
-                (unsigned long long) atomic_load(&stat_shed_loop), (unsigned long long) atomic_load(&stat_shed_core),
-                (unsigned long long) atomic_load(&stat_shed_writer), ns.closed_conn_limit, ns.closed_total_limit, (unsigned long long) atomic_load(&stat_preverified));
+                (unsigned long long) ng_atomic_load(&stat_shed_loop), (unsigned long long) ng_atomic_load(&stat_shed_core),
+                (unsigned long long) ng_atomic_load(&stat_shed_writer), ns.closed_conn_limit, ns.closed_total_limit, (unsigned long long) ng_atomic_load(&stat_preverified));
     }
     relay_core_shutdown();
     return ok;
 }
 
 void server_stop(void) {
-    atomic_store(&stopping, true);
+    ng_atomic_store(&stopping, true);
     if (srv) ngws_server_stop(srv);
 }

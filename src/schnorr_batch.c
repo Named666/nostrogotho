@@ -19,7 +19,9 @@
  * keys/R not on the curve. Randomizers are 128-bit (a forged batch passes
  * with probability ~2^-128, the usual batch-verification choice; it halves
  * the a_i * R_i work). Lifted public keys are cached per scratch. */
-#include "../thirdparty/secp256k1/src/secp256k1.c"
+/* Angle brackets: found through -isystem thirdparty/secp256k1, so the
+ * vendored code is compiled as a system header (its warnings are not ours). */
+#include <src/secp256k1.c>
 #include "schnorr_batch.h"
 
 typedef struct { const secp256k1_scalar *sc; const secp256k1_ge *pt; } ng_batch_cb_t;
