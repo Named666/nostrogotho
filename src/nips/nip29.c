@@ -529,7 +529,7 @@ static nip01_process_result_t on_event(relay_conn_t *c, const event_t *ev, stora
         else if (ev->kind == 9021) {
             code_t cm = { g, false };
             each_tag(ev, code_match, &cm);
-            if (member(g, ev->pubkey)) { r = nip_plugin_duplicate("duplicate: already a member"); free(gid); goto stored_dup; }
+            if (member(g, ev->pubkey)) { r = nip_plugin_reject("duplicate: already a member of this group"); free(gid); goto stored_dup; }
             if ((g->flags & F_CLOSED) && !cm.hit) why = "restricted: this group is closed; joining needs an invite code";
             else if (!put_member(g, ev->pubkey, "")) why = "error: out of memory";
             else if (!emit(g, 9000, -1, "h", "", fill_p, ev->pubkey) || !emit_state(g, false, false, true))

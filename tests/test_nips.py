@@ -521,7 +521,7 @@ def nip29():
     evs, _ = a0.req("pu", {"kinds": [9000], "#h": ["pizza"], "#p": [bob.pk]})
     check("relay answers the join with a signed put-user (9000)", len(evs) == 1 and evs[0]["pubkey"] == RELAY_PK, evs)
     m = w.publish(bob.ev("", 9021, [["h", "pizza"], ["code", "abc123"]]))
-    check("join as a member -> duplicate:", m[3].startswith("duplicate:"), m)
+    check("join as a member -> OK false duplicate: (spec: MUST be rejected)", m[2] is False and m[3].startswith("duplicate:"), m)
     msg = bob.ev("member hello", 9, [["h", "pizza"]])
     m = w.publish(msg)
     check("member writes", m[2] is True, m)
