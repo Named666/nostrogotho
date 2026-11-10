@@ -92,6 +92,9 @@ static void vendor_flags(Cmd *cmd)
     opt_flags(cmd);
     nob_cmd_append(cmd, "-std=gnu11");
     defines(cmd);
+    /* sqlite3.c: FTS5 for the NIP-50 search index (part of the vendored
+     * amalgamation; off unless enabled). Inert for the other vendored TUs. */
+    nob_cmd_append(cmd, "-DSQLITE_ENABLE_FTS5=1");
     nob_cmd_append(cmd, "-I"THIRD_PARTY_FOLDER, "-I"THIRD_PARTY_FOLDER"usockets/src",
                    "-I"THIRD_PARTY_FOLDER"secp256k1/include", "-I"THIRD_PARTY_FOLDER"secp256k1",
                    "-I"THIRD_PARTY_FOLDER"secp256k1/src");

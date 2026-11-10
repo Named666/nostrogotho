@@ -9,7 +9,7 @@
 
 ng_limits_t ng_limits = {
     (size_t) 5 << 20, (size_t) 512 << 10, (size_t) 256 << 10, 5000,
-    100, 20, 100, 500, 500, 5000, 10000
+    100, 20, 100, 500, 500, 5000, 10000, 1
 };
 
 void ng_limits_defaults(ng_limits_t *l) {
@@ -24,6 +24,7 @@ void ng_limits_defaults(ng_limits_t *l) {
     l->default_limit = 500;
     l->max_filter_items = 5000;
     l->max_req_authors = 10000;
+    l->search = 1;
 }
 
 void ng_limits_apply(const ng_limits_t *l) {
@@ -125,6 +126,7 @@ static const cfg_key_t keys[] = {
     { "created_at_upper_limit", K_INT, 0, (size_t) 1 << 30,            F(info.created_at_upper_limit) },
     { "max_filter_items",   K_INT,     1, 20000,                       F(limits.max_filter_items) },
     { "max_req_authors",    K_INT,     1, 100000,                      F(limits.max_req_authors) },
+    { "search",             K_INT,     0, 1,                           F(limits.search) },
 };
 #undef F
 

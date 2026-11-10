@@ -301,3 +301,114 @@ char *string_dup(const char *str) {
 void string_free(char *str) {
     free(str);
 }
+
+
+/* ============================================================================
+ * NIP-50 search terms (see nostrogotho.h)
+ * ============================================================================ */
+
+bool ng_search_kind(int kind) {
+    switch (kind) {
+    case 4: case 13: case 1059: case 1060: case 21059: case 22242: case 24133: return false;
+    default: return true;
+    }
+}
+
+static bool term_byte(unsigned char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80;
+}
+
+static bool space_byte(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+/* A whitespace-delimited word "key:value" with a letters/digits/_/- key
+ * and a non-empty value: a NIP-50 extension. */
+static bool extension_word(const char *w, size_t n) {
+    size_t i = 0;
+    while (i < n && (term_byte((unsigned char) w[i]) || w[i] == '_' || w[i] == '-')) i++;
+    return i > 0 && i + 1 < n && w[i] == ':';
+}
+
+/* Call fn(term, len, arg) for each term of search; stops early when fn
+ * returns false. Returns false iff fn did. */
+static bool each_term(const char *search, bool (*fn)(const char *, size_t, void *), void *arg) {
+    const char *p = search ? search : "";
+    while (*p) {
+        while (*p && space_byte((unsigned char) *p)) p++;
+        const char *w = p;
+        while (*p && !space_byte((unsigned char) *p)) p++;
+        size_t n = (size_t) (p - w);
+        if (n == 0 || extension_word(w, n)) continue;
+        for (size_t i = 0; i < n;) {
+            while (i < n && !term_byte((unsigned char) w[i])) i++;
+            size_t s = i;
+            while (i < n && term_byte((unsigned char) w[i])) i++;
+            if (i > s && !fn(w + s, i - s, arg)) return false;
+        }
+    }
+    return true;
+}
+
+static bool stop_at_first(const char *t, size_t n, void *arg) { (void) t; (void) n; *(bool *) arg = true; return false; }
+
+bool ng_search_has_terms(const char *search) {
+    bool any = false;
+    each_term(search, stop_at_first, &any);
+    return any;
+}
+
+typedef struct { char *buf; size_t len, cap; bool oom; } fts_out_t;
+
+static bool fts_append(const char *t, size_t n, void *arg) {
+    fts_out_t *o = (fts_out_t *) arg;
+    size_t need;   /* separator + quotes + term (no '"' inside: not a term byte) + NUL */
+    if (!ng_size_add3(o->len, n, 4, &need)) { o->oom = true; return false; }
+    if (need > o->cap) {
+        size_t cap = o->cap ? o->cap : 64;
+        while (cap < need) { if (!ng_size_mul(cap, 2, &cap)) { o->oom = true; return false; } }
+        char *b = (char *) realloc(o->buf, cap);
+        if (!b) { o->oom = true; return false; }
+        o->buf = b; o->cap = cap;
+    }
+    if (o->len) o->buf[o->len++] = ' ';
+    o->buf[o->len++] = '"';
+    memcpy(o->buf + o->len, t, n); o->len += n;
+    o->buf[o->len++] = '"';
+    o->buf[o->len] = '\0';
+    return true;
+}
+
+char *ng_search_fts_query(const char *search) {
+    fts_out_t o = { NULL, 0, 0, false };
+    each_term(search, fts_append, &o);
+    if (o.oom || o.len == 0) { free(o.buf); return NULL; }
+    return o.buf;
+}
+
+typedef struct { const char *content; size_t len; } live_t;
+
+static unsigned char fold(unsigned char c) { return (c >= 'A' && c <= 'Z') ? (unsigned char) (c + 32) : c; }
+
+/* term occurs in content as a whole term (bounded by non-term bytes). */
+static bool live_term(const char *t, size_t n, void *arg) {
+    const live_t *l = (const live_t *) arg;
+    const unsigned char *c = (const unsigned char *) l->content;
+    for (size_t i = 0; i < l->len;) {
+        while (i < l->len && !term_byte(c[i])) i++;
+        size_t s = i;
+        while (i < l->len && term_byte(c[i])) i++;
+        if (i - s != n) continue;
+        size_t k = 0;
+        while (k < n && fold(c[s + k]) == fold((unsigned char) t[k])) k++;
+        if (k == n) return true;
+    }
+    return false;
+}
+
+bool ng_search_match(const char *search, int kind, const char *content, size_t content_len) {
+    if (!ng_search_has_terms(search)) return true;
+    if (!ng_search_kind(kind)) return false;
+    live_t l = { content ? content : "", content ? content_len : 0 };
+    return each_term(search, live_term, &l);
+}

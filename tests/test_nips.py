@@ -344,6 +344,63 @@ def nip62():
 
 
 @section
+def nip50():
+    """NIP-50 search over the FTS5 index: ranking, limit after ranking, live, backfill (step 7)."""
+    import sqlite3
+    r = Relay(); w = WS(r.port); k = Key(); now = int(time.time())
+    best = k.ev("nostr apps: the best nostr apps for nostr", 1, [], ca=now - 30)
+    ok1 = k.ev("some nostr apps", 1, [], ca=now - 10)
+    other = k.ev("bitcoin only", 1, [], ca=now - 5)
+    art = k.ev("Long form about Nostr APPS", 30023, [["d", "x"]], ca=now - 20)
+    dm = k.ev("nostr apps", 4, [["p", k.pk]], ca=now - 1)
+    for e in (best, ok1, other, art, dm): w.publish(e)
+    evs, end = w.req("s1", {"search": "nostr apps"})
+    ids = [e["id"] for e in evs]
+    check("search returns only matching, non-encrypted events", set(ids) == {best["id"], ok1["id"], art["id"]}, ids)
+    check("best match first (not newest first)", ids and ids[0] == best["id"], ids)
+    evs, _ = w.req("s2", {"search": "nostr apps", "limit": 1})
+    check("limit applies after ranking", [e["id"] for e in evs] == [best["id"]], evs)
+    evs, _ = w.req("s3", {"search": "NOSTR apps", "kinds": [30023]})
+    check("search + kinds, case-insensitive", [e["id"] for e in evs] == [art["id"]], evs)
+    evs, _ = w.req("s4", {"search": "include:spam nostr"})
+    check("unsupported key:value extensions are ignored", len(evs) == 3, len(evs))
+    evs, _ = w.req("s5", {"search": "app"})
+    check("whole-word terms (no substring hits)", evs == [], evs)
+    evs, end = w.req("s6", {"search": "\"; DROP TABLE event; --"})
+    check("FTS syntax in the query is inert", end and end[0] == "EOSE", end)
+    w.send(["COUNT", "c", {"search": "nostr"}]); m = w.recv()
+    check("COUNT with search", m and m[0] == "COUNT" and m[2]["count"] == 3, m)
+    pub = WS(r.port)
+    w.send(["REQ", "live", {"search": "zaps", "since": now - 100}]); w.recv()
+    pub.publish(k.ev("no match here", 1, [])); hit = k.ev("Zaps are great", 1, []); pub.publish(hit)
+    m = w.recv()
+    check("live events matched with the same terms", m and m[0] == "EVENT" and m[2]["id"] == hit["id"], m)
+    _, d = nip11_doc(r)
+    check("NIP-11 declares 50", 50 in d.get("supported_nips", []), d.get("supported_nips"))
+    r.stop()
+    db = sqlite3.connect(r.db)
+    db.executescript("DROP TRIGGER event_fts_insert; DROP TRIGGER event_fts_delete; DROP TABLE event_fts;")
+    db.close()
+    r.start(); w = WS(r.port)
+    evs, _ = w.req("s7", {"search": "nostr apps"})
+    check("search index backfilled for an older database", len(evs) == 3, len(evs))
+    r.stop()
+    off = Relay("search = 0\n", db=r.db); w = WS(off.port)
+    _, end = w.req("s8", {"search": "nostr"})
+    check("search = 0: CLOSED unsupported:", end and end[0] == "CLOSED" and end[2].startswith("unsupported:"), end)
+    _, d = nip11_doc(off)
+    check("search = 0: NIP-11 omits 50", 50 not in d.get("supported_nips", []), d.get("supported_nips"))
+    off.stop()
+    db = sqlite3.connect(r.db)
+    check("search = 0 drops the index", db.execute("SELECT count(*) FROM sqlite_master WHERE name LIKE 'event_fts%'").fetchone()[0] == 0)
+    db.close()
+    r.start(); w = WS(r.port)
+    evs, _ = w.req("s9", {"search": "nostr apps"})
+    check("re-enabled: index rebuilt", len(evs) == 3, len(evs))
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

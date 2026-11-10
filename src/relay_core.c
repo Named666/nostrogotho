@@ -275,7 +275,11 @@ static void remove_subscriptions(relay_conn_t *connection, const char *id) {
     }
 }
 
-static bool matches_filter(const filter_t *filter, const event_t *event, const relay_tags_t *tags) {
+/* live: also apply the NIP-50 search terms. Stored rows skip them: the
+ * FTS5 index already selected the row (and folds more than ASCII), and a
+ * row matched by one filter's SQL is delivered whatever the others say. */
+static bool matches_filter(const filter_t *filter, const event_t *event, const relay_tags_t *tags,
+                           bool live) {
     if (filter->since && event->created_at < filter->since) return false;
     if (filter->until && event->created_at > filter->until) return false;
     if (filter->kinds_count) {
@@ -302,8 +306,8 @@ static bool matches_filter(const filter_t *filter, const event_t *event, const r
         }
         if (!matched) return false;
     }
-    if (filter->search && *filter->search &&
-        !jl_str_contains(jl_str(event->content ? event->content : ""), filter->search)) return false;
+    if (live && filter->search &&
+        !ng_search_match(filter->search, event->kind, event->content, event->content_len)) return false;
     return true;
 }
 
@@ -369,7 +373,7 @@ static void probe(shard_index_t *ix, sub_entry_t *e, const relay_bcast_t *b) {
     for (; e; e = e->next) {
         subscription_t *s = e->sub;
         if (s->gen == ix->gen) continue;
-        if (!matches_filter(e->filter, &b->ev, &b->tags)) continue;
+        if (!matches_filter(e->filter, &b->ev, &b->tags, true)) continue;
         s->gen = ix->gen;                       /* at most once per subscription */
         if (!plugins_can_deliver(&b->ev, s->connection)) continue;
         relay_conn_send_event(s->connection, s->id_json, s->id_json_len, b->body);
@@ -400,7 +404,7 @@ static void query_sender(const char *json, const event_t *event) {
     if (!relay_tags_parse(event, &tags)) return;   /* OOM: tag filters cannot be evaluated; skip */
     bool matched = false;
     for (size_t i = 0; i < query_filters_count && !matched; i++)
-        if (matches_filter(&query_filters[i], event, &tags)) matched = true;
+        if (matches_filter(&query_filters[i], event, &tags, false)) matched = true;
     relay_tags_free(&tags);
     if (matched && plugins_can_deliver(event, query_connection)) {
         size_t n = strlen(json);
@@ -513,6 +517,11 @@ static const char *collect_filters(json_value_t *values, size_t count, filter_t 
     for (size_t i = 0; !why && i < n; i++) {
         if (list[i].type != JSON_TYPE_OBJECT) { why = "invalid: filters must be objects"; break; }
         if (!json_parse_filter_why(list[i].value.string_val, &filters[got], &why)) break;
+        if (!ng_limits.search && filters[got].search) {
+            why = "unsupported: search (NIP-50) is disabled on this relay";
+            got++;
+            break;
+        }
         authors += filters[got++].authors_count;
         if (authors > (size_t) ng_limits.max_req_authors) why = "error: too many authors in one request (see NIP-11 limitation)";
     }

@@ -96,23 +96,6 @@ static void sq_list(sq_query_t *q, const char *item, size_t n) {
     for (size_t i = 0; i < n; i++) { if (i) sq_sql(q, ","); sq_sql(q, item); }
 }
 
-/* "%" + LIKE-escaped pieces + "%" as one owned pattern. */
-static char *like_pattern(const char *fmt_a, const char *a, const char *fmt_b, const char *b,
-                          const char *fmt_end) {
-    char *ea = escape_like(a, strlen(a));
-    char *eb = b ? escape_like(b, strlen(b)) : NULL;
-    char *out = NULL;
-    size_t n;
-    if (ea && (eb || !b) &&
-        ng_size_add3(strlen(fmt_a) + strlen(fmt_end) + 1, strlen(ea),
-                     (b ? strlen(fmt_b) + strlen(eb) : 0), &n) &&
-        (out = (char *) malloc(n)) != NULL) {
-        snprintf(out, n, "%s%s%s%s%s", fmt_a, ea, b ? fmt_b : "", b ? eb : "", fmt_end);
-    }
-    free(ea); free(eb);
-    return out;
-}
-
 bool sq_tag_name_indexable(const char *name) {
     return name && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) &&
            name[1] == '\0';
@@ -175,6 +158,10 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     else if (mode == SQ_MODE_PUBKEYS) sq_sql(q, multi ? "SELECT DISTINCT e.seq, e.pubkey FROM " : "SELECT e.seq, e.pubkey FROM ");
     else sq_sql(q, multi ? "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM " : "SELECT " SQ_EVENT_COLUMNS " FROM ");
     sq_sql(q, tagged ? "tag t JOIN event e ON e.seq = t.ev" : "event e");
+    /* NIP-50: the FTS5 index drives or joins; ranked by bm25 below. */
+    char *fts = f->search && ng_search_has_terms(f->search) ? ng_search_fts_query(f->search) : NULL;
+    if (f->search && !fts && ng_search_has_terms(f->search)) sq_fail(q, NG_E_NOMEM);
+    if (fts) sq_sql(q, " JOIN event_fts ON event_fts.rowid = e.seq");
     const char *sep = " WHERE ";
 #define NEXT() (sq_sql(q, sep), sep = " AND ")
 
@@ -217,13 +204,13 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
         sq_tag_match(q, "x", &f->tags[t]);
         sq_sql(q, " AND x.created_at = e.created_at AND x.ev = e.seq)");
     }
-    if (f->search && f->search[0]) {
-        NEXT();
-        sq_sql(q, "e.content LIKE ? ESCAPE '\\'");
-        sq_owned(q, like_pattern("%", f->search, NULL, NULL, "%"));
-    }
+    if (fts) { NEXT(); sq_sql(q, "event_fts MATCH ?"); sq_owned(q, fts); }
 #undef NEXT
-    if (mode == SQ_MODE_ROWS) {
+    if (mode == SQ_MODE_ROWS && fts) {
+        /* NIP-50: best match first, the limit applies after ranking. */
+        sq_sql(q, " ORDER BY event_fts.rank, e.created_at DESC, e.id ASC LIMIT ?");
+        sq_int(q, limit);
+    } else if (mode == SQ_MODE_ROWS) {
         /* NIP-01: newest first; equal created_at by lowest id first. */
         sq_sql(q, tagged && !multi ? " ORDER BY t.created_at DESC, e.id ASC LIMIT ?"
                                    : " ORDER BY e.created_at DESC, e.id ASC LIMIT ?");

@@ -105,6 +105,8 @@ static void test_limits_and_info(void) {
     CHECK(ng_config_set(&c, "relay_pubkey", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef") == NG_OK && c.info.pubkey[63] == 'f');
     CHECK(ng_config_set(&c, "relay_pubkey", "") == NG_OK && !c.info.pubkey[0]);
     CHECK(ng_config_set(&c, "created_at_upper_limit", "0") == NG_OK && c.info.created_at_upper_limit == 0);
+    CHECK(c.limits.search == 1 && ng_config_set(&c, "search", "0") == NG_OK && c.limits.search == 0);
+    CHECK(ng_config_set(&c, "search", "2") == NG_E_RANGE);
     ng_limits_t l = c.limits; l.max_limit = 100; l.default_limit = 200;
     ng_limits_apply(&l); CHECK(ng_limits.default_limit == 100);    /* default never above max */
     ng_limits_defaults(&l); ng_limits_apply(&l);

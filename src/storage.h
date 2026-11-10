@@ -296,6 +296,9 @@ typedef struct {
 /* Writer durability: true = PRAGMA synchronous=FULL (default), false =
  * NORMAL. Startup only: call before init() and before any thread runs. */
 void storage_set_sync_full(bool full);
+/* NIP-50 full-text index (default on). Off: init drops the index and its
+ * triggers (re-enabling rebuilds it from the stored events). */
+void storage_set_search(bool on);
 
 void storage_context_init_sqlite3(storage_context_t *ctx);
 

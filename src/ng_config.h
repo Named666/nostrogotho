@@ -41,6 +41,7 @@ typedef struct {
     int default_limit;          /* default_limit: stored events when no "limit" */
     int max_filter_items;       /* max_filter_items: ids/authors/kinds/#tag values per filter */
     int max_req_authors;        /* max_req_authors: authors summed over a REQ's filters */
+    int search;                 /* search: 1 = NIP-50 full-text index on (default), 0 = off */
 } ng_limits_t;
 
 /* Relay identity and policy (NIP-11 document, NIP-42 relay tag, NIP-62).

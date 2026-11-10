@@ -103,6 +103,7 @@ static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, cons
         event.tags_json = (char *) sqlite3_column_text(stmt, 4);
         event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
         event.content = (char *) sqlite3_column_text(stmt, 5);
+        event.content_len = event.content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
         snprintf(event.sig, sizeof(event.sig), "%s", (const char *) sqlite3_column_text(stmt, 6));
         json_builder_t *builder = json_builder_scratch(JSON_SCRATCH_QUERY);
         json_builder_append_string(builder, "EVENT");

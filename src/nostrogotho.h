@@ -214,4 +214,31 @@ char *string_dup(const char *str);
  * Args: str - pointer to malloc'd string (NULL-safe) */
 void string_free(char *str);
 
+/* ============================================================================
+ * NIP-50 search
+ *
+ * One tokenizer for both paths: a search string is split on whitespace;
+ * `key:value` words are NIP-50 extensions, none supported, so ignored; the
+ * rest is cut into terms = maximal runs of ASCII letters/digits and bytes
+ * >= 0x80 (SQLite's unicode61 token characters, approximately). A filter
+ * matches when every term occurs as a whole word of the content, ASCII
+ * case-insensitively. Stored events are searched through the FTS5 index
+ * (storage_sqlite.c); live ones with ng_search_match.
+ * ============================================================================ */
+
+/* Kinds whose content is indexed and searchable (not encrypted payloads:
+ * 4, 13, 1059, 21059, 1060, 24133, nor AUTH 22242). */
+bool ng_search_kind(int kind);
+/* SQL fragment equivalent of ng_search_kind on column `kind`. */
+#define NG_SEARCH_KIND_SQL(col) col " NOT IN (4, 13, 1059, 1060, 21059, 22242, 24133)"
+
+/* true when search has at least one term (else the filter has no search
+ * constraint). */
+bool ng_search_has_terms(const char *search);
+/* The FTS5 MATCH expression for search: the terms as quoted strings, ANDed.
+ * malloc'd; NULL on OOM or when there are no terms. */
+char *ng_search_fts_query(const char *search);
+/* Live match of one event (see above; kind checked too). */
+bool ng_search_match(const char *search, int kind, const char *content, size_t content_len);
+
 #endif /* NOSTROGOTHO_H_ */

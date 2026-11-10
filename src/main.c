@@ -47,6 +47,7 @@ static void apply_config(const char *service_url, int min_pow, int lower_limit, 
     if (lower_limit >= 0) info->created_at_lower_limit = lower_limit;
     if (upper_limit >= 0) info->created_at_upper_limit = upper_limit;
     storage_set_sync_full(cfg.db_sync == NG_DB_SYNC_FULL);
+    storage_set_search(cfg.limits.search != 0);
     ng_limits_apply(&cfg.limits);
     ng_relay_info_apply(info);
     server_set_config(&cfg);

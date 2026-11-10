@@ -41,23 +41,33 @@ static void test_count_authors_ids(void) {
     sq_free(&q);
 }
 
-static void test_tags_and_search_escaped(void) {
+static void test_tags_and_search_fts(void) {
     filter_t f; memset(&f, 0, sizeof(f));
     char *el[] = {(char *) "t", (char *) "a%b", (char *) "c_d"};
     tag_t tag = { el, 3, 3 };
     f.tags = &tag; f.tags_count = 1;
-    f.search = (char *) "50%_off\\";
+    f.search = (char *) "Best \"nostr\" apps! include:spam 50%_off";
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 10);
     const char *want = "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
-                       "WHERE t.name = ? AND t.value IN (?,?) AND e.content LIKE ? ESCAPE '\\' "
-                       "ORDER BY e.created_at DESC, e.id ASC LIMIT ?";
-    check("multi-value tag + search SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
+                       "JOIN event_fts ON event_fts.rowid = e.seq "
+                       "WHERE t.name = ? AND t.value IN (?,?) AND event_fts MATCH ? "
+                       "ORDER BY event_fts.rank, e.created_at DESC, e.id ASC LIMIT ?";
+    check("multi-value tag + NIP-50 search SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
     int ok = q.n == 5 && !q.params[0].owned && strcmp(q.params[0].text, "t") == 0 &&
              strcmp(q.params[1].text, "a%b") == 0 && strcmp(q.params[2].text, "c_d") == 0 &&
-             q.params[3].owned && strcmp(q.params[3].text, "%50\\%\\_off\\\\%") == 0;
-    check("tag values exact, search pattern LIKE-escaped", ok, q.n > 3 ? q.params[3].text : NULL);
+             q.params[3].owned && strcmp(q.params[3].text, "\"Best\" \"nostr\" \"apps\" \"50\" \"off\"") == 0;
+    check("tag values exact, FTS5 query quoted terms, extension dropped", ok, q.n > 3 ? q.params[3].text : NULL);
     sq_free(&q);
+    f.search = (char *) "  include:spam !!! ";
+    st = sq_build(&q, &f, false, 10);
+    check("search without terms adds no constraint", st == NG_OK && strstr(q.sql, "event_fts") == NULL, q.sql);
+    sq_free(&q);
+    check("live: whole word, case-insensitive", ng_search_match("NOSTR apps", 1, "best nostr apps.", 16), NULL);
+    check("live: all terms needed", !ng_search_match("nostr zap", 1, "best nostr apps", 15), NULL);
+    check("live: no substring match", !ng_search_match("app", 1, "best nostr apps", 15), NULL);
+    check("live: encrypted kinds never match", !ng_search_match("x", 4, "x", 1), NULL);
+    check("live: no terms matches all", ng_search_match("lang:en", 4, "", 0), NULL);
 }
 
 /* Single-value tag drives the join in index order; a second tag name is an
@@ -141,7 +151,7 @@ static void test_caps(void) {
 int main(void) {
     test_simple_req();
     test_count_authors_ids();
-    test_tags_and_search_escaped();
+    test_tags_and_search_fts();
     test_tag_join();
     test_long_search_not_truncated();
     test_caps();

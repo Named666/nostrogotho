@@ -58,6 +58,48 @@ static char db_dsn[1024];
 static const char *db_sync = "FULL";
 
 void storage_set_sync_full(bool full) { db_sync = full ? "FULL" : "NORMAL"; }
+static bool db_search = true;
+void storage_set_search(bool on) { db_search = on; }
+
+/* NIP-50 full-text index over content (FTS5, external content =
+ * the event table, keyed by seq). Encrypted / AUTH kinds and empty
+ * content are not indexed; insert and delete triggers share that
+ * WHEN so the index never sees a delete for a row it lacks. */
+static const char search_sql[] =
+    "CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5("
+    "    content, content='event', content_rowid='seq',"
+    "    tokenize='unicode61 remove_diacritics 2');"
+    "CREATE TRIGGER IF NOT EXISTS event_fts_insert AFTER INSERT ON event"
+    "  WHEN new.content != '' AND " NG_SEARCH_KIND_SQL("new.kind") " BEGIN"
+    "  INSERT INTO event_fts (rowid, content) VALUES (new.seq, new.content);"
+    "END;"
+    "CREATE TRIGGER IF NOT EXISTS event_fts_delete AFTER DELETE ON event"
+    "  WHEN old.content != '' AND " NG_SEARCH_KIND_SQL("old.kind") " BEGIN"
+    "  INSERT INTO event_fts (event_fts, rowid, content) VALUES ('delete', old.seq, old.content);"
+    "END;";
+
+static bool has_table(const char *name) {
+    sqlite3_stmt *st = NULL;
+    bool yes = false;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT 1 FROM sqlite_master WHERE name = ?", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+/* Run sql on the init connection; on error report it and close. */
+static bool exec_or_close(const char *sql) {
+    char *errmsg = NULL;
+    if (sqlite3_exec(ngdb_conn, sql, NULL, NULL, &errmsg) == SQLITE_OK) return true;
+    fprintf(stderr, "SQL error: %s\n", errmsg ? errmsg : sqlite3_errmsg(ngdb_conn));
+    sqlite3_free(errmsg);
+    sqlite3_close_v2(ngdb_conn);
+    ngdb_conn = NULL;
+    return false;
+}
+
 
 /* ============================================================================
  * Database Initialization and Management
@@ -201,17 +243,18 @@ static bool storage_init_sqlite3(const char *dsn) {
         "CREATE TABLE IF NOT EXISTS vanished ("
         "    pubkey BLOB PRIMARY KEY CHECK (length(pubkey) = 32), until INTEGER NOT NULL"
         ") WITHOUT ROWID;";
-    
-    errmsg = NULL;
-    if (sqlite3_exec(ngdb_conn, schema_sql, NULL, NULL, &errmsg) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", errmsg);
-        sqlite3_free(errmsg);
-        sqlite3_close_v2(ngdb_conn);
-        ngdb_conn = NULL;
-        return false;
-    }
+    /* A database from before the search index: index its events once. */
+    bool had_events = has_table("event"), had_fts = has_table("event_fts");
 
-    
+    if (!exec_or_close(schema_sql)) return false;
+    if (!exec_or_close(db_search ? search_sql :
+                       "DROP TRIGGER IF EXISTS event_fts_insert; DROP TRIGGER IF EXISTS event_fts_delete;"
+                       "DROP TABLE IF EXISTS event_fts;")) return false;
+    if (db_search && had_events && !had_fts) {
+        fprintf(stderr, "storage: building the NIP-50 search index for the stored events...\n");
+        if (!exec_or_close("INSERT INTO event_fts (rowid, content) SELECT seq, content FROM event"
+                           " WHERE content != '' AND " NG_SEARCH_KIND_SQL("kind"))) return false;
+    }
     return true;
 }
 
