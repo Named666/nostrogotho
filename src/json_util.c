@@ -916,7 +916,7 @@ bool json_parse_event_why(const char *json_str, event_t *event, const char **why
         *why = "invalid: kind must be an integer 0-65535";
     else if (!tags.buf || !validate_event_tags(tags))
         *why = "invalid: tags must be an array of arrays of strings";
-    if (*why) {
+    if (*why || !content || !tags.buf) {   /* (the last two imply *why; explicit for analyzers) */
         free(id); free(pubkey); free(content); free(sig);
         return false;
     }
