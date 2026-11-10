@@ -92,7 +92,8 @@ typedef struct {
  *   tags, tags_count       - Tag filters (e.g., tag name "e" with values)
  *   since                  - Minimum created_at (0 = no limit)
  *   until                  - Maximum created_at (0 = no limit)
- *   limit                  - Maximum number of events to return (default 500)
+ *   limit, limit_set       - "limit" (clamped by the relay's max_limit when
+ *                            set; the relay's default_limit otherwise)
  *   search                 - Full-text search in content (optional)
  * 
  * Memory management:
@@ -114,7 +115,8 @@ typedef struct {
     
     time_t since;
     time_t until;
-    int limit;
+    int limit;              /* meaningful only when limit_set */
+    bool limit_set;         /* "limit" present; limit:0 = no stored events */
     
     char *search;
 } filter_t;

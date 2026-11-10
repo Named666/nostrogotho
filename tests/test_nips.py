@@ -48,6 +48,24 @@ def tags():
 
 
 @section
+def limit0():
+    """NIP-01 limit:0 returns no stored events, then live ones (A2)."""
+    r = Relay(); w = WS(r.port); k = Key()
+    old = k.ev("stored"); w.publish(old)
+    evs, end = w.req("z", {"authors": [k.pk], "limit": 0})
+    check("limit:0 -> EOSE with no stored events", evs == [] and end and end[0] == "EOSE", (evs, end))
+    live = k.ev("live"); WS(r.port).publish(live)
+    m = w.recv()
+    check("limit:0 subscription still gets live events", m and m[0] == "EVENT" and m[2]["id"] == live["id"], m)
+    w.send(["CLOSE", "z"])
+    evs, end = w.req("one", {"authors": [k.pk], "limit": 1})
+    check("limit:1 -> newest only", [e["id"] for e in evs] == [live["id"]], evs)
+    evs, end = w.req("c", {"authors": [k.pk], "limit": 0}, verb="COUNT")
+    check("COUNT ignores limit:0", end and end[0] == "COUNT" and end[2]["count"] == 2, end)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

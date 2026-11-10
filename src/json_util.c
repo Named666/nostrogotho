@@ -765,7 +765,6 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
     if (!json_str || !filter) return false;
 
     *filter = (filter_t) {0};
-    filter->limit = 500;
     object = jl_str(json_str);
     if (object.len < 2 || object.buf[0] != '{') return false;
 
@@ -809,7 +808,10 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
             ok = *end == '\0';
             if (ok && strcmp(field, "since") == 0) filter->since = (time_t) number;
             if (ok && strcmp(field, "until") == 0) filter->until = (time_t) number;
-            if (ok && strcmp(field, "limit") == 0 && number >= 0) filter->limit = number > 500 ? 500 : (int) number;
+            if (ok && strcmp(field, "limit") == 0 && number >= 0) {
+                filter->limit = number > INT_MAX ? INT_MAX : (int) number;   /* clamped per query */
+                filter->limit_set = true;
+            }
             else if (strcmp(field, "limit") == 0 && (!ok || number < 0)) ok = false;
             free(number_text);
         } else if (strcmp(field, "search") == 0) {

@@ -143,14 +143,14 @@ static void test_parse_string_array_hex64(void) {
 
 static void test_filter_empty_is_match_all(void) {
     /* NIP-01: a filter object with no keys matches everything. It must parse
-     * successfully and carry the default limit. */
+     * successfully and carry no explicit limit. */
     filter_t filter;
     if (!json_parse_filter("{}", &filter)) {
         printf("FAIL: empty filter should parse as match-all\n");
         return;
     }
-    printf("%s: empty filter parses as match-all (limit=%d)\n",
-           filter.limit == 500 ? "PASS" : "FAIL", filter.limit);
+    printf("%s: empty filter parses as match-all (no limit set, %d)\n",
+           !filter.limit_set ? "PASS" : "FAIL", filter.limit);
     filter_release(&filter);
 }
 

@@ -152,7 +152,10 @@ bool ngdb_send_records(send_records_callback_t sender, const char *sub,
             fprintf(stderr, "Error: filter arrays too large\n");
             return false;
         }
-        int limit = filter->limit > 0 && filter->limit < SR_MAX_LIMIT ? filter->limit : SR_MAX_LIMIT;
+        /* NIP-01: limit:0 asks for no stored events (live events only);
+         * COUNT ignores limit. */
+        if (!do_count && filter->limit_set && filter->limit == 0) continue;
+        int limit = filter->limit_set && filter->limit < SR_MAX_LIMIT ? filter->limit : SR_MAX_LIMIT;
 
         sq_query_t q = {0};
         ng_status_t st = sq_build(&q, filter, do_count, limit);
