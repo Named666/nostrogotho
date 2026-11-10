@@ -47,7 +47,7 @@ async def main():
         tag = os.urandom(6).hex()
         await b.send(json.dumps(["REQ", "live", {"kinds": [1], "#t": [tag]}]))
         m = await recv(b)
-        check("EOSE exact shape", m == ["EOSE", "live"], str(m))
+        check("EOSE exact shape (NIP-67 hints)", m == ["EOSE", "live", ["finish"]], str(m))
 
         ev = mk(sk, 1, "hello " + tag, [["t", tag]])
         await a.send(json.dumps(["EVENT", ev]))
@@ -69,7 +69,7 @@ async def main():
         await a.send(json.dumps(["REQ", "past", {"ids": [ev["id"]]}]))
         m1 = await recv(a); m2 = await recv(a)
         check("REQ returns stored event", m1[0] == "EVENT" and m1[2]["id"] == ev["id"], str(m1)[:60])
-        check("then EOSE", m2 == ["EOSE", "past"], str(m2))
+        check("then EOSE", m2[:2] == ["EOSE", "past"] and "finish" in m2[2], str(m2))
 
         await a.send(json.dumps(["COUNT", "c", {"ids": [ev["id"]]}]))
         m = await until(a, lambda m: m[0] == "COUNT")
@@ -124,7 +124,7 @@ async def main():
         await recv(c)
         await c.send(iter(['["REQ","fr', 'ag",{"kinds":[1],"limit":1}]']))
         got = await until(c, lambda m: m[0] == "EOSE")
-        check("fragmented message reassembled", got == ["EOSE", "frag"], str(got))
+        check("fragmented message reassembled", got[:2] == ["EOSE", "frag"], str(got))
 
     # oversize message closes with 1009 (limit 5 MiB)
     try:
