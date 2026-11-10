@@ -571,6 +571,59 @@ def nip29():
 
 
 @section
+def nip43():
+    """NIP-43 relay membership (step 12)."""
+    import signal, time as _t
+    r = keyed_relay("nip43 = 1\nmembers_only = 1\ninvite_codes = abc, def\n")
+    alice, bob = Key(), Key()
+    _, d = nip11_doc(r)
+    check("NIP-11: 43 declared, restricted_writes", 43 in d.get("supported_nips", []) and
+          d.get("limitation", {}).get("restricted_writes") is True, d)
+    w = WS(r.port)
+    m = w.publish(alice.ev("hello", 1))
+    check("members-only: non-member write -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(alice.ev("", 28934, [["-"], ["claim", "def"]]))
+    check("claim before AUTH -> auth-required: (NIP-70)", m[2] is False and m[3].startswith("auth-required:"), m)
+    w.auth(alice, "ws://127.0.0.1")
+    m = w.publish(alice.ev("", 28934, [["-"], ["claim", "nope"]]))
+    check("bad code -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(alice.ev("", 28934, [["-"], ["claim", "def"]], ca=int(_t.time()) - 1000))
+    check("stale claim -> invalid:", m[2] is False and m[3].startswith("invalid:"), m)
+    m = w.publish(alice.ev("", 28934, [["-"], ["claim", "def"]]))
+    check("valid claim -> OK true info: welcome", m[2] is True and m[3].startswith("info: welcome"), m)
+    evs, _ = w.req("ml", {"kinds": [13534]})
+    check("relay publishes its 13534 member list", len(evs) == 1 and evs[0]["pubkey"] == RELAY_PK and ["-"] in evs[0]["tags"]
+          and ["member", alice.pk] in evs[0]["tags"], evs)
+    evs, _ = w.req("au", {"kinds": [8000], "#p": [alice.pk]})
+    check("relay publishes 8000 add-user", len(evs) == 1 and evs[0]["pubkey"] == RELAY_PK, evs)
+    m = w.publish(alice.ev("member hello", 1))
+    check("member writes", m[2] is True, m)
+    m = w.publish(alice.ev("", 28934, [["-"], ["claim", "abc"]]))
+    check("claim as a member -> OK true duplicate:", m[2] is True and m[3].startswith("duplicate:"), m)
+    m = WS(r.port).publish(bob.ev("", 13534, [["member", bob.pk]]))
+    check("13534 from anyone but the relay -> blocked:", m[2] is False and m[3].startswith("blocked:"), m)
+    r.stop(signal.SIGKILL); r.start()
+    w = WS(r.port)
+    m = w.publish(alice.ev("after restart", 1))
+    check("restart: membership reloaded from 13534", m[2] is True, m)
+    w.auth(alice, "ws://127.0.0.1")
+    m = w.publish(alice.ev("", 28936, [["-"]]))
+    check("leave request", m[2] is True, m)
+    evs, _ = w.req("rm", {"kinds": [8001], "#p": [alice.pk]})
+    evs2, _ = w.req("ml2", {"kinds": [13534]})
+    check("relay publishes 8001 and an updated 13534", len(evs) == 1 and len(evs2) == 1 and
+          ["member", alice.pk] not in evs2[0]["tags"], (evs, evs2))
+    m = w.publish(alice.ev("after leaving", 1))
+    check("after leaving: write -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    r.stop()
+    r = keyed_relay()
+    _, d = nip11_doc(r)
+    m = WS(r.port).publish(alice.ev("open relay", 1))
+    check("nip43 off: 43 not declared, open writes", 43 not in d.get("supported_nips", []) and m[2] is True, m)
+    r.stop()
+
+
+@section
 def nip26():
     """NIP-26 delegation is not supported (deprecated NIP, removed)."""
     r = Relay(); w = WS(r.port); delegator = Key(); delegatee = Key()

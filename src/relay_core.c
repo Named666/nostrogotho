@@ -866,7 +866,7 @@ void relay_core_configure(storage_context_t *storage, const char *relay_url, int
     config.created_at_lower_limit = created_at_lower_limit;
     config.created_at_upper_limit = created_at_upper_limit;
     config.auth_required = false;
-    config.restricted_writes = false;
+    config.restricted_writes = ng_relay_info.nip43 && ng_relay_info.members_only;
     nip_plugins_init(&config);
 }
 
