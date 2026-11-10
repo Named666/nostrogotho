@@ -119,13 +119,13 @@ static void test_caps(void) {
     check("256 ids + 256 authors + 256 kinds compile", st == NG_OK && q.n == 256 * 3 + 1, NULL);
     sq_free(&q);
 
-    static char *vals[257];
+    static char *vals[2049];
     vals[0] = (char *) "p";
-    for (int i = 1; i < 257; i++) vals[i] = H2;
+    for (int i = 1; i < 2049; i++) vals[i] = H2;
     static tag_t tags[16];
-    for (int t = 0; t < 16; t++) { tags[t].elements = vals; tags[t].count = 257; tags[t].capacity = 257; }
+    for (int t = 0; t < 16; t++) { tags[t].elements = vals; tags[t].count = 2049; tags[t].capacity = 2049; }
     memset(&f, 0, sizeof(f));
-    f.tags = tags; f.tags_count = 16;                  /* 16 * 256 * 2 params > SQ_MAX_PARAMS */
+    f.tags = tags; f.tags_count = 16;                  /* 16 * 2048 params > SQ_MAX_PARAMS */
     st = sq_build(&q, &f, false, 500);
     check("past SQ_MAX_PARAMS -> NG_E_TOOBIG", st == NG_E_TOOBIG && q.n <= SQ_MAX_PARAMS && q.len <= SQ_MAX_SQL, NULL);
     sq_free(&q);

@@ -7,6 +7,7 @@
 #include <ctype.h>
 
 #include "json_lite.h"
+#include "ng_config.h"
 #include "relay_conn.h"
 #include "platform/ng_alloc.h"
 #include "platform/ng_platform.h"
@@ -684,6 +685,14 @@ static bool parse_string_array(jstr_t raw, char ***items, size_t *count,
     return true;
 }
 
+/* Number of elements of a JSON array/object token. */
+static size_t jl_count(jstr_t raw) {
+    jstr_t key, value;
+    size_t offset = 0, n = 0;
+    while ((offset = jl_next(raw, offset, &key, &value)) != 0) n++;
+    return n;
+}
+
 static bool append_filter_tag(filter_t *filter, const char *name,
                               jstr_t raw) {
     jstr_t key, value;
@@ -694,7 +703,7 @@ static bool append_filter_tag(filter_t *filter, const char *name,
     /* NIP-01: only single-letter (a-z, A-Z) tags are indexed and queryable. */
     if (filter->tags_count >= MAX_TAG_ELEMENTS || !((name[0] >= 'a' && name[0] <= 'z') ||
         (name[0] >= 'A' && name[0] <= 'Z')) || name[1] != '\0') return false;
-    tag = tag_alloc(MAX_TAG_ELEMENTS);
+    tag = tag_alloc(jl_count(raw) + 1);                /* count <= max_filter_items */
     if (!tag) return false;
     tag->elements[tag->count++] = string_dup(name);
     if (!tag->elements[0]) {
@@ -773,6 +782,13 @@ size_t json_event_tag_count(const event_t *event) {
 }
 
 bool json_parse_filter(const char *json_str, filter_t *filter) {
+    return json_parse_filter_why(json_str, filter, NULL);
+}
+
+bool json_parse_filter_why(const char *json_str, filter_t *filter, const char **why) {
+    const char *dummy;
+    if (!why) why = &dummy;
+    *why = "invalid: malformed filter";
     jstr_t object, key, value;
     size_t offset = 0;
     if (!json_str || !filter) return false;
@@ -786,10 +802,20 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
         char *field = json_raw_string(key);
         ok = field != NULL;
         if (!ok) break;
-        if (strcmp(field, "ids") == 0) {
-            ok = parse_string_array(value, &filter->ids, &filter->ids_count, 256, true);
+        bool listy = strcmp(field, "ids") == 0 || strcmp(field, "authors") == 0 ||
+                     strcmp(field, "kinds") == 0 || field[0] == '#';
+        if (listy && (value.len < 2 || value.buf[0] != '[')) {
+            *why = "invalid: filter values must be arrays";
+            ok = false;
+        } else if (listy && jl_count(value) > (size_t) ng_limits.max_filter_items) {
+            *why = "error: too many values in one filter field (see NIP-11 limitation)";
+            ok = false;
+        } else if (strcmp(field, "ids") == 0) {
+            ok = parse_string_array(value, &filter->ids, &filter->ids_count, (size_t) ng_limits.max_filter_items, true);
+            if (!ok) *why = "invalid: ids must be 64-character lowercase hex";
         } else if (strcmp(field, "authors") == 0) {
-            ok = parse_string_array(value, &filter->authors, &filter->authors_count, 256, true);
+            ok = parse_string_array(value, &filter->authors, &filter->authors_count, (size_t) ng_limits.max_filter_items, true);
+            if (!ok) *why = "invalid: authors must be 64-character lowercase hex";
         } else if (strcmp(field, "kinds") == 0) {
             jstr_t array_key, array_value;
             size_t array_offset = 0;
@@ -798,7 +824,7 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
                 char *number_text, *end = NULL;
                 long kind;
                 int *resized;
-                if (array_key.buf != NULL || filter->kinds_count >= 256) { ok = false; break; }
+                if (array_key.buf != NULL || filter->kinds_count >= (size_t) ng_limits.max_filter_items) { ok = false; break; }
                 number_text = copy_json_value(array_value.buf, array_value.buf + array_value.len);
                 if (!number_text) { ok = false; break; }
                 kind = strtol(number_text, &end, 10);
@@ -809,14 +835,17 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
                 filter->kinds = resized;
                 filter->kinds[filter->kinds_count++] = (int) kind;
             }
+            if (!ok) *why = "invalid: kinds must be integers";
         } else if (field[0] == '#' && field[1] != '\0') {
             ok = append_filter_tag(filter, field + 1, value);
+            if (!ok) *why = field[2] ? "invalid: only single-letter tag filters are supported"
+                                     : "invalid: malformed tag filter (#e/#p values must be 64-character lowercase hex)";
         } else if (strcmp(field, "since") == 0 || strcmp(field, "until") == 0 ||
                    strcmp(field, "limit") == 0) {
             char *number_text = copy_json_value(value.buf, value.buf + value.len);
             char *end = NULL;
             long long number;
-            if (!number_text) { free(field); break; }
+            if (!number_text) { ok = false; free(field); break; }
             number = strtoll(number_text, &end, 10);
             ok = *end == '\0';
             if (ok && strcmp(field, "since") == 0) filter->since = (time_t) number;
@@ -826,6 +855,7 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
                 filter->limit_set = true;
             }
             else if (strcmp(field, "limit") == 0 && (!ok || number < 0)) ok = false;
+            if (!ok) *why = "invalid: since, until and limit must be integers (limit >= 0)";
             free(number_text);
         } else if (strcmp(field, "search") == 0) {
             filter->search = json_raw_string(value);
@@ -834,6 +864,8 @@ bool json_parse_filter(const char *json_str, filter_t *filter) {
         free(field);
         if (!ok) break;
     }
+    if (!ok) filter_release(filter);   /* no partial filter escapes */
+    else *why = NULL;
     return ok;
 }
 

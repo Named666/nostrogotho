@@ -51,7 +51,7 @@ def tags():
 def limit0():
     """NIP-01 limit:0 returns no stored events, then live ones (A2)."""
     r = Relay(); w = WS(r.port); k = Key()
-    old = k.ev("stored"); w.publish(old)
+    old = k.ev("stored", ca=int(time.time()) - 10); w.publish(old)
     evs, end = w.req("z", {"authors": [k.pk], "limit": 0})
     check("limit:0 -> EOSE with no stored events", evs == [] and end and end[0] == "EOSE", (evs, end))
     live = k.ev("live"); WS(r.port).publish(live)
@@ -105,6 +105,46 @@ def limits():
     check("max_subscriptions = 2: third REQ CLOSED", end and end[0] == "CLOSED", end)
     _, end = w.req("a", {"limit": 0})
     check("re-using an open subscription id is allowed", end and end[0] == "EOSE", end)
+    r.stop()
+
+
+@section
+def complexity():
+    """Home-feed sized REQs (A6) and CLOSED reasons over the limits (A5)."""
+    r = Relay(); w = WS(r.port); pub = WS(r.port)
+    follows = [Key() for _ in range(3)] 
+    authors = [Key().pk for _ in range(1997)] + [f.pk for f in follows]
+    for f in follows: pub.publish(f.ev("stored"))
+    evs, end = w.req("home", {"authors": authors, "kinds": [1]})
+    check("2000-author home feed REQ -> stored events + EOSE", len(evs) == 3 and end and end[0] == "EOSE", (len(evs), end))
+    live = follows[-1].ev("live"); pub.publish(live)
+    m = w.recv()
+    check("live event from the 2000th author is delivered (index keeps every author)", m and m[0] == "EVENT" and m[2]["id"] == live["id"], m)
+    w.send(["CLOSE", "home"])
+    ids = [Key().pk for _ in range(99)]
+    late = follows[0].ev("late id"); ids.append(late["id"])
+    _, end = w.req("ids", {"ids": ids})
+    pub.publish(late); m = w.recv()
+    check("live match on the 100th id of an ids filter", m and m[0] == "EVENT" and m[2]["id"] == late["id"], m)
+    w.send(["CLOSE", "ids"])
+    _, end = w.req("big", {"authors": [Key().pk for _ in range(5001)]})
+    check("5001 authors in one filter -> CLOSED error:", end and end[0] == "CLOSED" and end[2].startswith("error:"), end)
+    _, end = w.req("many", *[{"kinds": [i]} for i in range(21)])
+    check("21 filters -> CLOSED error: too many filters", end and end[0] == "CLOSED" and "too many filters" in end[2], end)
+    _, end = w.req("bad", {"kinds": [1]}, {"authors": ["abc"]})
+    check("one malformed filter -> CLOSED invalid: (not silently dropped)", end and end[0] == "CLOSED" and end[2].startswith("invalid:"), end)
+    _, end = w.req("cnt", {"authors": [Key().pk for _ in range(5001)]}, verb="COUNT")
+    check("COUNT over the limits -> CLOSED", end and end[0] == "CLOSED", end)
+    _, end = w.req("", {"kinds": [1]})
+    check("empty subscription id -> CLOSED invalid:", end and end[0] == "CLOSED" and end[2].startswith("invalid:"), end)
+    r.stop()
+    r = Relay("max_req_authors = 10\nmax_filters = 2\nmax_filter_items = 8\n"); w = WS(r.port)
+    _, end = w.req("a", {"authors": [Key().pk for _ in range(6)]}, {"authors": [Key().pk for _ in range(6)]})
+    check("max_req_authors = 10: 2x6 authors -> CLOSED", end and end[0] == "CLOSED" and "authors" in end[2], end)
+    _, end = w.req("b", {"#t": [str(i) for i in range(9)]})
+    check("max_filter_items = 8: 9 tag values -> CLOSED", end and end[0] == "CLOSED", end)
+    _, end = w.req("c", {"#t": [str(i) for i in range(8)]}, {"kinds": [1]})
+    check("within the configured limits -> EOSE", end and end[0] == "EOSE", end)
     r.stop()
 
 

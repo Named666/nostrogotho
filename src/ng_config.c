@@ -88,6 +88,8 @@ static const cfg_key_t keys[] = {
     { "max_subid_length",   K_INT,     1, 1024,                        F(limits.max_subid_length) },
     { "max_limit",          K_INT,     1, 100000,                      F(limits.max_limit) },
     { "default_limit",      K_INT,     1, 100000,                      F(limits.default_limit) },
+    { "max_filter_items",   K_INT,     1, 20000,                       F(limits.max_filter_items) },
+    { "max_req_authors",    K_INT,     1, 100000,                      F(limits.max_req_authors) },
 };
 #undef F
 

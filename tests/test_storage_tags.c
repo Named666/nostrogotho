@@ -39,7 +39,7 @@ static int query(storage_context_t *s, const char *filter_json, bool do_count) {
     if (!json_parse_filter(filter_json, &f)) return -2;
     rows = 0;
     int n = 0;
-    bool ok = s->send_records(count_rows, "s", &f, 1, do_count, &n);
+    bool ok = s->send_records(count_rows, "s", &f, 1, do_count, &n) == NG_OK;
     filter_release(&f);
     return ok ? (do_count ? n : rows) : -1;
 }

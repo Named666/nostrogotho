@@ -1,5 +1,6 @@
 /* storage_read - SQLite read path (see storage_internal.h). Runs on worker
  * threads, each with its own read-only WAL connection. */
+#include "ng_config.h"
 #include "storage_internal.h"
 
 #include <stdio.h>
@@ -84,13 +85,10 @@ event_t *ngdb_get_event_by_id(const char *id) {
     return ev;
 }
 
-/* Per-REQ complexity policy (on top of the per-filter caps of the parser):
- * the total author count bounds the work one REQ/COUNT can put on a
- * worker's connection; each filter compiles to one statement. */
-#define SR_MAX_FILTERS       256
-#define SR_MAX_FILTER_ITEMS  256
-#define SR_MAX_TOTAL_AUTHORS 1024
-#define SR_MAX_LIMIT         500
+/* Per-REQ complexity policy: ng_limits (max_filters, max_filter_items,
+ * max_req_authors, max_limit, default_limit), enforced by the protocol
+ * layer when the REQ is parsed and re-checked here (defense in depth);
+ * each filter compiles to one statement. */
 
 /* Stream one compiled query's rows to sender as ["EVENT", sub, {...}]. */
 static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub, int limit) {
@@ -127,48 +125,39 @@ static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, cons
  * exceeds the complexity policy, a filter cannot be compiled (size caps,
  * OOM) or SQLite fails; details go to stderr.
  */
-bool ngdb_send_records(send_records_callback_t sender, const char *sub,
-                       const filter_t *filters, size_t filters_count,
-                       bool do_count, int *out_count) {
-    if (!ngdb_conn || !sender) return false;
+ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
+                              const filter_t *filters, size_t filters_count,
+                              bool do_count, int *out_count) {
+    if (!ngdb_conn || !sender) return NG_E_INVALID;
     if (do_count && out_count) *out_count = 0;
-    if (filters_count > SR_MAX_FILTERS) {
-        fprintf(stderr, "Error: too many filters (%zu > %d)\n", filters_count, SR_MAX_FILTERS);
-        return false;
-    }
+    const size_t max_items = (size_t) ng_limits.max_filter_items;
+    if (filters_count > (size_t) ng_limits.max_filters) return NG_E_TOOBIG;
     size_t total_authors = 0;
     for (size_t f = 0; f < filters_count; f++) total_authors += filters[f].authors_count;
-    if (total_authors > SR_MAX_TOTAL_AUTHORS) {
-        fprintf(stderr, "Error: REQ too complex (%zu total authors across %zu filters)\n",
-                total_authors, filters_count);
-        return false;
-    }
+    if (total_authors > (size_t) ng_limits.max_req_authors) return NG_E_TOOBIG;
 
     int total_count = 0;
     for (size_t f = 0; f < filters_count; f++) {
         const filter_t *filter = &filters[f];
-        if (filter->ids_count > SR_MAX_FILTER_ITEMS || filter->authors_count > SR_MAX_FILTER_ITEMS ||
-            filter->kinds_count > SR_MAX_FILTER_ITEMS || filter->tags_count > SR_MAX_FILTER_ITEMS) {
-            fprintf(stderr, "Error: filter arrays too large\n");
-            return false;
-        }
+        if (filter->ids_count > max_items || filter->authors_count > max_items ||
+            filter->kinds_count > max_items || filter->tags_count > max_items) return NG_E_TOOBIG;
         /* NIP-01: limit:0 asks for no stored events (live events only);
          * COUNT ignores limit. */
         if (!do_count && filter->limit_set && filter->limit == 0) continue;
-        int limit = filter->limit_set && filter->limit < SR_MAX_LIMIT ? filter->limit : SR_MAX_LIMIT;
+        int limit = !filter->limit_set ? ng_limits.default_limit
+                  : filter->limit < ng_limits.max_limit ? filter->limit : ng_limits.max_limit;
 
         sq_query_t q = {0};
         ng_status_t st = sq_build(&q, filter, do_count, limit);
         if (st != NG_OK) {
-            fprintf(stderr, "Error: filter not compiled: %s\n", ng_status_str(st));
             sq_free(&q);
-            return false;
+            return st;                                  /* TOOBIG: over SQ_MAX_* */
         }
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
             fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
             sq_free(&q);
-            return false;
+            return NG_E_IO;
         }
         for (size_t i = 0; i < q.n; i++) {             /* n <= SQ_MAX_PARAMS */
             int idx = (int) i + 1;
@@ -187,8 +176,8 @@ bool ngdb_send_records(send_records_callback_t sender, const char *sub,
             ok = stream_rows(stmt, sender, sub, limit);
         }
         sqlite3_finalize(stmt);
-        if (!ok) return false;
+        if (!ok) return NG_E_IO;
     }
     if (do_count && out_count) *out_count = total_count;
-    return true;
+    return NG_OK;
 }

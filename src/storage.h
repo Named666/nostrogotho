@@ -2,6 +2,7 @@
 #define STORAGE_H_
 
 #include "nostrogotho.h"
+#include "ng_status.h"
 #include <stdbool.h>
 
 /* ============================================================================
@@ -228,7 +229,9 @@ typedef struct {
      *   out_count - when do_count is true, receives the aggregated count.
      *               May be NULL when do_count is false.
      * 
-     * Returns: true on success, false on database error
+     * Returns: NG_OK; NG_E_TOOBIG when the request exceeds the complexity
+     * limits (ng_limits, SQ_MAX_*); NG_E_IO on a database error. Rows of
+     * earlier filters may already have been streamed on failure.
      * 
      * Behavior:
      *   - Multiple filters are OR'd (send if ANY filter matches)
@@ -236,7 +239,7 @@ typedef struct {
      *   - If do_count is true, reports the count via out_count instead of
      *     emitting a COUNT response (NIP-45)
      */
-    bool (*send_records)(send_records_callback_t sender, const char *sub,
+    ng_status_t (*send_records)(send_records_callback_t sender, const char *sub,
                         const filter_t *filters, size_t filters_count,
                         bool do_count, int *out_count);
 

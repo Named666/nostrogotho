@@ -21,8 +21,8 @@
 
 /* Policy caps for one compiled filter. SQ_MAX_PARAMS stays well below
  * SQLite's SQLITE_MAX_VARIABLE_NUMBER (32766 in the vendored build). */
-#define SQ_MAX_SQL    (256u * 1024u)
-#define SQ_MAX_PARAMS 4096u
+#define SQ_MAX_SQL    (1024u * 1024u)
+#define SQ_MAX_PARAMS 30000u   /* below SQLite's 32766 host parameters */
 
 typedef enum { SQ_INT, SQ_TEXT } sq_type_t;
 

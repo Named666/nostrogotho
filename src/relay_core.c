@@ -143,30 +143,28 @@ static bool all_len(char **v, size_t n, size_t want) {
     return n > 0;
 }
 
-/* Number of index keys a filter is stored under, and the keys. */
-static size_t filter_keys(const filter_t *f, uint64_t *keys, size_t cap) {
+/* Number of index keys a filter is stored under; the keys are written to
+ * keys when it is not NULL. Every value of the chosen field is a key (a
+ * filter must be found by any of its values), 0 = wildcard. */
+static size_t filter_keys(const filter_t *f, uint64_t *keys) {
     size_t n = 0;
     if (f->ids_count && all_len(f->ids, f->ids_count, 64)) {
-        for (size_t i = 0; i < f->ids_count && n < cap; i++) keys[n++] = key_hash('i', f->ids[i], 64);
+        for (size_t i = 0; i < f->ids_count; i++, n++) if (keys) keys[n] = key_hash('i', f->ids[i], 64);
         return n;
     }
     if (f->authors_count && all_len(f->authors, f->authors_count, 64)) {
-        for (size_t i = 0; i < f->authors_count && n < cap; i++) keys[n++] = key_hash('a', f->authors[i], 64);
+        for (size_t i = 0; i < f->authors_count; i++, n++) if (keys) keys[n] = key_hash('a', f->authors[i], 64);
         return n;
     }
     for (size_t t = 0; t < f->tags_count; t++) {
         const tag_t *tg = &f->tags[t];
         if (tg->count < 2 || strlen(tg->elements[0]) != 1) continue;
-        if (tg->count - 1 > cap) break;
-        for (size_t v = 1; v < tg->count; v++)
-            keys[n++] = key_hash((char) (tg->elements[0][0] | 0x80), tg->elements[v], strlen(tg->elements[v]));
+        for (size_t v = 1; v < tg->count; v++, n++)
+            if (keys) keys[n] = key_hash((char) (tg->elements[0][0] | 0x80), tg->elements[v], strlen(tg->elements[v]));
         return n;
     }
-    if (f->kinds_count && f->kinds_count <= cap) {
-        for (size_t i = 0; i < f->kinds_count; i++) keys[n++] = kind_hash(f->kinds[i]);
-        return n;
-    }
-    return 0;   /* wildcard */
+    for (size_t i = 0; i < f->kinds_count; i++, n++) if (keys) keys[n] = kind_hash(f->kinds[i]);
+    return n;
 }
 
 /* Index s under its filters' keys. false on OOM: s is then not indexed
@@ -174,22 +172,26 @@ static size_t filter_keys(const filter_t *f, uint64_t *keys, size_t cap) {
 static bool index_add(int shard, subscription_t *s) {
     shard_index_t *ix = index_of(shard);
     if (!ix) return false;
-    uint64_t keys[NG_MAX_FILTERS][64]; size_t nk[NG_MAX_FILTERS]; size_t total = 0;
-    for (size_t i = 0; i < s->filters_count && i < NG_MAX_FILTERS; i++) {
-        nk[i] = filter_keys(&s->filters[i], keys[i], 64);
-        total += nk[i] ? nk[i] : 1;
+    size_t total = 0, most = 0;
+    for (size_t i = 0; i < s->filters_count; i++) {
+        size_t nk = filter_keys(&s->filters[i], NULL);
+        if (nk > most) most = nk;
+        if (!ng_size_add(total, nk ? nk : 1, &total)) return false;
     }
-    s->entries = (sub_entry_t *) calloc(total ? total : 1, sizeof(sub_entry_t));
-    if (!s->entries) return false;
+    uint64_t *keys = (uint64_t *) ng_malloc_array(most ? most : 1, sizeof(uint64_t));
+    s->entries = keys ? (sub_entry_t *) calloc(total ? total : 1, sizeof(sub_entry_t)) : NULL;
+    if (!s->entries) { free(keys); return false; }
     size_t e = 0;
-    for (size_t i = 0; i < s->filters_count && i < NG_MAX_FILTERS; i++) {
-        if (!nk[i]) { s->entries[e].sub = s; s->entries[e].filter = &s->filters[i]; entry_link(&ix->wild, &s->entries[e]); e++; continue; }
-        for (size_t k = 0; k < nk[i]; k++) {
+    for (size_t i = 0; i < s->filters_count; i++) {
+        size_t nk = filter_keys(&s->filters[i], keys);
+        if (!nk) { s->entries[e].sub = s; s->entries[e].filter = &s->filters[i]; entry_link(&ix->wild, &s->entries[e]); e++; continue; }
+        for (size_t k = 0; k < nk; k++) {
             s->entries[e].sub = s; s->entries[e].filter = &s->filters[i];
-            entry_link(&ix->buckets[keys[i][k] & (IDX_BUCKETS - 1)], &s->entries[e]);
+            entry_link(&ix->buckets[keys[k] & (IDX_BUCKETS - 1)], &s->entries[e]);
             e++;
         }
     }
+    free(keys);
     s->entries_count = e;
     ix->n_subs++;
     return true;
@@ -393,7 +395,10 @@ static void query_sender(const char *json, const event_t *event) {
     }
 }
 
-static void query_events(relay_conn_t *connection, const char *sub,
+/* Stored-event phase of a REQ/COUNT. false when the query was refused or
+ * failed: CLOSED (with the NIP-01 reason) was sent instead of EOSE/COUNT
+ * and the caller must drop the subscription. */
+static bool query_events(relay_conn_t *connection, const char *sub,
                          filter_t *filters, size_t count, bool do_count) {
     int total_count = 0;
     query_connection = connection;
@@ -401,11 +406,18 @@ static void query_events(relay_conn_t *connection, const char *sub,
     query_render_failed = false;
     query_filters = filters;
     query_filters_count = count;
-    storage_ctx->send_records(query_sender, sub, filters, count, do_count,
-                              &total_count);
+    ng_status_t st = storage_ctx->send_records(query_sender, sub, filters, count, do_count,
+                                               &total_count);
     query_connection = NULL;
     query_filters = NULL;
     query_filters_count = 0;
+    if (st != NG_OK) {
+        nip_plugin_send_status(connection, "CLOSED", sub, false,
+            st == NG_E_TOOBIG ? "error: query too complex (see NIP-11 limitation)"
+          : st == NG_E_NOMEM ? "error: server unavailable (out of memory)"
+                             : "error: query failed");
+        return false;
+    }
 
     char *response = NULL;
     if (do_count) {
@@ -446,35 +458,42 @@ static void query_events(relay_conn_t *connection, const char *sub,
     } else {
         nip_plugin_send_json(connection, "[\"NOTICE\",\"error: could not build query response (out of memory)\"]");
     }
+    return true;
 }
 
-static bool collect_filters(json_value_t *values, size_t count, filter_t **out, size_t *out_count) {
-    filter_t *filters = NULL;
-    size_t filter_capacity = 0;
-    /* Accepted layouts:
-     *   ["REQ"/"COUNT", id, {filter1}, {filter2}, ...]   (standard)
-     *   ["REQ"/"COUNT", id, [{filter1}, {filter2}]]      (wrapped array) */
-    if (count >= 3 && values[2].type == JSON_TYPE_ARRAY) {
-        json_value_t inner[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
-        size_t inner_count = json_array_parse(values[2].value.string_val, inner, MAX_JSON_ARRAY_ELEMENTS);
-        filter_capacity = inner_count;
-        filters = (filter_t *) calloc(filter_capacity ? filter_capacity : 1, sizeof(*filters));
-        if (!filters) return false;
-        for (size_t i = 0; i < inner_count && *out_count < (size_t) ng_limits.max_filters; i++) {
-            if (inner[i].type == JSON_TYPE_OBJECT && json_parse_filter(inner[i].value.string_val, &filters[*out_count])) (*out_count)++;
-        }
-        json_array_free(inner, inner_count);
-    } else {
-        filter_capacity = count > 2 ? count - 2 : 0;
-        filters = (filter_t *) calloc(filter_capacity ? filter_capacity : 1, sizeof(*filters));
-        if (!filters) return false;
-        for (size_t i = 2; i < count && *out_count < (size_t) ng_limits.max_filters; i++) {
-            if (values[i].type == JSON_TYPE_OBJECT && json_parse_filter(values[i].value.string_val, &filters[*out_count])) (*out_count)++;
-        }
+static void release_filters(filter_t *filters, size_t n);
+
+/* Parse a REQ/COUNT's filters. Accepted layouts:
+ *   ["REQ"/"COUNT", id, {filter1}, {filter2}, ...]   (standard)
+ *   ["REQ"/"COUNT", id, [{filter1}, {filter2}]]      (wrapped array)
+ * NULL on success (*out owns *out_count >= 1 filters), else the NIP-01
+ * reason for CLOSED: one bad filter or a breached complexity limit rejects
+ * the whole request (never a silently narrowed subscription). */
+static const char *collect_filters(json_value_t *values, size_t count, filter_t **out, size_t *out_count) {
+    json_value_t inner[MAX_JSON_ARRAY_ELEMENTS] = {{0}};
+    size_t inner_count = 0;
+    json_value_t *list = values + 2;
+    size_t n = count > 2 ? count - 2 : 0;
+    if (count == 3 && values[2].type == JSON_TYPE_ARRAY) {
+        inner_count = json_array_parse(values[2].value.string_val, inner, MAX_JSON_ARRAY_ELEMENTS);
+        list = inner; n = inner_count;
     }
-    if (*out_count == 0) { free(filters); return false; }
-    *out = filters;
-    return true;
+    const char *why = NULL;
+    filter_t *filters = NULL;
+    size_t got = 0, authors = 0;
+    if (n == 0) why = "invalid: no filters";
+    else if (n > (size_t) ng_limits.max_filters) why = "error: too many filters (see NIP-11 limitation)";
+    else if (!(filters = (filter_t *) calloc(n, sizeof(*filters)))) why = "error: server unavailable";
+    for (size_t i = 0; !why && i < n; i++) {
+        if (list[i].type != JSON_TYPE_OBJECT) { why = "invalid: filters must be objects"; break; }
+        if (!json_parse_filter_why(list[i].value.string_val, &filters[got], &why)) break;
+        authors += filters[got++].authors_count;
+        if (authors > (size_t) ng_limits.max_req_authors) why = "error: too many authors in one request (see NIP-11 limitation)";
+    }
+    if (inner_count) json_array_free(inner, inner_count);
+    if (why) { if (filters) release_filters(filters, got); return why; }
+    *out = filters; *out_count = got;
+    return NULL;
 }
 
 static void release_filters(filter_t *filters, size_t n) {
@@ -486,16 +505,18 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     const char *sub = json_array_get_string(values, count, 1);
     filter_t *filters = NULL;
     size_t filter_count = 0;
-    if (!sub || strlen(sub) > (size_t) ng_limits.max_subid_length || count < 3 || !collect_filters(values, count, &filters, &filter_count)) {
-        nip_plugin_send_status(connection, "CLOSED", sub, false, "error: invalid filter"); return;
+    if (!sub || !*sub || strlen(sub) > (size_t) ng_limits.max_subid_length) {
+        nip_plugin_send_status(connection, "CLOSED", sub, false, "invalid: subscription id must be 1 to max_subid_length characters"); return;
     }
+    const char *bad = count < 3 ? "invalid: no filters" : collect_filters(values, count, &filters, &filter_count);
+    if (bad) { nip_plugin_send_status(connection, "CLOSED", sub, false, bad); return; }
     const char *why = NULL;
     if (admission && !admission(connection, RELAY_ADMIT_REQ, &why)) {
         release_filters(filters, filter_count);
         nip_plugin_send_status(connection, "CLOSED", sub, false, why); return;
     }
     if (do_count) {
-        query_events(connection, sub, filters, filter_count, true);
+        (void) query_events(connection, sub, filters, filter_count, true);
         release_filters(filters, filter_count);
         return;
     }
@@ -537,7 +558,8 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     s->shard_next = shard_subs[shard];
     if (s->shard_next) s->shard_next->shard_prev = s;
     shard_subs[shard] = s;
-    query_events(connection, sub, filters, filter_count, false);
+    if (!query_events(connection, sub, filters, filter_count, false))
+        remove_subscriptions(connection, sub);          /* CLOSED was sent */
 }
 
 nip01_process_result_t relay_core_commit_event(relay_conn_t *conn, const event_t *event) {

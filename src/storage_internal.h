@@ -53,7 +53,7 @@ void ngdb_write_scratch_free(void);
 
 /* storage_read.c */
 event_t *ngdb_get_event_by_id(const char *id);
-bool ngdb_send_records(send_records_callback_t sender, const char *sub,
+ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
                        const filter_t *filters, size_t filters_count,
                        bool do_count, int *out_count);
 

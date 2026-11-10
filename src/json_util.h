@@ -280,6 +280,9 @@ size_t json_builder_length(const json_builder_t *builder);
  *       freeing via filter_free()
  */
 bool json_parse_filter(const char *json_str, filter_t *filter);
+/* As json_parse_filter; on failure *why (if why) is a static NIP-01
+ * machine-readable reason ("invalid: ..." or "error: ..."). */
+bool json_parse_filter_why(const char *json_str, filter_t *filter, const char **why);
 
 /* Parse event object from JSON
  * 
