@@ -1,0 +1,30 @@
+r1 ev400k_uniq.txt w0 base msgs_s=31510 lat_us_p50=31457  p99=46137  cpu: 0% 17% 17% 16% 17% 17% 17% 17% 17% 76% 4% 1% 1% 
+r1 ev400k_uniq.txt w0 off msgs_s=32474 lat_us_p50=29622  p99=83886  cpu: 0% 33% 33% 33% 33% 71% 6% 0% 1% 0% 0% 
+r1 ev400k_uniq.txt w0 on msgs_s=32446 lat_us_p50=29622  p99=87032  cpu: 0% 28% 28% 28% 28% 70% 7% 0% 0% 1% 1% 
+r1 ev400k_uniq.txt w1 base msgs_s=0  cpu: 0% 
+r1 ev400k_uniq.txt w1 off msgs_s=23418 lat_us_p50=41943  p99=95420  cpu: 0% 97% 67% 5% 1% 1% 1% 1% 
+r1 ev400k_uniq.txt w1 on msgs_s=29994 lat_us_p50=33030  p99=61342  cpu: 0% 94% 76% 2% 0% 1% 1% 0% 
+r1 ev1500k.txt w1 base msgs_s=0  cpu: 0% 
+r1 ev1500k.txt w1 off msgs_s=23128 lat_us_p50=42992  p99=66585  cpu: 0% 100% 70% 2% 1% 1% 1% 1% 
+r1 ev1500k.txt w1 on msgs_s=33994 lat_us_p50=29098  p99=59769  cpu: 0% 95% 74% 4% 1% 1% 0% 1% 
+r2 ev400k_uniq.txt w0 base msgs_s=30029 lat_us_p50=32244  p99=69206  cpu: 0% 17% 18% 18% 18% 18% 18% 17% 18% 78% 7% 1% 2% 
+r2 ev400k_uniq.txt w0 off msgs_s=31853 lat_us_p50=31195  p99=44040  cpu: 0% 34% 34% 34% 34% 80% 3% 0% 1% 1% 0% 
+r2 ev400k_uniq.txt w0 on msgs_s=31769 lat_us_p50=31719  p99=45613  cpu: 0% 31% 31% 30% 31% 80% 2% 1% 0% 1% 1% 
+r2 ev400k_uniq.txt w1 base msgs_s=0  cpu: 0% 
+r2 ev400k_uniq.txt w1 off msgs_s=22354 lat_us_p50=43516  p99=95420  cpu: 0% 98% 67% 5% 1% 1% 1% 1% 
+r2 ev400k_uniq.txt w1 on msgs_s=24851 lat_us_p50=38273  p99=81789  cpu: 0% 93% 71% 5% 0% 1% 0% 0% 
+r2 ev1500k.txt w1 base msgs_s=0  cpu: 0% 
+r2 ev1500k.txt w1 off msgs_s=22807 lat_us_p50=43516  p99=74449  cpu: 0% 99% 72% 3% 2% 1% 1% 1% 
+r2 ev1500k.txt w1 on msgs_s=29974 lat_us_p50=31719  p99=71303  cpu: 0% 96% 64% 5% 1% 0% 1% 0% 
+r1 ev1500k.txt w1 base(NG_WORKERS=1) msgs_s=23754 lat_us_p50=42467  p99=58720  cpu: 0% 99% 73% 4% 2% 2% 
+r1 ev400k_uniq.txt w1 base(NG_WORKERS=1) msgs_s=24374 lat_us_p50=40894  p99=71303  cpu: 0% 99% 66% 3% 3% 2% 
+r2 ev1500k.txt w1 base(NG_WORKERS=1) msgs_s=23017 lat_us_p50=44040  p99=56623  cpu: 0% 100% 72% 1% 2% 3% 
+r2 ev400k_uniq.txt w1 base(NG_WORKERS=1) msgs_s=24138 lat_us_p50=41419  p99=65012  cpu: 0% 99% 72% 5% 3% 2% 
+r3 ev1500k.txt w1 batch=0 msgs_s=23724 lat_us_p50=41943  p99=83886  cpu: 0% 98% 68% 3% 2% 1% 1% 1% 
+r3 ev1500k.txt w1 batch=1 msgs_s=34443 lat_us_p50=28312  p99=55050  cpu: 0% 96% 71% 5% 1% 1% 1% 1% 
+r3 ev400k_uniq.txt w1 batch=0 msgs_s=24229 lat_us_p50=40894  p99=75497  cpu: 0% 98% 65% 4% 1% 2% 1% 1% 
+r3 ev400k_uniq.txt w1 batch=1 msgs_s=28763 lat_us_p50=33292  p99=69206  cpu: 0% 87% 76% 6% 0% 1% 0% 0% 
+r4 ev1500k.txt w1 batch=0 msgs_s=23527 lat_us_p50=42467  p99=92275  cpu: 0% 100% 70% 2% 2% 1% 1% 1% 
+r4 ev1500k.txt w1 batch=1 msgs_s=31970 lat_us_p50=30409  p99=63439  cpu: 0% 96% 75% 5% 1% 1% 0% 0% 
+r4 ev400k_uniq.txt w1 batch=0 msgs_s=22362 lat_us_p50=44564  p99=69206  cpu: 0% 99% 71% 5% 2% 2% 1% 1% 
+r4 ev400k_uniq.txt w1 batch=1 msgs_s=26280 lat_us_p50=36176  p99=84935  cpu: 0% 94% 72% 4% 1% 1% 0% 1% 

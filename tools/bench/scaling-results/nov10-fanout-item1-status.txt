@@ -1,0 +1,2 @@
+diag-fanout-item1-r4000 error= None
+diag-fanout-item1-r8000 error= None

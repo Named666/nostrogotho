@@ -1,0 +1,7 @@
+diag-fanout-base-r1000 error= None
+diag-fanout-base-r2000 error= None
+diag-fanout-base-r4000 error= 2 GiB memory headroom stop
+diag-fanout-base20k-r2000 error= None
+diag-fanout-base20k-r4000 error= None
+diag-fanout-base20k-r1000 error= None
+diag-fanout-base20k-r8000 error= 2 GiB memory headroom stop

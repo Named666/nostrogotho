@@ -1,0 +1,54 @@
+### r1 base
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=167782 msgs_s=27942 MB_s=0.0 ok=167782 rejected=0 lat_us_p50=35652 p99=52953 p999=117441 max=122185 srv_rss_base_mb=6.8 srv_rss_conn_mb=7.5 bytes_per_conn=10368 srv_rss_end_mb=109.6 srv_cpu_pct=225 client_cpu_pct=6
+0% 17% 17% 16% 17% 16% 16% 17% 17% 84% 5% 1% 1%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.42s commit 5.05s post 0.54s
+writer: 209114 events in 409 batches (avg 511.3)
+
+### r1 off
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=209475 msgs_s=34886 MB_s=0.0 ok=209475 rejected=0 lat_us_p50=27263 p99=52953 p999=111149 max=111642 srv_rss_base_mb=6.0 srv_rss_conn_mb=6.5 bytes_per_conn=7552 srv_rss_end_mb=128.1 srv_cpu_pct=252 client_cpu_pct=8
+0% 37% 36% 36% 36% 76% 5% 1% 1% 1% 0%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.73s commit 4.71s post 0.57s
+writer: 259181 events in 539 batches (avg 480.9)
+batch_verified=0 
+### r1 on
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=203204 msgs_s=33840 MB_s=0.0 ok=203204 rejected=0 lat_us_p50=27525 p99=55575 p999=62915 max=66823 srv_rss_base_mb=6.1 srv_rss_conn_mb=6.6 bytes_per_conn=7168 srv_rss_end_mb=131.7 srv_cpu_pct=208 client_cpu_pct=7
+0% 31% 31% 32% 31% 77% 4% 1% 1% 0% 0%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.52s commit 4.98s post 0.53s
+writer: 257081 events in 522 batches (avg 492.5)
+batch_verified=257033 
+### r2 base
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=212611 msgs_s=35411 MB_s=0.0 ok=212611 rejected=0 lat_us_p50=25690 p99=50856 p999=104858 max=105465 srv_rss_base_mb=6.7 srv_rss_conn_mb=7.3 bytes_per_conn=10624 srv_rss_end_mb=128.4 srv_cpu_pct=259 client_cpu_pct=8
+0% 21% 20% 20% 21% 21% 20% 21% 21% 79% 5% 1% 1%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.81s commit 4.49s post 0.70s
+writer: 260471 events in 515 batches (avg 505.8)
+
+### r2 off
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=240315 msgs_s=40021 MB_s=0.0 ok=240315 rejected=0 lat_us_p50=24117 p99=44040 p999=68157 max=85325 srv_rss_base_mb=6.2 srv_rss_conn_mb=6.7 bytes_per_conn=7360 srv_rss_end_mb=139.3 srv_cpu_pct=271 client_cpu_pct=8
+0% 43% 46% 44% 43% 79% 5% 1% 1% 1% 1%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.71s commit 4.65s post 0.63s
+writer: 289685 events in 587 batches (avg 493.5)
+batch_verified=0 
+### r2 on
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=235218 msgs_s=39176 MB_s=0.0 ok=235218 rejected=0 lat_us_p50=24642 p99=46137 p999=90178 max=97850 srv_rss_base_mb=6.2 srv_rss_conn_mb=6.6 bytes_per_conn=7168 srv_rss_end_mb=142.1 srv_cpu_pct=233 client_cpu_pct=8
+0% 35% 37% 35% 34% 79% 6% 0% 1% 1% 1%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.80s commit 4.58s post 0.61s
+writer: 285456 events in 605 batches (avg 471.8)
+batch_verified=285440 
+### r3 base
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=211346 msgs_s=35202 MB_s=0.0 ok=211346 rejected=0 lat_us_p50=28312 p99=42992 p999=93323 max=96611 srv_rss_base_mb=6.7 srv_rss_conn_mb=7.4 bytes_per_conn=11776 srv_rss_end_mb=128.7 srv_cpu_pct=266 client_cpu_pct=8
+0% 22% 22% 23% 22% 23% 22% 22% 22% 77% 4% 2% 2%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.80s commit 4.59s post 0.62s
+writer: 257772 events in 522 batches (avg 493.8)
+
+### r3 off
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=221562 msgs_s=36902 MB_s=0.0 ok=221562 rejected=0 lat_us_p50=25690 p99=62915 p999=114295 max=126359 srv_rss_base_mb=6.2 srv_rss_conn_mb=6.6 bytes_per_conn=7040 srv_rss_end_mb=131.6 srv_cpu_pct=263 client_cpu_pct=8
+0% 44% 45% 44% 43% 77% 3% 0% 1% 1% 1%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.71s commit 4.76s post 0.58s
+writer: 266898 events in 552 batches (avg 483.5)
+batch_verified=0 
+### r3 on
+mode=nostr-pub conns=64 open=64 failed=0 threads=4 src_ips=1 connect_s=0.02 connected=64 dropped=0 secs=6.00 msgs=239794 msgs_s=39939 MB_s=0.0 ok=239794 rejected=0 lat_us_p50=24117 p99=54002 p999=84935 max=94102 srv_rss_base_mb=6.1 srv_rss_conn_mb=6.6 bytes_per_conn=8832 srv_rss_end_mb=142.6 srv_cpu_pct=237 client_cpu_pct=8
+0% 34% 37% 36% 35% 77% 5% 1% 1% 1% 1%  <- per-thread CPU (main, workers..., writer, io)
+writer: dispatch 1.82s commit 4.57s post 0.61s
+writer: 289336 events in 597 batches (avg 484.6)
+batch_verified=289323 

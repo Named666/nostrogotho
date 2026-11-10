@@ -200,12 +200,12 @@ saturated at the probe's offered rate.
 | Host memory safety | 250k projected to leave 883 MiB, policy requires 2 GiB | Dedicated larger relay host; put generators on separate hosts; use live RSS + kernel/cgroup tracking |
 | Process descriptors | hard 524,288; raising refused | Admin/systemd/container limits and `fs.nr_open` above intended per-process total; split acceptors if necessary |
 | Source port space | 28,232 tuples/IP here, not an assumed 64k | Existing multi-source bind (`-i`); ~72 source IPs for 1M at <=15k/IP; multiple generator machines/addresses |
-| Accept surge | vendored uSockets `listen(...,512)`; sysctl cap 4096 | Expose/increase actual listen backlog as well as somaxconn; pace reconnect storms, test burst acceptance; sysctl alone does not remove 512 |
+| Accept surge | was vendored uSockets `listen(...,512)`; sysctl cap 4096 | **Done (a9f71c9):** `listen_backlog` config, default = `net.core.somaxconn`; still pace reconnect storms |
 | TCP payload memory | tcp_mem high ~1.46 GiB on this host; defaults permit large autotuned per-socket buffers | Dedicated-host sizing; test modest buffers with realistic RTT/BDP, monitor TCP memory pressure/drops; idle socket structs cannot be tuned away with SO_RCVBUF |
 | Full-sync serialized write path | COMMIT 6.44 s of 8.10 s writer timed work | Low-latency durable NVMe, batching measurements under a latency SLO, keep one writer |
-| Verification CPU | secp256k1 arithmetic dominates sampled publish CPU | Scale validation workers/cores, keep early dedupe; never skip signature checks |
-| Fanout amplification | ~1M deliveries/s pegs both I/O cores (~97%, mostly system CPU); output/refcount work scales with recipients | Shard fanout/connection ownership; investigate batched refs; benchmark popular broad subscriptions |
-| Slow readers / overload (code risk, not induced) | 32 MiB per-socket output cutoff; writer/worker job queues lack a global admission budget | Add per-connection/per-identity quotas, small configurable backlog budgets, aggregate queue limits and load shedding before production; 1M × 32 MiB is untenable |
+| Verification CPU | secp256k1 arithmetic dominates sampled publish CPU | **Done (5e22ba3):** verification runs on all workers, with BIP-340 batch verification per job list; still never skips checks |
+| Fanout amplification | ~1M deliveries/s pegs both I/O cores (~97%, mostly system CPU); output/refcount work scales with recipients | **Done (a89b4b8):** `io_threads` default = cores, no per-delivery refcount atomics; kernel send cost remains the floor |
+| Slow readers / overload | was: 32 MiB per-socket cutoff, unbounded worker/writer queues | **Done (08c7170):** per-connection and process budgets, slowest-reader shedding, bounded queues, CLOSED/OK false "error: ..."; per-identity quotas still open |
 | Expensive REQ / database growth (not tested) | Readers execute queries on worker threads; tiny fresh DB in this test | Query time/row/result-byte limits; mature-database read load and long WAL/checkpoint tests |
 | Keepalive timer sweep / reconnect herd | default 120 s ping timeout; timer walks sockets | Test multiple ping cycles, jitter reconnection/keepalive scheduling, watch event-loop lag |
 | Profiling visibility | no perf; slabinfo denied | Repeat on staging host with perf stat/record, scheduler/lock and syscall tracing; separate kernel time and TCP allocation classes |
@@ -222,6 +222,146 @@ saturated at the probe's offered rate.
   added for future operational diagnostics. No write parallelism introduced.
 - Reproducible bounded `tools/bench/scaling.py` and `diagnose.py`; raw logs,
   specs and flat profiles under `tools/bench/scaling-results/`.
+
+## Overload, fan-out, backlog and verification work (Nov 10, 2026, CST)
+
+Four commits on `usockets` (not pushed), each followed by the full suite.
+Numbers come from the same shared 8-core VM, relay on CPUs 0-3 and clients
+on 4-7, 1 k subscribers plus 20 k idle sockets for fan-out and 64 publishers
+x 16 in flight with FULL sync for publish. Other agents were using the host,
+so treat run-to-run spread of 10-20% as noise. Raw summaries are in
+`tools/bench/scaling-results/nov10-*.txt`.
+
+### 1. Bounded output and slow readers (08c7170)
+
+Config keys (with K/M/G suffixes):
+
+| Key | Default | What it does |
+|---|---|---|
+| `conn_out_max` | 4M | Per-connection output budget. Over it, the connection is closed. Above half of it, REQ gets `CLOSED` and EVENT gets `OK false` with "error: output backlog too large, read faster". |
+| `total_out_max` | 1G | Process-wide budget (socket backlogs plus posted outboxes). At 75%, ngws closes the largest backlogs over 64 KiB until usage is under 50%. At 90%, workers refuse new REQ/EVENT. |
+| `worker_queue_max` | 16M | Bytes queued per worker. When full, the I/O thread answers inline with "error: relay overloaded, try again later" and never blocks. |
+| `writer_queue_max` | 65536 | EVENTs queued for the single writer. Over it, `OK false` with the overload error. |
+| `conn_pending_max` | 1024 | Unprocessed messages per connection. |
+
+- Stored-event replies to a REQ are capped at `conn_out_max/2` bytes. EOSE
+  still follows.
+- `tests/test_overload.py` passes 25/25 and covers:
+  - (A) one non-reading subscriber among a publisher and a fast subscriber: the slow reader is closed after about 1.9 MB of about 12 MB, the others get 1500/1500.
+  - (B) four non-reading subscribers over the total budget: all four are closed, every EVENT is answered, and the relay recovers.
+  - (C) a slow reader under its limit gets CLOSED / OK false for new work.
+  - (D) a REQ flood: 292 of 300 are shed inline with CLOSED, and each is answered exactly once.
+  - (E) writer queue overflow: 296 OK false, then accepted on retry.
+  - (F) an oversize message is shed by the I/O thread.
+
+Fan-out overload (rate 4000 and 8000 events/s, i.e. 4M or 8M deliveries/s offered):
+
+| | before (33cdf36) | after |
+|---|---|---|
+| 1k subs, rate 4000, io=2 | 3.3-3.7M/s delivered, p50 134-369 ms, p99 1.1-3.1 s, RSS 0.7-1.7 GB and growing | 4.0M/s, p50 10.6-11.3 ms (after item 2) |
+| rate 8000 | stopped by the 2 GiB headroom guard (unbounded growth) | io=4: 4.08M/s, 707 lagging subscribers closed at `conn_out_max`, 12 k EVENTs refused with OK false, p50 285 ms / p99 3.0 s, RSS 2.06 GB, bounded. io=2: 3.29M/s, 48 k refused, p50 512 ms / p99 4.3 s, RSS 2.40 GB |
+
+Peak RSS under sustained overload is about 2x `total_out_max`, because the
+budget counts payload bytes while allocator retention and kernel socket
+buffers (up to `tcp_wmem[2]`, about 4 MB per socket on loopback) sit on top.
+
+### 2. Fan-out send path (a89b4b8)
+
+- `io_threads` defaults to the number of usable CPUs (`sched_getaffinity`).
+  Connections spread across the loops with SO_REUSEPORT.
+- Each event body is serialized and framed once and shared.
+- Outbox records no longer take per-recipient connection references:
+  deferred unrefs are released after the outbox flush, and the final free
+  is a FIFO task on the connection's own loop.
+- Body references are taken once per run of records and released in bulk.
+
+1k subscribers plus 20 k idle sockets, workers=4, deliveries/s and
+publish-to-delivery latency:
+
+| Offered | before, io=2 | after, io=2 | after, io=3 | after, io=4 |
+|---|---|---|---|---|
+| 1M/s | 1.0M/s, p50 6.3-7.1 ms, p99 15-21 ms | 1.0M/s, p50 7.1-8.4 ms | p50 3.8-4.3 ms, p99 10-18 ms | p50 2.7-2.8 ms, p99 6.9-21.8 ms |
+| 4M/s | 3.3-3.7M/s (saturated), p50 134-369 ms, p99 1.1-3.1 s | 4.0M/s, p50 10.6-11.3 ms, p99 33-40 ms | 4.0M/s, p50 6.7 ms | 4.0M/s, p50 5.2-5.3 ms, p99 12-34 ms |
+
+- I/O thread CPU at 1M/s drops from about 90% per thread (io=2) to 60-68%
+  (io=4). It is still about 90% system time: kernel `send` is the floor.
+- One earlier baseline run did reach 4M/s at p50 8.8 ms, so the saturation
+  point at io=2 sits close to 4M/s on this host.
+
+### 3. Listen backlog (a9f71c9)
+
+- `listen_backlog` (0 = `net.core.somaxconn`, capped by it) replaces the
+  vendored uSockets `listen(..., 512)`.
+- The patch is recorded in `thirdparty/VENDOR.md`.
+- The startup line prints the effective `backlog=`.
+- `tests/test_listen_backlog.py` reads the listener's Send-Q from `ss`
+  (4/4).
+
+30 k-connection burst:
+
+| | before (512) | after (4096 = somaxconn) |
+|---|---|---|
+| Time to connect all | 2.5-3.4 s | 0.7-1.4 s |
+| ListenOverflows | about 15.6 k | 0-839 |
+| Failed connects | 1 | 0 |
+
+### 4. Signature verification (5e22ba3)
+
+- Verification already ran on the worker pool; a connection is pinned to one
+  worker, `shard = id % workers`.
+- Each worker now batch-verifies the EVENTs of a job list before processing
+  them (`src/schnorr_batch.c`, built on the vendored secp256k1's
+  `ecmult_multi_var`):
+  - 128-bit randomizers from a tagged hash
+  - lifted pubkeys cached
+  - chunks of up to 256; failures are bisected down to groups of 4
+- Proven `(sig, id, pubkey)` triples go into a thread-local table that
+  `signature_verify` consults. The id is still recomputed from the
+  serialization, so a triple that doesn't match byte for byte still gets the
+  individual check.
+- Events that admission would shed are skipped.
+- `NG_BATCH_VERIFY=0` turns it off.
+
+Microbenchmark, one core, against individual `secp256k1_schnorrsig_verify`
+(about 26-33 k sig/s on this host):
+
+| Batch size | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---|---|---|---|---|---|---|
+| Speedup, 256-bit randomizers (first version) | 1.12x | 1.11x | 1.13x | 1.16x | 1.31x | 1.44x | 1.43x |
+| Speedup, 128-bit randomizers, no key cache | 1.19x | 1.31x | 1.28x | 1.29x | 1.35x | 1.57x | 1.66x |
+| Speedup, 128-bit randomizers plus key cache (repeated keys) | 1.50x | 1.57x | 1.60x | 1.72x | 1.79x | 2.08x | 2.22x |
+
+Publish with FULL sync, 64 connections x 16 in flight, 6 s, events/s:
+
+| Config | before (33cdf36) | item 4, batch off | item 4, batch on |
+|---|---|---|---|
+| default workers, 64 authors | 27.9 / 35.4 / 35.2 k | 34.9 / 40.0 / 36.9 k | 33.8 / 39.2 / 39.9 k |
+| default workers, all distinct authors | 31.5 / 30.0 k | 32.5 / 31.9 k | 32.4 / 31.8 k |
+| workers=1 (verify-bound), 64 authors | 23.8 / 23.0 k | 23.1 / 22.8 / 23.7 / 23.5 k | 34.0 / 30.0 / 34.4 / 32.0 k |
+| workers=1, distinct authors | 24.4 / 24.1 k | 23.4 / 22.4 / 24.2 / 22.4 k | 30.0 / 24.9 / 28.8 / 26.3 k |
+
+- At the default worker count, publish with FULL sync is bound by the
+  writer, not by verification:
+  - the writer thread is at 76-84% CPU
+  - COMMIT/fsync takes about 4.5-5 s of each 7 s
+  - throughput is flat within noise
+- Batch verification still lowers worker CPU per event by roughly 10-20%
+  (for example 4 x 44% → 4 x 35% at the same rate).
+- When verification is the bottleneck (one worker), batch on vs off is about
+  +40% with repeated authors and +10-25% with all-distinct authors.
+- The baseline sized its pools from `nproc`, so it ran 8 workers even under
+  `taskset -c 0-3`. The new default reads the affinity mask, giving 4 workers
+  here. The baseline's verify-bound rows use `NG_WORKERS=1`.
+- An earlier FULL-sync measurement on Nov 7 (BENCHMARKS.md) showed 49-53 k on
+  a quieter host. Disk and host contention explain the lower absolute values
+  today; compare within a table only.
+
+### Still open
+
+- One busy connection's verification remains serialized on its worker.
+- Peak RSS can exceed the budget by about 2x (see above).
+- REQ `limit:0` still returns up to 500 stored events (now byte-capped).
+- There are no per-identity quotas.
 
 ## Production starting point for one million concurrent users
 
@@ -273,7 +413,8 @@ Final optimized relay build succeeded. `test_core.py`: **15/15** checks;
 `test_dedupe.py`: **23/23** with the recent/in-flight set enabled and **23/23**
 with `NG_DEDUPE_RECENT=0`; `test_ws.py`: connected and received AUTH;
 `tests/rfc6455_conformance.py` against the echo transport: **80/80 strict**;
-`tests/test_config.py`: **11/11** startup cases. Dedupe runs used fresh FULL-sync
+`tests/test_config.py`: **11/11** startup cases (19 after the Nov 10
+config keys; see the section above for the current suite). Dedupe runs used fresh FULL-sync
 databases. Python WebSocket/crypto tests used the existing
 `/workspace/ngvenv/bin/python` environment. Refused-connection diagnostics
 were also checked separately. No changes were pushed.

@@ -9,6 +9,25 @@ built with clang (zig cc) `-O3 -march=native` — only used for benchmarking.
 Client: `build/ngload` (pure C, epoll, multithreaded, multiple source IPs).
 Scripts: `tools/bench/*.sh`; events from `tools/bench/genev.py`.
 
+## Overload, fan-out, backlog and batch verification (Nov 10 2026, CST)
+
+Commits 08c7170, a89b4b8, a9f71c9 and 5e22ba3 (`usockets`, not pushed).
+The method, config keys and every run are in SCALING.md under "Overload,
+fan-out, backlog and verification work"; raw summaries are in
+`tools/bench/scaling-results/nov10-*.txt`. Same host and pinning as below.
+The host was shared and noisier than on Nov 7.
+
+| Measurement | before (33cdf36) | after |
+|---|---|---|
+| Fan-out at 1M deliveries/s, 1k subs plus 20k idle: p50 / p99 | 6.3-7.1 / 15-21 ms (io=2) | 2.7-2.8 / 6.9-21.8 ms (io=4 = default here) |
+| Fan-out offered 4M/s | 3.3-3.7M/s, p50 134-369 ms, p99 1.1-3.1 s, RSS up to 1.7 GB | 4.0M/s, p50 5.2-5.3 ms, p99 12-34 ms, RSS 113 MB (io=4) |
+| Fan-out offered 8M/s | unbounded memory, stopped at the 2 GiB headroom guard | 4.08M/s; lagging subscribers closed; EVENTs refused with OK false; RSS 2.06 GB |
+| Non-reading subscriber | output buffered up to 32 MiB per socket, no process cap | closed after about 1.9 MB (4 MiB budget); others unaffected (test_overload A/B) |
+| Publish, FULL sync, 64 x 16, events/s | 27.9-35.4 k | 31.8-40.0 k (writer/fsync-bound; batch verify on vs off is within noise) |
+| Publish, one worker (verify-bound) | 23.0-24.4 k | batch on: 30.0-34.4 k with 64 authors, 24.9-30.0 k with distinct authors (batch off: 22.4-24.2 k) |
+| Schnorr verify, one core, batch of 64 / 256 | 1.00x (individual) | 1.29x / 1.57x distinct keys; 1.72x / 2.08x repeated keys |
+| 30k-connection burst | 2.5-3.4 s, about 15.6k listen overflows, 1 failed | 0.7-1.4 s, 0-839 overflows, 0 failed |
+
 ## Final head-to-head: ngws (PGO) vs uWebSockets (Nov 7 2026)
 
 `tools/bench/h2h.sh 3 ngws=<pgo bench server> uws=<uws_ref>`, summarized with
@@ -137,6 +156,18 @@ transport (server ~205% of 4 CPUs).
 `NG_SAN=thread ./nob` / `NG_SAN=address ./nob` produce `build/*_thread` /
 `build/*_address`. Under test_core, test_ws2, live broadcast and ngload
 pub/fanout/hold: 0 ThreadSanitizer warnings, 0 ASan/LSan errors.
+
+Nov 10 2026, CST: `tools/run_all_tests.sh main_address _address` and `main_thread _thread`
+(test_core, test_ws, dedupe in both modes, config, nip13, listen_backlog,
+overload, RFC 6455 strict) plus `tools/run_ctests.sh`. Also ran
+`tools/run_ctests.sh` with `CT_OPT` set to ASan+UBSan and to TSan, and a TSan relay under
+ngload fan-out (300 subs) and publish (64 x 16).
+
+Results:
+- 0 ThreadSanitizer reports.
+- 0 ASan, UBSan or LSan errors after two fixes found in this pass:
+  - LSan: the per-thread deferred-unref buffer (from item 2) was never freed at thread exit. It is now freed.
+  - A shutdown hang: SIGINT that arrived while later I/O loops were still being created (the first listeners already accept) skipped those loops. They then never stopped. This hit `tests/test_config.py` 4 of 15 times under ASan; after the fix it was 0 of 15, plus 120 targeted start/connect/SIGINT cycles.
 
 ## Writer tuning + duplicate guards (Nov 2026)
 

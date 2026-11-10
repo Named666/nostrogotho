@@ -1,0 +1,6 @@
+diag-fanout-newc-io4-r8000.json minavail_MiB=5592
+  ng-checkpoint=1%(sys 1) ng-io-0=59%(sys 49) ng-io-1=43%(sys 33) ng-io-2=63%(sys 51) ng-io-3=48%(sys 39) ng-worker-0=16%(sys 1) ng-worker-1=50%(sys 2) ng-worker-2=16%(sys 1) ng-worker-3=17%(sys 2) ng-writer=20%(sys 11)
+  mode=nostr-fanout conns=1001 open=294 failed=707 threads=4 src_ips=1 connect_s=0.10 connected=1001 dropped=707 secs=12.01 msgs=48958740 msgs_s=4075789 MB_s=0.0 ok=84001 rejected=12052 lat_us_p50=285213 p99=3019899 p999=3690988 max=3975300 srv_rss_base_mb=18.7 srv_rss_conn_mb=20.3 bytes_per_conn=5768 srv_rss_end_mb=2060.9 srv_cpu_pct=356 client_cpu_pct=115
+diag-fanout-newc-io2-r8000.json minavail_MiB=6656
+  ng-checkpoint=1%(sys 1) ng-io-0=93%(sys 71) ng-io-1=93%(sys 76) ng-worker-0=13%(sys 1) ng-worker-1=33%(sys 1) ng-worker-2=13%(sys 1) ng-worker-3=13%(sys 1) ng-writer=8%(sys 3)
+  mode=nostr-fanout conns=1001 open=1001 failed=0 threads=4 src_ips=1 connect_s=0.10 connected=1001 dropped=0 secs=12.02 msgs=39508567 msgs_s=3286983 MB_s=0.0 ok=46522 rejected=47856 lat_us_p50=511705 p99=4294967 p999=4898947 max=5210118 srv_rss_base_mb=18.4 srv_rss_conn_mb=20.0 bytes_per_conn=1608 srv_rss_end_mb=2395.8 srv_cpu_pct=285 client_cpu_pct=74
