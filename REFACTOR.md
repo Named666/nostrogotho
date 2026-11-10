@@ -116,11 +116,11 @@ connection, batched commits), one WAL checkpointer.
 | Layer | Modules |
 |---|---|
 | platform | `src/platform/ng_platform.h` (compiler gate, `NG_THREAD_LOCAL`, `NG_ALIGNED`, `NG_STATIC_ASSERT`, ctz), `ng_atomic.h` (struct-wrapped `__atomic`), `ng_alloc.h` (overflow-checked sizes and allocation) |
-| transport | `src/ngws/ngws.c` (uSockets glue, HTTP upgrade, frame state machine, corked output, backlog budgets) - not split further (see 5.4) |
+| transport | `src/ngws/ngws.c` (event loop, server, uSockets callbacks, shedding), `ngws_handshake.c` (HTTP + upgrade), `ngws_frame.c` (frame input state machine), `ngws_send.c` (send queue, backlog, flush); `ngws_internal.h` |
 | framing (pure) | `src/ws_proto.c` (header encode/parse, unmask, UTF-8, SHA-1/base64) |
 | protocol (pure) | `src/relay_wire.c` (raw-message helpers: overload replies, signature triple extraction), `src/json_lite.c`, `src/json_util.c`, `src/crypto.c`, `src/schnorr_batch.c` |
 | core | `src/relay_core.c` (protocol engine, subscriptions, matching), `src/relay_conn.c`, `src/dedupe.c`, `src/nips/` |
-| storage | `src/storage.c` |
+| storage | `src/storage_sqlite.c` (lifecycle, schema, prepared statements, batch tx, checkpoint), `storage_write.c` (insert, tombstones, replaceable admission, deletes, purge), `storage_query.c` (pure filter -> SQL builder), `storage_read.c` (get_event_by_id, send_records); `storage_internal.h` |
 | config | `src/ng_config.c` (one key table, pure line/size parsing, file loader with line/key/status errors), `src/ng_status.h` (error codes) |
 | orchestration | `src/main.c` (CLI), `src/backend_ngws.c` (264 lines: ngws callbacks, admission, inline shedding, thread setup/teardown), `src/ngb_conn.h` (connection object + field ownership), `src/ngb_outbox.c` (worker/writer -> loop output and the connection lifetime rule), `src/ngb_workers.c` (sharded workers, job queues, batch pre-verification), `src/ngb_writer.c` (the single writer as take / commit / finish steps, and the checkpointer) |
 
@@ -231,22 +231,40 @@ No case moved beyond run-to-run noise (4M fan-out p99 ranges: base
 30-53 ms, new 33-44 ms; RSS base 104-156 MB, new 122-141 MB). Raw output:
 `/workspace/bench/gate-results/` on the bench host (not in the repo).
 
-### 5.4 Remaining (not done, by priority)
+### 5.4 Follow-up: former 5.4 items resolved (Nov 10 2026, CST)
 
-- Outbox allocation failure still drops the frame being queued (now
-  documented in ngb_outbox.h). A correct fix closes the connection from
-  the loop; not done because it changes wire behavior under OOM.
-- `json_builder_t` truncates silently at 64 KiB (documented; callers that
-  can exceed it size first). An explicit overflow flag would touch every
-  builder user.
-- Error conventions are documented (ng_status.h: bool / NULL /
-  `ng_status_t`) and used by the config module; older tri-states
-  (`ws_parse_header` 1/0/-1, storage `STORE_*`, `jl_unescape` sentinel)
-  were not converted.
-- `ngws.c` (1088 lines) is not split into transport and framing-state
-  modules; `storage.c` (1468 lines) and `relay_core.c` keep long
-  functions and owner-thread-only shard tables (documented in
-  relay_core.h).
-- Strict flags apply in every build of our code; `-Werror` only with
-  `NG_WERROR=1`.
-- cppcheck findings in test code (unchecked malloc) left as is.
+| Commit | Item |
+|---|---|
+| 8d8b67d | unbuilt `tools/bench/ngws_wslay_variant.c` deleted (in git history) |
+| 92e25af | error conventions unified: `ws_parse_header` -> `ng_status_t` (NG_OK / NG_E_AGAIN / NG_E_INVALID), `jl_unescape` -> bool, storage `STORE_*` / "count or -1" -> `storage_put_t`, `storage_admit_t` and bool + `size_t *deleted`; deletion and purge loops now check the final `SQLITE_DONE` |
+| 2ab676b | `json_builder_t` growable (512 B inline, checked growth, hard cap `JSON_BUILDER_MAX` 1 MiB), sticky NG_E_TOOBIG / NG_E_NOMEM, `finish()` NULL on failure; per-thread scratch builders on the broadcast/query paths; callers answer the client (NOTICE / OK false / CLOSED); 64 KiB event policy kept as `NG_EVENT_JSON_MAX` |
+| 5eee98b | outbox allocation failure closes the connection (1011 "server out of memory", allocation-free intrusive task) instead of dropping the frame; `NG_FAULT_OUTBOX_OOM` test hook, test_overload case G |
+| d5f1831 | `storage.c` split (sqlite / write / query / read); dynamic query builder with policy caps replaces the 2 KiB / 4 KiB / 256-param buffers; search pattern no longer truncated or left unescaped on OOM; `tests/test_storage_query.c`; clang `-Wstring-concatenation` fixed |
+| 1df0a3e | `ngws.c` split (loop / handshake / frame input / send queue) |
+| 66bd116 | test code checks every allocation and `fopen` |
+
+Gates on 66bd116: suite (test_core 17/17, dedupe 23/23 x2, overload
+37/37, RFC 6455 80/80, ws_split_fuzz 804/200) and C tests 9/9 after every
+commit; strict set 0 warnings under gcc 14 and clang 22 (`zig cc`, fresh
+cache per run); ASan+UBSan suite + C tests 0 reports; TSan suite + load
+(300-sub fan-out at 2000/s, 32x8 publish, churn) 0 reports; cppcheck
+src/ + tools + tests 0 findings.
+
+Performance vs a098f60 (interleaved, same host):
+
+| Case | a098f60 | 66bd116 | uWS |
+|---|---|---|---|
+| echo 64 B (msg/s, 3 runs) | 2.97 / 2.88 / 3.04M | 2.89 / 2.97 / 3.07M | 2.96 / 2.75 / 2.90M |
+| echo 4 KB (msg/s) | 1.49 / 1.54 / 1.42M | 1.54 / 1.45 / 1.51M | 1.15 / 1.12 / 1.12M |
+| fan-out 1M/s, 1k subs + 20k idle: p50 / p99 (ms, 3 runs) | 2.13/11.5, 2.36/24.6, 2.08/24.1 | 1.95/17.3, 2.33/6.7, 2.39/20.7 | - |
+| fan-out 4M/s: delivered; p50 / p99 (ms); RSS end (MB) | 4.00M; 4.26/15.6, 4.33/11.4, 4.19/25.4; 100/89/112 | 4.00M; 4.78/26.7, 3.93/19.4, 4.19/14.0; 114/109/108 | - |
+| publish FULL sync 64x16 (events/s; run 1 cold) | 15.2 / 38.8 / 44.9k | 23.7 / 45.3 / 44.7k | - |
+
+No case moved beyond run-to-run noise; nothing reverted.
+
+### 5.5 Remaining
+
+- `relay_core.c` keeps long functions and owner-thread-only shard tables
+  (documented in relay_core.h).
+- Strict flags apply in every build; `-Werror` only with `NG_WERROR=1`.
+- send_records failures (complexity caps) still end with EOSE, not CLOSED.
