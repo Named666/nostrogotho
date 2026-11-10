@@ -45,13 +45,14 @@ check("no SQL errors logged", "SQL error" not in r.logtext(), r.logtext()[-300:]
 # synchronous=NORMAL commits do not sync the WAL: the shim must flush at the
 # wal-index barrier, so an OK'd event is visible to other connections at once.
 r = Relay("db_sync = normal\n")
-a, b = WS(r.port), WS(r.port); k = Key(); miss = 0
+a, b = WS(r.port), WS(r.port); k = Key(); miss = 0; why = []
 for i in range(300):
     e = k.ev(f"n{i}", 1, [["t", "vis"]])
     m = a.publish(e)
     evs, _ = b.req(f"v{i}", {"ids": [e["id"]]}); b.send(["CLOSE", f"v{i}"])
-    if not (m and m[2] and len(evs) == 1): miss += 1
-check("NORMAL sync: every OK'd event immediately readable elsewhere", miss == 0, f"misses={miss}")
+    if not (m and m[2] and len(evs) == 1):
+        miss += 1; why.append((i, m and m[:4], len(evs), _))
+check("NORMAL sync: every OK'd event immediately readable elsewhere", miss == 0, f"misses={miss} {why[:3]}")
 r.stop()
 check("no SQL errors logged (NORMAL)", "SQL error" not in r.logtext(), r.logtext()[-300:])
 sys.exit(summary())
