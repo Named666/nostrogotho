@@ -89,6 +89,7 @@ static NG_THREAD_LOCAL relay_conn_t *query_connection;
 static NG_THREAD_LOCAL filter_t *query_filters;
 static NG_THREAD_LOCAL size_t query_filters_count;
 static NG_THREAD_LOCAL size_t query_bytes;
+static NG_THREAD_LOCAL bool query_render_failed;   /* a stored row could not be rendered */
 static size_t query_bytes_max;    /* 0 = unlimited */
 void relay_core_set_query_bytes_max(size_t n) { query_bytes_max = n; }
 
@@ -331,11 +332,10 @@ relay_bcast_t *relay_bcast_new(event_t *ev) {
     relay_bcast_t *b = (relay_bcast_t *) calloc(1, sizeof(*b));
     if (!b) { event_release(ev); return NULL; }   /* ev is consumed either way */
     b->ev = *ev;                       /* ownership of tags/content moves */
-    static NG_THREAD_LOCAL json_builder_t body;
-    json_builder_start(&body);
-    json_serialize_event(&b->ev, &body);
-    const char *j = json_builder_finish(&body);   /* "[{...}]" */
-    size_t jl = strlen(j);
+    json_builder_t *body = json_builder_scratch(JSON_SCRATCH_BCAST);
+    json_serialize_event(&b->ev, body);
+    const char *j = json_builder_finish(body);    /* "[{...}]", NULL on OOM / cap */
+    size_t jl = j ? json_builder_length(body) : 0;
     b->body = jl >= 2 ? relay_body_new(j + 1, jl - 2) : NULL;
     bool tags_ok = relay_tags_parse(&b->ev, &b->tags);
     if (!b->body || !tags_ok) { relay_bcast_free(b); return NULL; }   /* never fan out partial tags */
@@ -380,6 +380,7 @@ void relay_core_broadcast_shard(int shard, const relay_bcast_t *b) {
 
 static void query_sender(const char *json, const event_t *event) {
     if (!query_connection || !event) return;
+    if (!json) { query_render_failed = true; return; }   /* storage could not render the row */
     relay_tags_t tags;
     if (!relay_tags_parse(event, &tags)) return;   /* OOM: tag filters cannot be evaluated; skip */
     bool matched = false;
@@ -402,6 +403,7 @@ static void query_events(relay_conn_t *connection, const char *sub,
     int total_count = 0;
     query_connection = connection;
     query_bytes = 0;
+    query_render_failed = false;
     query_filters = filters;
     query_filters_count = count;
     storage_ctx->send_records(query_sender, sub, filters, count, do_count,
@@ -423,7 +425,9 @@ static void query_events(relay_conn_t *connection, const char *sub,
             json_builder_start_object(&builder);
             json_builder_object_key_number(&builder, "count", (long long) total_count);
             json_builder_end_object(&builder);
-            response = string_dup(json_builder_finish(&builder));
+            const char *j = json_builder_finish(&builder);
+            response = j ? string_dup(j) : NULL;
+            json_builder_free(&builder);
         }
     } else {
         /* Hook kept for its side effect (NIP-17 sends an AUTH challenge). */
@@ -434,12 +438,18 @@ static void query_events(relay_conn_t *connection, const char *sub,
             json_builder_start(&builder);
             json_builder_append_string(&builder, "EOSE");
             json_builder_append_string(&builder, sub);  /* NIP-01: ["EOSE",<sub_id>] */
-            response = string_dup(json_builder_finish(&builder));
+            const char *j = json_builder_finish(&builder);
+            response = j ? string_dup(j) : NULL;
+            json_builder_free(&builder);
         }
     }
+    if (query_render_failed)
+        nip_plugin_send_json(connection, "[\"NOTICE\",\"error: some stored events could not be sent (out of memory)\"]");
     if (response) {
         nip_plugin_send_json(connection, response);
         free(response);
+    } else {
+        nip_plugin_send_json(connection, "[\"NOTICE\",\"error: could not build query response (out of memory)\"]");
     }
 }
 
@@ -511,10 +521,13 @@ static void handle_req(relay_conn_t *connection, json_value_t *values, size_t co
     {
         json_builder_t jb; json_builder_start(&jb); json_builder_append_string(&jb, sub);
         const char *j = json_builder_finish(&jb);        /* ["<escaped>"] */
-        size_t jl = strlen(j);
-        s->id_json_len = jl - 2;
-        s->id_json = (char *) malloc(jl);
-        if (s->id_json) { memcpy(s->id_json, j + 1, jl - 2); s->id_json[jl - 2] = '\0'; }
+        size_t jl = j ? json_builder_length(&jb) : 0;
+        if (jl >= 2) {
+            s->id_json_len = jl - 2;
+            s->id_json = (char *) malloc(jl - 1);
+            if (s->id_json) { memcpy(s->id_json, j + 1, jl - 2); s->id_json[jl - 2] = '\0'; }
+        }
+        json_builder_free(&jb);
     }
     if (!s->id_json) {
         free(s->id); free(s); release_filters(filters, filter_count);

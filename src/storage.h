@@ -28,20 +28,9 @@
  * ============================================================================ */
 
 /* ============================================================================
- * Callback Types
+ * Result and Callback Types
  * ============================================================================ */
 
-/* send_records_callback_t - Callback for sending records to client
- * 
- * Called by send_records() for each event matching a filter.
- * Also called once for COUNT responses.
- * 
- * Args: json_event - JSON-formatted event string (EVENT or COUNT response)
- *                    Format: ["EVENT", subscription_id, event] or
- *                            ["COUNT", subscription_id, {count: N}]
- * 
- * Note: json_event and event are valid only for the duration of the callback
- */
 /* Outcome of insert_event. */
 typedef enum {
     STORAGE_PUT_INSERTED,    /* stored */
@@ -57,6 +46,20 @@ typedef enum {
     STORAGE_ADMIT_FAILED     /* database error or OOM */
 } storage_admit_t;
 
+/* send_records_callback_t - Callback for sending records to client
+ * 
+ * Called by send_records() for each event matching a filter.
+ * Also called once for COUNT responses.
+ * 
+ * Args: json_event - JSON-formatted event string (EVENT or COUNT response)
+ *                    Format: ["EVENT", subscription_id, event] or
+ *                            ["COUNT", subscription_id, {count: N}]
+ * 
+ *              NULL when the row could not be rendered (builder OOM / size
+ *              cap); the callback should tell the client (NOTICE).
+ * 
+ * Note: json_event and event are valid only for the duration of the callback
+ */
 typedef void (*send_records_callback_t)(const char *json_event, const event_t *event);
 
 /* ============================================================================

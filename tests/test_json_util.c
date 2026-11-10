@@ -46,13 +46,9 @@ static void test_filter_many_ids(void) {
     free(buf);
 }
 
-/* Regression: json_builder_object_key_string() used to pass a fixed 128-byte
- * budget to snprintf after checking only 4 bytes of headroom, writing past
- * json_builder_t.buffer[65535] (into the adjacent pos field / stack memory)
- * when serializing events with ~65.3 KB of tags. The fixed code bounds the
- * key write by the remaining capacity; this test asserts the builder never
- * reports a position outside the buffer and that the result stays NUL-
- * terminated. */
+/* Regression (was a stack smash with the fixed 64 KiB buffer): serializing
+ * events with ~65.3 KB of tags must produce complete, NUL-terminated JSON
+ * whose length matches the builder's position. The builder now grows. */
 static void test_serialize_huge_tags_terminated(void) {
     event_t event;
     memset(&event, 0, sizeof(event));
@@ -62,12 +58,13 @@ static void test_serialize_huge_tags_terminated(void) {
                           "2222222222222222222222222222222222222222222222222222222222222222");
     event.created_at = 1700000000;
     event.kind = 1;
-    event.content = strdup("hi");
+    event.content = (char *) "hi";
     event.content_len = 2;
 
     int pass = 1;
+    char *tags = (char *) malloc(65340 + 1);
+    if (!tags) { printf("FAIL: out of memory\n"); return; }
     for (size_t tags_len = 65200; tags_len <= 65340 && pass; tags_len++) {
-        char *tags = (char *) malloc(tags_len + 1);
         size_t off = 0;
         tags[off++] = '[';
         int first = 1;
@@ -83,38 +80,23 @@ static void test_serialize_huge_tags_terminated(void) {
         event.tags_json = tags;
         event.tags_json_len = tags_len;
 
-        json_builder_t *b = (json_builder_t *) malloc(sizeof(json_builder_t));
-        memset(b, 0, sizeof(*b));
-        json_builder_start(b);
-        json_builder_append_string(b, "EVENT");
-        json_builder_append_string(b, "sub");
-        size_t pos_before = b->pos;
-        json_serialize_event(&event, b);
-        const char *out = json_builder_finish(b);
-
-        if (b->pos < pos_before) {
-            printf("FAIL: pos went backward at tags_len=%zu (OOB write)\n", tags_len);
+        json_builder_t b;
+        json_builder_start(&b);
+        json_builder_append_string(&b, "EVENT");
+        json_builder_append_string(&b, "sub");
+        json_serialize_event(&event, &b);
+        const char *out = json_builder_finish(&b);
+        size_t want = json_serialized_event_size(&event) + strlen("[\"EVENT\",\"sub\",]");
+        if (!out || strlen(out) != json_builder_length(&b) || strlen(out) != want ||
+            memcmp(out + strlen(out) - 2, "}]", 2) != 0) {
+            printf("FAIL: incomplete serialization at tags_len=%zu\n", tags_len);
             pass = 0;
         }
-        if (b->pos >= sizeof(b->buffer)) {
-            printf("FAIL: pos=%zu outside buffer at tags_len=%zu\n", b->pos, tags_len);
-            pass = 0;
-        }
-        if (memchr(b->buffer, 0, sizeof(b->buffer)) == NULL) {
-            printf("FAIL: unterminated builder at tags_len=%zu\n", tags_len);
-            pass = 0;
-        }
-        if (strlen(out) != b->pos) {
-            printf("FAIL: strlen(out)=%zu != pos=%zu at tags_len=%zu\n",
-                   strlen(out), b->pos, tags_len);
-            pass = 0;
-        }
-        free(b);
-        free(tags);
+        json_builder_free(&b);
     }
-    printf("%s: serialization of ~65 KB tags stays bounded and terminated\n",
+    free(tags);
+    printf("%s: serialization of ~65 KB tags is complete and terminated\n",
            pass ? "PASS" : "FAIL");
-    free(event.content);
 }
 
 /* Regression: validate_event_tags() used to allow tags with unlimited
@@ -180,6 +162,7 @@ static void test_builder_key_number_format(void) {
     const char *result = json_builder_finish(&builder);
     printf("%s: builder key-number format\n",
            result && strstr(result, "\"count\":42") ? "PASS" : "FAIL");
+    json_builder_free(&builder);
 }
 
 /* Invariant: json_serialized_event_size() must exactly predict the number
@@ -204,17 +187,18 @@ static void test_serialized_size_matches(void) {
         event.tags_json_len = strlen(event.tags_json);
 
         size_t predicted = json_serialized_event_size(&event);
-        json_builder_t *b = (json_builder_t *) malloc(sizeof(json_builder_t));
-        json_builder_start(b);
-        json_serialize_event(&event, b);
+        json_builder_t b;
+        json_builder_start(&b);
+        json_serialize_event(&event, &b);
         /* buffer = '[' + '{...}' + ']'  ->  object length = strlen - 2 */
-        size_t actual = strlen(json_builder_finish(b)) - 2;
+        const char *r = json_builder_finish(&b);
+        size_t actual = r ? strlen(r) - 2 : 0;
         if (predicted != actual) {
             printf("FAIL: content[%zu] predicted=%zu actual=%zu (%s)\n",
                    i, predicted, actual, contents[i]);
             pass = 0;
         }
-        free(b);
+        json_builder_free(&b);
         free(event.content);
         free(event.tags_json);
     }
@@ -225,29 +209,76 @@ static void test_serialized_size_matches(void) {
  * truncated "\u00X" plus an embedded NUL (snprintf size 6 for a 6-char
  * escape), corrupting stored and broadcast JSON. */
 static void test_builder_control_escape(void) {
-    json_builder_t *b = (json_builder_t *) malloc(sizeof(json_builder_t));
-    json_builder_start(b);
-    json_builder_append_string(b, "a\x01\x1f\x7f\"\\z");
-    const char *r = json_builder_finish(b);
-    int ok = strcmp(r, "[\"a\\u0001\\u001f\x7f\\\"\\\\z\"]") == 0 && strlen(r) == b->pos;
-    printf("%s: builder escapes control bytes as \\u00XX (%s)\n", ok ? "PASS" : "FAIL", r);
-    free(b);
+    json_builder_t b;
+    json_builder_start(&b);
+    json_builder_append_string(&b, "a\x01\x1f\x7f\"\\z");
+    const char *r = json_builder_finish(&b);
+    int ok = r && strcmp(r, "[\"a\\u0001\\u001f\x7f\\\"\\\\z\"]") == 0 &&
+             strlen(r) == json_builder_length(&b);
+    printf("%s: builder escapes control bytes as \\u00XX (%s)\n", ok ? "PASS" : "FAIL", r ? r : "(null)");
+    json_builder_free(&b);
 }
 
-/* Regression: printf-style appends advanced pos by the untruncated length,
- * so a long key could move pos past the text actually written. */
-static void test_builder_long_key_clamped(void) {
-    json_builder_t *b = (json_builder_t *) malloc(sizeof(json_builder_t));
+/* Long keys are written in full (the fixed builder used to drop them). */
+static void test_builder_long_key(void) {
+    json_builder_t b;
     char key[300]; memset(key, 'k', sizeof(key) - 1); key[sizeof(key) - 1] = '\0';
-    json_builder_start(b);
-    json_builder_start_object(b);
-    json_builder_object_key_number(b, key, 1);
-    json_builder_object_key_number(b, "n", 2);
-    json_builder_end_object(b);
-    const char *r = json_builder_finish(b);
-    int ok = strlen(r) == b->pos && strstr(r, "\"n\":2") != NULL && strstr(r, "kkkk") == NULL;
-    printf("%s: oversized printf append is dropped, not overrun (%s)\n", ok ? "PASS" : "FAIL", r);
-    free(b);
+    json_builder_start(&b);
+    json_builder_start_object(&b);
+    json_builder_object_key_number(&b, key, 1);
+    json_builder_object_key_number(&b, "n", 2);
+    json_builder_end_object(&b);
+    const char *r = json_builder_finish(&b);
+    int ok = r && strlen(r) == json_builder_length(&b) && strstr(r, "\"n\":2") != NULL &&
+             strlen(r) == 1 + 1 + (1 + 299 + 1 + 1 + 1) + 1 + 5 + 1 + 1;
+    printf("%s: long key written in full\n", ok ? "PASS" : "FAIL");
+    json_builder_free(&b);
+}
+
+/* Past JSON_BUILDER_MAX the builder fails explicitly: NG_E_TOOBIG, sticky,
+ * finish() returns NULL instead of truncated JSON. */
+static void test_builder_overflow_is_error(void) {
+    size_t chunk = 64 * 1024;
+    char *s = (char *) malloc(chunk + 1);
+    if (!s) { printf("FAIL: out of memory\n"); return; }
+    memset(s, 'x', chunk); s[chunk] = '\0';
+    json_builder_t b;
+    json_builder_start(&b);
+    int ok = 1;
+    for (size_t total = 0; total < JSON_BUILDER_MAX - 2 * chunk; total += chunk + 3)
+        json_builder_append_string(&b, s);
+    ok &= json_builder_status(&b) == NG_OK;                /* still under the cap */
+    for (int i = 0; i < 4; i++) json_builder_append_string(&b, s);
+    ok &= json_builder_status(&b) == NG_E_TOOBIG;
+    size_t pos = json_builder_length(&b);
+    json_builder_append_string(&b, "y");                    /* sticky: no-op */
+    ok &= json_builder_length(&b) == pos && json_builder_finish(&b) == NULL;
+    json_builder_free(&b);
+    json_builder_free(&b);                                  /* idempotent */
+    free(s);
+    printf("%s: builder overflow past JSON_BUILDER_MAX returns NG_E_TOOBIG / NULL\n", ok ? "PASS" : "FAIL");
+}
+
+/* Scratch builders: reset on every call, independent slots, reusable after
+ * a failure, heap buffer kept between uses. */
+static void test_builder_scratch_reuse(void) {
+    int ok = 1;
+    json_builder_t *a = json_builder_scratch(JSON_SCRATCH_BCAST);
+    json_builder_t *q = json_builder_scratch(JSON_SCRATCH_QUERY);
+    ok &= a != q;
+    char big[2000]; memset(big, 'z', sizeof(big) - 1); big[sizeof(big) - 1] = '\0';
+    json_builder_append_string(a, big);
+    const char *r = json_builder_finish(a);
+    ok &= r && strlen(r) == sizeof(big) - 1 + 4;
+    json_builder_t *a2 = json_builder_scratch(JSON_SCRATCH_BCAST);
+    ok &= a2 == a;
+    json_builder_append_string(a2, "v");
+    r = json_builder_finish(a2);
+    ok &= r && strcmp(r, "[\"v\"]") == 0;
+    json_builder_append_string(q, "q");
+    r = json_builder_finish(q);
+    ok &= r && strcmp(r, "[\"q\"]") == 0;
+    printf("%s: scratch builders reset per use, slots independent\n", ok ? "PASS" : "FAIL");
 }
 
 int main(void) {
@@ -260,7 +291,9 @@ int main(void) {
     test_filter_empty_is_match_all();
     test_builder_key_number_format();
     test_builder_control_escape();
-    test_builder_long_key_clamped();
+    test_builder_long_key();
+    test_builder_overflow_is_error();
+    test_builder_scratch_reuse();
     printf("json_util security regression tests complete.\n");
     return 0;
 }

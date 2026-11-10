@@ -1058,7 +1058,6 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 if (fetched > limit) break;
                 
                 event_t event = {0};
-                json_builder_t builder;
                 snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
                 snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
                 event.created_at = (time_t) sqlite3_column_int64(stmt, 2);
@@ -1067,11 +1066,11 @@ static bool send_records(send_records_callback_t sender, const char *sub,
                 event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
                 event.content = (char *) sqlite3_column_text(stmt, 5);
                 snprintf(event.sig, sizeof(event.sig), "%s", (const char *) sqlite3_column_text(stmt, 6));
-                json_builder_start(&builder);
-                json_builder_append_string(&builder, "EVENT");
-                json_builder_append_string(&builder, sub);
-                json_serialize_event(&event, &builder);
-                sender(json_builder_finish(&builder), &event);
+                json_builder_t *builder = json_builder_scratch(JSON_SCRATCH_QUERY);
+                json_builder_append_string(builder, "EVENT");
+                json_builder_append_string(builder, sub);
+                json_serialize_event(&event, builder);
+                sender(json_builder_finish(builder), &event);   /* NULL = could not render */
             }
             
             sqlite3_finalize(stmt);

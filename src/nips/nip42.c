@@ -196,7 +196,11 @@ static void nip42_plugin_on_connect(relay_conn_t *connection, void *ctx) {
     json_builder_start(&builder);
     json_builder_append_string(&builder, "AUTH");
     json_builder_append_string(&builder, challenge);
-    nip_plugin_send_json(connection, json_builder_finish(&builder));
+    {
+        const char *j = json_builder_finish(&builder);
+        nip_plugin_send_json(connection, j ? j : "[\"NOTICE\",\"error: server out of memory\"]");
+        json_builder_free(&builder);
+    }
 }
 
 static void nip42_plugin_on_disconnect(relay_conn_t *connection, void *ctx) {

@@ -25,7 +25,8 @@ typedef enum {
     NG_E_UNKNOWN   = -3,   /* unknown key / name */
     NG_E_NOMEM     = -4,   /* allocation failed or size overflow */
     NG_E_IO        = -5,   /* OS-level I/O error (errno is set) */
-    NG_E_AGAIN     = -6    /* incomplete input: call again with more bytes */
+    NG_E_AGAIN     = -6,   /* incomplete input: call again with more bytes */
+    NG_E_TOOBIG    = -7    /* output would exceed a hard size policy */
 } ng_status_t;
 
 /* Static English description; never NULL. Thread-safe. */
@@ -38,6 +39,7 @@ static inline const char *ng_status_str(ng_status_t s) {
     case NG_E_NOMEM: return "out of memory";
     case NG_E_IO: return "I/O error";
     case NG_E_AGAIN: return "incomplete";
+    case NG_E_TOOBIG: return "too large";
     }
     return "error";
 }

@@ -22,11 +22,10 @@ char *nip45_build_count_response(const char *sub_id, unsigned long count) {
     json_builder_end_object(&builder);
     
     const char *result = json_builder_finish(&builder);
-    if (!result) return NULL;
-    
-    /* json_builder_finish returns a pointer to internal buffer,
-     * so we need to duplicate it for caller to own */
-    return string_dup(result);
+    /* finish() points into the builder: duplicate for the caller. */
+    char *out = result ? string_dup(result) : NULL;
+    json_builder_free(&builder);
+    return out;
 }
 
 static char *nip45_plugin_build_count(const char *sub, unsigned long count, void *ctx) {

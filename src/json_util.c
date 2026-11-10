@@ -9,6 +9,8 @@
 #include "json_lite.h"
 #include "relay_conn.h"
 #include "platform/ng_alloc.h"
+#include "platform/ng_platform.h"
+#include <pthread.h>
 
 /* ============================================================================
  * JSON Parsing Utilities
@@ -322,229 +324,241 @@ bool json_array_get_number(const json_value_t *values, size_t count, size_t inde
  * JSON Builder Implementation
  * ============================================================================ */
 
+/* Make room for `needed` more bytes plus the closing ']' and NUL that
+ * json_builder_finish() appends. Errors are sticky: once a reservation
+ * fails every later append is a no-op and finish() returns NULL. */
+static bool json_builder_reserve(json_builder_t *b, size_t needed) {
+    size_t want;
+    if (b->status != NG_OK) return false;
+    if (!ng_size_add3(b->pos, needed, 2, &want) || want > JSON_BUILDER_MAX) {
+        b->status = NG_E_TOOBIG;
+        return false;
+    }
+    if (want <= b->cap) return true;
+    size_t cap = ng_grow_cap(b->cap, want, JSON_BUILDER_INLINE);
+    if (cap > JSON_BUILDER_MAX) cap = JSON_BUILDER_MAX;
+    char *nb;
+    if (b->buf == b->inline_buf) {
+        nb = (char *) malloc(cap);
+        if (nb) memcpy(nb, b->buf, b->pos);
+    } else {
+        nb = (char *) realloc(b->buf, cap);
+    }
+    if (!nb) { b->status = NG_E_NOMEM; return false; }
+    b->buf = nb;
+    b->cap = cap;
+    return true;
+}
+
+static void json_builder_raw(json_builder_t *b, const char *s, size_t n) {
+    if (!json_builder_reserve(b, n)) return;
+    memcpy(b->buf + b->pos, s, n);
+    b->pos += n;
+}
+
+static void json_builder_byte(json_builder_t *b, char c) {
+    if (!json_builder_reserve(b, 1)) return;
+    b->buf[b->pos++] = c;
+}
+
 void json_builder_start(json_builder_t *builder) {
-    memset(builder, 0, sizeof(*builder));
-    builder->buffer[0] = '[';
+    builder->buf = builder->inline_buf;
+    builder->cap = sizeof(builder->inline_buf);
+    builder->status = NG_OK;
+    builder->buf[0] = '[';
     builder->pos = 1;
 }
 
-static bool json_builder_ensure_space(json_builder_t *builder, size_t needed) {
-    return builder->pos + needed < sizeof(builder->buffer);
+void json_builder_reset(json_builder_t *builder) {
+    if (!builder->buf) { json_builder_start(builder); return; }
+    if (builder->buf != builder->inline_buf && builder->cap > JSON_BUILDER_KEEP) {
+        free(builder->buf);
+        json_builder_start(builder);
+        return;
+    }
+    builder->status = NG_OK;
+    builder->buf[0] = '[';
+    builder->pos = 1;
 }
 
-/* printf-append at most `reserve` bytes. The position only advances when
- * the whole formatted text fits (snprintf returns the untruncated length;
- * adding that blindly could move pos past the buffer). */
-static void json_builder_appendf(json_builder_t *builder, size_t reserve, const char *fmt, ...)
-    __attribute__((format(printf, 3, 4)));
-static void json_builder_appendf(json_builder_t *builder, size_t reserve, const char *fmt, ...) {
-    if (!json_builder_ensure_space(builder, reserve)) return;
-    size_t avail = sizeof(builder->buffer) - builder->pos;
-    if (avail > reserve) avail = reserve;
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(&builder->buffer[builder->pos], avail, fmt, ap);
-    va_end(ap);
-    if (n > 0 && (size_t) n < avail) builder->pos += (size_t) n;
-    else builder->buffer[builder->pos] = '\0';
+void json_builder_free(json_builder_t *builder) {
+    if (builder->buf && builder->buf != builder->inline_buf) free(builder->buf);
+    builder->buf = NULL;
+    builder->cap = builder->pos = 0;
+}
+
+static NG_THREAD_LOCAL json_builder_t scratch[JSON_SCRATCH_SLOTS];
+static NG_THREAD_LOCAL bool scratch_registered;
+static pthread_key_t scratch_key;
+static pthread_once_t scratch_once = PTHREAD_ONCE_INIT;
+static bool scratch_key_ok;
+
+static void scratch_release(void *unused) {
+    (void) unused;
+    for (int i = 0; i < JSON_SCRATCH_SLOTS; i++) json_builder_free(&scratch[i]);
+}
+
+static void scratch_key_init(void) {
+    scratch_key_ok = pthread_key_create(&scratch_key, scratch_release) == 0;
+}
+
+json_builder_t *json_builder_scratch(json_scratch_t slot) {
+    if (!scratch_registered) {
+        scratch_registered = true;
+        /* The key's value is only a non-NULL marker so its destructor runs
+         * (in this thread, while its TLS is still valid) at thread exit. */
+        pthread_once(&scratch_once, scratch_key_init);
+        if (scratch_key_ok) (void) pthread_setspecific(scratch_key, &scratch[0]);
+    }
+    json_builder_reset(&scratch[slot]);
+    return &scratch[slot];
+}
+
+ng_status_t json_builder_status(const json_builder_t *builder) {
+    return builder->status;
 }
 
 static void json_builder_add_comma(json_builder_t *builder) {
-    if (builder->pos > 1 && builder->buffer[builder->pos - 1] != '[' && 
-        builder->buffer[builder->pos - 1] != '{' && builder->buffer[builder->pos - 1] != ':') {
-        if (json_builder_ensure_space(builder, 1)) {
-            builder->buffer[builder->pos++] = ',';
-        }
-    }
+    if (builder->pos == 0) return;
+    char last = builder->buf[builder->pos - 1];
+    if (builder->pos > 1 && last != '[' && last != '{' && last != ':')
+        json_builder_byte(builder, ',');
 }
 
 void json_builder_append_null(json_builder_t *builder) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 4)) {
-        memcpy(&builder->buffer[builder->pos], "null", 4);
-        builder->pos += 4;
-    }
+    json_builder_raw(builder, "null", 4);
 }
 
 void json_builder_append_bool(json_builder_t *builder, bool value) {
     json_builder_add_comma(builder);
-    if (value) {
-        if (json_builder_ensure_space(builder, 4)) {
-            memcpy(&builder->buffer[builder->pos], "true", 4);
-            builder->pos += 4;
-        }
-    } else {
-        if (json_builder_ensure_space(builder, 5)) {
-            memcpy(&builder->buffer[builder->pos], "false", 5);
-            builder->pos += 5;
-        }
-    }
+    if (value) json_builder_raw(builder, "true", 4);
+    else json_builder_raw(builder, "false", 5);
+}
+
+static void json_builder_number(json_builder_t *builder, long long value) {
+    char num[24];
+    int n = snprintf(num, sizeof(num), "%lld", value);
+    if (n > 0 && (size_t) n < sizeof(num)) json_builder_raw(builder, num, (size_t) n);
 }
 
 void json_builder_append_number(json_builder_t *builder, long long value) {
     json_builder_add_comma(builder);
-    json_builder_appendf(builder, 32, "%lld", value);
+    json_builder_number(builder, value);
+}
+
+/* escaped_length - Number of bytes json_builder_escape_string writes for s */
+static size_t escaped_length(const char *s) {
+    size_t n = 0;
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char) *s;
+        if (c == '"' || c == '\\' || c == '\b' || c == '\f' ||
+            c == '\n' || c == '\r' || c == '\t') {
+            n += 2;
+        } else if (c < 0x20) {
+            n += 6;
+        } else {
+            n += 1;
+        }
+    }
+    return n;
 }
 
 /* json_builder_escape_string - Append a JSON-escaped string value
  *
- * Writes the escaped contents of `value` (without surrounding quotes) into
- * the builder. Escapes all characters required by the JSON spec: `"`, `\`,
- * `\b`, `\f`, `\n`, `\r`, `\t`, and any other control character as a
- * `\uXXXX` sequence.
- *
- * '/' is deliberately NOT escaped: it requires no escaping per RFC 8259,
- * the canonical NIP-01 serialization (JSON.stringify) leaves it literal,
- * and emitting "\/" breaks delivery because older jl_get_str()
- * versions returned NULL for strings containing that escape.
- *
- * This is the single source of truth for string escaping so that every
- * serialized field (including event `content`) is emitted correctly
- * regardless of its contents.
+ * Escapes everything the JSON spec requires: `"`, `\` and every control
+ * character below 0x20 (\b \f \n \r \t as short escapes, the rest as \u00XX).
+ * Bytes >= 0x20 (including UTF-8 sequences and 0x7f) pass through.
+ * Sizes the output exactly first (one reservation, plain memcpy when nothing
+ * needs escaping), then writes without per-byte bound checks.
  */
 static void json_builder_escape_string(json_builder_t *builder, const char *value) {
-    for (size_t i = 0; value && value[i]; i++) {
-        unsigned char c = (unsigned char)value[i];
-
-        if (c == '"' || c == '\\') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = (char) c;
-        } else if (c == '\b') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = 'b';
-        } else if (c == '\f') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = 'f';
-        } else if (c == '\n') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = 'n';
-        } else if (c == '\r') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = 'r';
-        } else if (c == '\t') {
-            if (!json_builder_ensure_space(builder, 2)) return;
-            builder->buffer[builder->pos++] = '\\';
-            builder->buffer[builder->pos++] = 't';
-        } else if (c < 0x20) {             /* \u00XX: exactly 6 bytes, no NUL */
-            static const char hex[] = "0123456789abcdef";
-            if (!json_builder_ensure_space(builder, 6)) return;
-            memcpy(&builder->buffer[builder->pos], "\\u00", 4);
-            builder->buffer[builder->pos + 4] = hex[c >> 4];
-            builder->buffer[builder->pos + 5] = hex[c & 15];
-            builder->pos += 6;
-        } else {
-            if (!json_builder_ensure_space(builder, 1)) return;
-            builder->buffer[builder->pos++] = (char) c;
-        }
+    static const char hex[] = "0123456789abcdef";
+    size_t out = escaped_length(value);
+    if (!json_builder_reserve(builder, out)) return;
+    char *w = builder->buf + builder->pos;
+    builder->pos += out;
+    if (out == strlen(value)) { memcpy(w, value, out); return; }
+    for (; *value; value++) {
+        unsigned char c = (unsigned char) *value;
+        if (c == '"' || c == '\\') { *w++ = '\\'; *w++ = (char) c; }
+        else if (c >= 0x20) *w++ = (char) c;
+        else if (c == '\b') { *w++ = '\\'; *w++ = 'b'; }
+        else if (c == '\f') { *w++ = '\\'; *w++ = 'f'; }
+        else if (c == '\n') { *w++ = '\\'; *w++ = 'n'; }
+        else if (c == '\r') { *w++ = '\\'; *w++ = 'r'; }
+        else if (c == '\t') { *w++ = '\\'; *w++ = 't'; }
+        else { memcpy(w, "\\u00", 4); w[4] = hex[c >> 4]; w[5] = hex[c & 15]; w += 6; }
     }
+}
+
+static void json_builder_quoted(json_builder_t *builder, const char *value) {
+    json_builder_byte(builder, '"');
+    json_builder_escape_string(builder, value ? value : "");
+    json_builder_byte(builder, '"');
+}
+
+/* "key": -- keys are compile-time literals; escaped anyway for safety. */
+static void json_builder_key(json_builder_t *builder, const char *key) {
+    json_builder_add_comma(builder);
+    json_builder_quoted(builder, key);
+    json_builder_byte(builder, ':');
 }
 
 void json_builder_append_string(json_builder_t *builder, const char *value) {
     json_builder_add_comma(builder);
-
-    if (!json_builder_ensure_space(builder, 2)) return;
-    builder->buffer[builder->pos++] = '"';
-
-    json_builder_escape_string(builder, value);
-
-    if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = '"';
-    }
+    json_builder_quoted(builder, value);
 }
 
 void json_builder_start_array(json_builder_t *builder) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = '[';
-    }
+    json_builder_byte(builder, '[');
 }
 
 void json_builder_end_array(json_builder_t *builder) {
-    if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = ']';
-    }
+    json_builder_byte(builder, ']');
 }
 
 void json_builder_start_object(json_builder_t *builder) {
     json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = '{';
-    }
+    json_builder_byte(builder, '{');
 }
 
 void json_builder_object_key_string(json_builder_t *builder, const char *key, const char *value) {
-    json_builder_add_comma(builder);
-    /* The key write must never run past the 64 KiB buffer: previously the
-     * guard only checked 4 bytes while snprintf was handed a fixed 128-byte
-     * budget, so keys written near the end of the buffer overflowed into
-     * adjacent memory (stack smash in send_records()/broadcast_event()). */
-    if (!json_builder_ensure_space(builder, 4)) return;
-
-    builder->buffer[builder->pos++] = '"';
-    if (json_builder_ensure_space(builder, 1)) {
-        int written = snprintf(&builder->buffer[builder->pos],
-                               sizeof(builder->buffer) - builder->pos,
-                               "%s\":", key);
-        if (written > 0) {
-            /* snprintf returns the would-be length, which can exceed what
-             * was actually written when truncated -- clamp so pos never
-             * passes the buffer end. */
-            size_t space = sizeof(builder->buffer) - builder->pos - 1;
-            builder->pos += ((size_t) written > space) ? space : (size_t) written;
-        }
-    }
-    
-    /* Append string value with full escaping */
-    if (!json_builder_ensure_space(builder, 2)) return;
-    builder->buffer[builder->pos++] = '"';
-    
-    json_builder_escape_string(builder, value);
-    
-    if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = '"';
-    }
+    json_builder_key(builder, key);
+    json_builder_quoted(builder, value);
 }
 
 void json_builder_object_key_number(json_builder_t *builder, const char *key, long long value) {
-    json_builder_add_comma(builder);
-    json_builder_appendf(builder, 128, "\"%s\":%lld", key, value);
+    json_builder_key(builder, key);
+    json_builder_number(builder, value);
 }
 
 void json_builder_object_key_bool(json_builder_t *builder, const char *key, bool value) {
-    json_builder_add_comma(builder);
-    json_builder_appendf(builder, 128, "\"%s\":%s", key, value ? "true" : "false");
+    json_builder_key(builder, key);
+    if (value) json_builder_raw(builder, "true", 4);
+    else json_builder_raw(builder, "false", 5);
 }
 
 void json_builder_object_start_nested(json_builder_t *builder, const char *key) {
-    json_builder_add_comma(builder);
-    json_builder_appendf(builder, 128, "\"%s\":{", key);
+    json_builder_key(builder, key);
+    json_builder_byte(builder, '{');
 }
 
 void json_builder_end_object(json_builder_t *builder) {
-    if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = '}';
-    }
+    json_builder_byte(builder, '}');
 }
 
 const char *json_builder_finish(json_builder_t *builder) {
-    if (json_builder_ensure_space(builder, 2)) {
-        builder->buffer[builder->pos++] = ']';
-        builder->buffer[builder->pos] = '\0';
-    } else if (json_builder_ensure_space(builder, 1)) {
-        builder->buffer[builder->pos++] = ']';
-        builder->buffer[builder->pos] = '\0';
-    } else {
-        /* Buffer completely full: overwrite the last content byte rather
-         * than returning an unterminated string (the old code could return
-         * a buffer without a NUL, causing an out-of-bounds strlen). */
-        builder->buffer[sizeof(builder->buffer) - 1] = '\0';
-    }
-    return builder->buffer;
+    if (builder->status != NG_OK) return NULL;
+    /* Every reservation kept 2 spare bytes, so this cannot fail. */
+    builder->buf[builder->pos++] = ']';
+    builder->buf[builder->pos] = '\0';
+    return builder->buf;
+}
+
+size_t json_builder_length(const json_builder_t *builder) {
+    return builder->pos;
 }
 
 /* ============================================================================
@@ -849,23 +863,6 @@ bool json_parse_event(const char *json_str, event_t *event) {
     return true;
 }
 
-/* escaped_length - Number of bytes json_builder_escape_string writes for s */
-static size_t escaped_length(const char *s) {
-    size_t n = 0;
-    for (; s && *s; s++) {
-        unsigned char c = (unsigned char) *s;
-        if (c == '"' || c == '\\' || c == '\b' || c == '\f' ||
-            c == '\n' || c == '\r' || c == '\t') {
-            n += 2;
-        } else if (c < 0x20) {
-            n += 6;
-        } else {
-            n += 1;
-        }
-    }
-    return n;
-}
-
 size_t json_serialized_event_size(const event_t *event) {
     if (!event) return 0;
     /* Mirror json_serialize_event() segment by segment:
@@ -897,17 +894,9 @@ void json_serialize_event(const event_t *event, json_builder_t *builder) {
     json_builder_object_key_string(builder, "pubkey", event->pubkey);
     json_builder_object_key_number(builder, "created_at", event->created_at);
     json_builder_object_key_number(builder, "kind", event->kind);
-    json_builder_add_comma(builder);
-    if (json_builder_ensure_space(builder, 7)) {
-        memcpy(&builder->buffer[builder->pos], "\"tags\":", 7);
-        builder->pos += 7;
-    }
-    if (event->tags_json && json_builder_ensure_space(builder, event->tags_json_len)) {
-        memcpy(&builder->buffer[builder->pos], event->tags_json, event->tags_json_len);
-        builder->pos += event->tags_json_len;
-    } else {
-        json_builder_append_null(builder);
-    }
+    json_builder_key(builder, "tags");
+    if (event->tags_json) json_builder_raw(builder, event->tags_json, event->tags_json_len);
+    else json_builder_raw(builder, "null", 4);
     json_builder_object_key_string(builder, "content", event->content ? event->content : "");
     json_builder_object_key_string(builder, "sig", event->sig);
     json_builder_end_object(builder);

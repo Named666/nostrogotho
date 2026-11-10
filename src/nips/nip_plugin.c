@@ -46,7 +46,10 @@ void nip_plugin_send_status(relay_conn_t *connection, const char *type,
     if (id) json_builder_append_string(&builder, id);
     if (strcmp(type, "OK") == 0) json_builder_append_bool(&builder, ok);
     json_builder_append_string(&builder, message);
-    nip_plugin_send_json(connection, json_builder_finish(&builder));
+    const char *j = json_builder_finish(&builder);
+    /* Only reachable on OOM (inputs are bounded): still answer the client. */
+    nip_plugin_send_json(connection, j ? j : "[\"NOTICE\",\"error: server out of memory\"]");
+    json_builder_free(&builder);
 }
 
 /* ============================================================================

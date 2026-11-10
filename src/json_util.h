@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "nostrogotho.h"
+#include "ng_status.h"
 
 /* ============================================================================
  * JSON Utilities for Nostr Protocol
@@ -19,10 +20,13 @@
  * Contract: no globals; every function is thread-safe on distinct objects.
  * Ownership: parse results (json_value_t arrays, filters, events) own their
  * heap strings; release them with the matching *_free function.
- * Builder: fixed 64 KiB buffer, no allocation. Appends that do not fit are
- * dropped (pos never passes the buffer) and json_builder_finish always
- * returns a NUL-terminated string; callers that can exceed 64 KiB size the
- * output first (json_serialized_event_size) and use their own buffer.
+ * Builder: growable. Starts in a small inline buffer and moves to the heap
+ * as needed, up to the hard cap JSON_BUILDER_MAX. Sizes are checked; the
+ * first failure (NG_E_TOOBIG past the cap, NG_E_NOMEM) is sticky, later
+ * appends are no-ops and json_builder_finish returns NULL. Callers must
+ * json_builder_free() a started builder (thread-local builders reused via
+ * json_builder_reset() keep their heap buffer up to JSON_BUILDER_KEEP).
+ * A started builder points into itself: it must not be copied or moved.
  * Errors: parsers return false / 0 and leave outputs freeable.
  * ============================================================================ */
 
@@ -32,10 +36,17 @@
 /* Maximum length for a single JSON string value */
 #define MAX_JSON_STRING_VALUE 65536
 
-/* Size of json_builder_t's internal buffer. Responses larger than this are
- * impossible to render, so events whose serialization would exceed it must
- * be rejected before they are stored or broadcast. */
-#define JSON_BUILDER_BUFFER_SIZE 65536
+/* Policy: largest serialized ["EVENT", sub, {...}] message the relay will
+ * store and deliver. Events whose serialization (+ wrapper) would exceed it
+ * are rejected on publish (NIP-01 "invalid: event serialization too large"). */
+#define NG_EVENT_JSON_MAX 65536
+
+/* json_builder_t sizing: inline bytes, the hard output cap (any message the
+ * relay builds, including events at NG_EVENT_JSON_MAX), and the heap buffer
+ * size a reused (thread-local) builder may keep between messages. */
+#define JSON_BUILDER_INLINE 512
+#define JSON_BUILDER_MAX    (1024u * 1024u)
+#define JSON_BUILDER_KEEP   (128u * 1024u)
 
 /* ============================================================================
  * JSON Value Types
@@ -121,8 +132,11 @@ bool json_array_get_number(const json_value_t *values, size_t count, size_t inde
 
 /* An in-progress JSON array being built */
 typedef struct {
-    char buffer[65536];
-    size_t pos;
+    char *buf;            /* inline_buf or heap; NULL before start / after free */
+    size_t pos;           /* bytes written (excluding the closing "]\0") */
+    size_t cap;
+    ng_status_t status;   /* NG_OK, or the first error (sticky) */
+    char inline_buf[JSON_BUILDER_INLINE];
 } json_builder_t;
 
 /* Start building a new JSON array
@@ -226,9 +240,30 @@ void json_builder_end_object(json_builder_t *builder);
  * 
  * Args: builder - Completed builder
  * 
- * Returns: Pointer to built JSON string (valid until next builder operation)
+ * Returns: Pointer to built JSON string (valid until next builder operation),
+ *          or NULL if any append failed (see json_builder_status)
  */
 const char *json_builder_finish(json_builder_t *builder);
+
+/* Start a builder that may already hold a heap buffer (or is zero
+ * initialized, e.g. static NG_THREAD_LOCAL); keeps up to JSON_BUILDER_KEEP. */
+void json_builder_reset(json_builder_t *builder);
+
+/* Release the heap buffer (if any). Safe on a zeroed or freed builder. */
+void json_builder_free(json_builder_t *builder);
+
+/* Per-thread scratch builders for hot paths (one per slot, so two users
+ * that may interleave on one thread never share). The returned builder is
+ * already reset; its heap buffer (<= JSON_BUILDER_KEEP) is reused across
+ * calls and released when the thread exits. Never free it. */
+typedef enum { JSON_SCRATCH_BCAST, JSON_SCRATCH_QUERY, JSON_SCRATCH_SLOTS } json_scratch_t;
+json_builder_t *json_builder_scratch(json_scratch_t slot);
+
+/* NG_OK, NG_E_TOOBIG (past JSON_BUILDER_MAX) or NG_E_NOMEM. */
+ng_status_t json_builder_status(const json_builder_t *builder);
+
+/* strlen of the finished string (valid after a successful finish). */
+size_t json_builder_length(const json_builder_t *builder);
 
 /* ============================================================================
  * Filter Parsing
@@ -281,8 +316,7 @@ void json_serialize_event(const event_t *event, json_builder_t *builder);
  * (excluding the enclosing ["EVENT", sub, ...] wrapper).
  *
  * Callers can use this to reject, before storing or broadcasting, any event
- * whose serialization could never fit JSON_BUILDER_BUFFER_SIZE -- such
- * events would otherwise be truncated mid-JSON on delivery.
+ * whose serialization exceeds the NG_EVENT_JSON_MAX policy.
  */
 size_t json_serialized_event_size(const event_t *event);
 
