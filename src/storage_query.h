@@ -41,11 +41,24 @@ typedef struct {
     ng_status_t status;     /* first error, sticky */
 } sq_query_t;
 
+/* The 7 event columns every stored-event query returns, in this order. */
+#define SQ_EVENT_COLUMNS "lower(hex(e.id)), lower(hex(e.pubkey)), e.created_at, e.kind, e.tags, " \
+                         "e.content, lower(hex(e.sig))"
+
+/* NIP-01 indexes tags whose name is a single letter (a-z, A-Z): only those
+ * are stored in the tag table and only those may appear as #<name> filters. */
+bool sq_tag_name_indexable(const char *name);
+/* s[0..len) is exactly 64 lowercase hex digits (stored as a 32-byte blob). */
+bool sq_is_hex64(const char *s, size_t len);
+
 /* Compile `filter` into q (q must be zeroed or sq_free'd). do_count selects
- * SELECT COUNT(id) (no ORDER BY / LIMIT); otherwise the 7 event columns,
- * ORDER BY created_at DESC LIMIT ? bound to `limit`.
+ * a COUNT (no ORDER BY / LIMIT); otherwise SQ_EVENT_COLUMNS,
+ * ORDER BY created_at DESC, id ASC LIMIT ? bound to `limit`. Tag conditions
+ * use the tag table (see storage_sqlite.c); a multi-value tag condition
+ * adds DISTINCT (one event may carry several of the values).
  * Returns NG_OK, NG_E_TOOBIG (past SQ_MAX_SQL / SQ_MAX_PARAMS),
- * NG_E_INVALID (a tag condition without values) or NG_E_NOMEM. q must be sq_free'd in every case. */
+ * NG_E_INVALID (a tag condition without values or with a name that is not
+ * a single letter) or NG_E_NOMEM. q must be sq_free'd in every case. */
 ng_status_t sq_build(sq_query_t *q, const filter_t *filter, bool do_count, int limit);
 
 void sq_free(sq_query_t *q);

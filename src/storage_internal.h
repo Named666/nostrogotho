@@ -26,7 +26,9 @@ extern NG_THREAD_LOCAL sqlite3 *ngdb_conn;
 
 /* Per-connection prepared statements for the hot write path, reused across
  * events (reset instead of prepare/finalize per insert). */
-enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_COUNT };
+enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_TAG_INSERT, PS_TAG_INSERT_CHUNK, PS_COUNT };
+/* Tag index rows per multi-row INSERT step (PS_TAG_INSERT_CHUNK). */
+#define TAG_CHUNK 4
 
 /* The statement, reset and with bindings cleared; NULL on prepare error. */
 sqlite3_stmt *ngdb_ps(int which);
@@ -46,6 +48,8 @@ bool ngdb_delete_record_by_id_and_kind_and_ptag(const char *id, int kind, const 
 bool ngdb_delete_all_events_by_pubkey(const char *pubkey, time_t created_at, int exclude_kind,
                                       size_t *deleted);
 bool ngdb_purge_expired(time_t now, size_t *deleted);
+/* Free the writer thread's tag-index scratch (thread close). */
+void ngdb_write_scratch_free(void);
 
 /* storage_read.c */
 event_t *ngdb_get_event_by_id(const char *id);

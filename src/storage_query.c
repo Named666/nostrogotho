@@ -113,37 +113,79 @@ static char *like_pattern(const char *fmt_a, const char *a, const char *fmt_b, c
     return out;
 }
 
-/* One exact tag-element match inside the stored tags JSON, for compact and
- * spaced JSON: (tags LIKE ? ESCAPE '\' OR tags LIKE ? ESCAPE '\'). */
-static void sq_tag_value(sq_query_t *q, const char *name, const char *value) {
-    sq_sql(q, "tags LIKE ? ESCAPE '\\'");
-    sq_owned(q, like_pattern("%[\"", name, "\",\"", value, "\"]%"));
-    sq_sql(q, " OR tags LIKE ? ESCAPE '\\'");
-    sq_owned(q, like_pattern("%[\"", name, "\", \"", value, "\"]%"));
+bool sq_tag_name_indexable(const char *name) {
+    return name && ((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')) &&
+           name[1] == '\0';
+}
+
+bool sq_is_hex64(const char *s, size_t len) {
+    if (len != 64) return false;
+    for (size_t i = 0; i < 64; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) return false;
+    return true;
+}
+
+/* One tag value placeholder: 64-char lowercase hex values are stored as
+ * 32-byte blobs in the tag table (storage_write.c), everything else as text. */
+static void sq_tag_value(sq_query_t *q, char *value) {
+    sq_sql(q, sq_is_hex64(value, strlen(value)) ? "unhex(?)" : "?");
+    sq_text(q, value);
+}
+
+/* "<alias>.name = ? AND <alias>.value IN (...)" for one tag condition. */
+static void sq_tag_match(sq_query_t *q, const char *alias, const tag_t *tag) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s.name = ? AND %s.value ", alias, alias);
+    sq_sql(q, buf);
+    sq_text(q, tag->elements[0]);
+    if (tag->count == 2) { sq_sql(q, "= "); sq_tag_value(q, tag->elements[1]); return; }
+    sq_sql(q, "IN (");
+    for (size_t v = 1; v < tag->count; v++) {
+        if (v > 1) sq_sql(q, ",");
+        sq_tag_value(q, tag->elements[v]);
+    }
+    sq_sql(q, ")");
 }
 
 /* ----------------------------------------------------------- compiler --- */
+/* Plain filters scan `event e` (pubkindidx / kindtimeidx / timeidx). Filters
+ * with tag conditions are driven by the tag index: the condition with the
+ * fewest values is joined (tag t, ordered by its (name, value, created_at,
+ * ev) key), the others are EXISTS point lookups on the same key. kinds and
+ * the time window are checked on the tag row itself before the join. */
 ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit) {
     q->status = NG_OK;
-    sq_sql(q, do_count ? "SELECT COUNT(id) FROM event"
-                       : "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, content, "
-                         "lower(hex(sig)) FROM event");
+    size_t drive = f->tags_count;
+    for (size_t t = 0; t < f->tags_count; t++) {
+        const tag_t *tag = &f->tags[t];
+        if (tag->count < 2 || !sq_tag_name_indexable(tag->elements[0])) { sq_fail(q, NG_E_INVALID); return q->status; }
+        if (drive == f->tags_count || tag->count < f->tags[drive].count) drive = t;
+    }
+    bool tagged = drive < f->tags_count;
+    bool multi = tagged && f->tags[drive].count > 2;   /* one event can match several values */
+    const char *tc = tagged ? "t." : "e.";             /* created_at / kind source */
+    char buf[96];
+
+    if (do_count) sq_sql(q, multi ? "SELECT COUNT(DISTINCT e.seq) FROM " : "SELECT COUNT(*) FROM ");
+    else sq_sql(q, multi ? "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM " : "SELECT " SQ_EVENT_COLUMNS " FROM ");
+    sq_sql(q, tagged ? "tag t JOIN event e ON e.seq = t.ev" : "event e");
     const char *sep = " WHERE ";
 #define NEXT() (sq_sql(q, sep), sep = " AND ")
 
+    if (tagged) { NEXT(); sq_tag_match(q, "t", &f->tags[drive]); }
     if (f->ids_count > 0) {
         NEXT();
-        if (f->ids_count == 1) sq_sql(q, "id = unhex(?)");
-        else { sq_sql(q, "id IN ("); sq_list(q, "unhex(?)", f->ids_count); sq_sql(q, ")"); }
+        if (f->ids_count == 1) sq_sql(q, "e.id = unhex(?)");
+        else { sq_sql(q, "e.id IN ("); sq_list(q, "unhex(?)", f->ids_count); sq_sql(q, ")"); }
         for (size_t i = 0; i < f->ids_count; i++) sq_text(q, f->ids[i]);
     }
     if (f->authors_count > 0) {
+        NEXT();
         /* NIP-26: {authors: [A]} matches the event pubkey or a delegator,
          * resolved through the indexed delegation side table. */
-        NEXT();
-        sq_sql(q, "(pubkey IN (");
+        sq_sql(q, "(e.pubkey IN (");
         sq_list(q, "unhex(?)", f->authors_count);
-        sq_sql(q, ") OR id IN (SELECT event_id FROM delegation WHERE delegator IN (");
+        sq_sql(q, ") OR e.id IN (SELECT event_id FROM delegation WHERE delegator IN (");
         sq_list(q, "unhex(?)", f->authors_count);
         sq_sql(q, ")))");
         for (int pass = 0; pass < 2; pass++)
@@ -151,44 +193,36 @@ ng_status_t sq_build(sq_query_t *q, const filter_t *f, bool do_count, int limit)
     }
     if (f->kinds_count > 0) {
         NEXT();
-        if (f->kinds_count == 1) sq_sql(q, "kind = ?");
-        else { sq_sql(q, "kind IN ("); sq_list(q, "?", f->kinds_count); sq_sql(q, ")"); }
+        snprintf(buf, sizeof(buf), f->kinds_count == 1 ? "%skind = ?" : "%skind IN (", tc);
+        sq_sql(q, buf);
+        if (f->kinds_count > 1) { sq_list(q, "?", f->kinds_count); sq_sql(q, ")"); }
         for (size_t i = 0; i < f->kinds_count; i++) sq_int(q, f->kinds[i]);
     }
     if (f->since > 0) {
-        char s[48];
-        snprintf(s, sizeof(s), "created_at >= %lld", (long long) f->since);
-        NEXT(); sq_sql(q, s);
+        snprintf(buf, sizeof(buf), "%screated_at >= %lld", tc, (long long) f->since);
+        NEXT(); sq_sql(q, buf);
     }
     if (f->until > 0) {
-        char s[48];
-        snprintf(s, sizeof(s), "created_at <= %lld", (long long) f->until);
-        NEXT(); sq_sql(q, s);
+        snprintf(buf, sizeof(buf), "%screated_at <= %lld", tc, (long long) f->until);
+        NEXT(); sq_sql(q, buf);
     }
-    if (f->tags_count > 0) {
-        /* AND across tag names, OR across the values of one name. */
-        NEXT(); sq_sql(q, "(");
-        for (size_t t = 0; t < f->tags_count; t++) {
-            const tag_t *tag = &f->tags[t];
-            if (t) sq_sql(q, " AND ");
-            if (tag->count < 2) { sq_fail(q, NG_E_INVALID); break; }   /* name without values */
-            sq_sql(q, "(");
-            for (size_t v = 1; v < tag->count; v++) {
-                if (v > 1) sq_sql(q, " OR ");
-                sq_tag_value(q, tag->elements[0], tag->elements[v]);
-            }
-            sq_sql(q, ")");
-        }
-        sq_sql(q, ")");
+    for (size_t t = 0; t < f->tags_count; t++) {        /* AND across tag names */
+        if (t == drive) continue;
+        NEXT();
+        sq_sql(q, "EXISTS (SELECT 1 FROM tag x WHERE ");
+        sq_tag_match(q, "x", &f->tags[t]);
+        sq_sql(q, " AND x.created_at = e.created_at AND x.ev = e.seq)");
     }
     if (f->search && f->search[0]) {
         NEXT();
-        sq_sql(q, "content LIKE ? ESCAPE '\\'");
+        sq_sql(q, "e.content LIKE ? ESCAPE '\\'");
         sq_owned(q, like_pattern("%", f->search, NULL, NULL, "%"));
     }
 #undef NEXT
     if (!do_count) {
-        sq_sql(q, " ORDER BY created_at DESC LIMIT ?");
+        /* NIP-01: newest first; equal created_at by lowest id first. */
+        sq_sql(q, tagged && !multi ? " ORDER BY t.created_at DESC, e.id ASC LIMIT ?"
+                                   : " ORDER BY e.created_at DESC, e.id ASC LIMIT ?");
         sq_int(q, limit);
     }
     return q->status;

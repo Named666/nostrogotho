@@ -29,6 +29,9 @@ static const char *const ps_sql[PS_COUNT] = {
     [PS_TOMB_ADD] = "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (unhex(?), unhex(?))",
     [PS_REPL_SEL] = "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = unhex(?) AND kind = ?",
     [PS_DEL_ID] = "DELETE FROM event WHERE id = unhex(?)",
+    [PS_TAG_INSERT] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES (?, ?, ?, ?, ?)",
+    [PS_TAG_INSERT_CHUNK] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES "
+                            "(?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
 };
 static NG_THREAD_LOCAL sqlite3_stmt *ps[PS_COUNT];
 
@@ -47,6 +50,7 @@ sqlite3_stmt *ngdb_ps(int which) {
 
 static void ps_finalize_all(void) {
     for (int i = 0; i < PS_COUNT; i++) { if (ps[i]) sqlite3_finalize(ps[i]); ps[i] = NULL; }
+    ngdb_write_scratch_free();
 }
 static char db_dsn[1024];
 static const char *db_sync = "FULL";
@@ -148,8 +152,10 @@ static bool storage_init_sqlite3(const char *dsn) {
     /* Create tables and indexes */
     const char *schema_sql = 
         "CREATE TABLE IF NOT EXISTS event ("
-        /* ids, pubkeys and sigs are stored binary (32/32/64 bytes); SQL
+        /* seq aliases the rowid: the tag index refers to events by it.
+         * ids, pubkeys and sigs are stored binary (32/32/64 bytes); SQL
          * converts at the boundary with unhex(?) / lower(hex(col)). */
+        "    seq INTEGER PRIMARY KEY,"
         "    id BLOB NOT NULL CHECK (length(id) = 32),"
         "    pubkey BLOB NOT NULL CHECK (length(pubkey) = 32),"
         "    created_at INTEGER NOT NULL,"
@@ -164,6 +170,30 @@ static bool storage_init_sqlite3(const char *dsn) {
         "CREATE INDEX IF NOT EXISTS pubkindidx ON event(pubkey,kind);"
         "CREATE INDEX IF NOT EXISTS timeidx ON event(created_at DESC);"
         "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);"
+        /* NIP-01 tag index: one row per (single-letter tag name, first
+         * value) of each stored event, written by storage_write.c in the
+         * writer's batch transaction. 64-char lowercase hex values (e, p,
+         * q, E, P ... ids and pubkeys) are stored as 32-byte blobs. The key
+         * serves #<name> filters newest-first; kind rides along so kinds
+         * filters are checked before the join to event. */
+        "CREATE TABLE IF NOT EXISTS tag ("
+        "    name TEXT NOT NULL, value NOT NULL, created_at INTEGER NOT NULL,"
+        "    ev INTEGER NOT NULL, kind INTEGER NOT NULL,"
+        "    PRIMARY KEY (name, value, created_at, ev)"
+        ") WITHOUT ROWID;"
+        /* Every delete path (replaceable overwrite, NIP-09, NIP-40, NIP-62)
+         * drops the event's tag rows by recomputing their keys from the
+         * stored tags JSON: point deletes on the primary key, no second
+         * index on ev. Same selection and blob mapping as the insert side. */
+        "CREATE TRIGGER IF NOT EXISTS event_tag_delete AFTER DELETE ON event BEGIN"
+        "  DELETE FROM tag WHERE (name, value, created_at, ev) IN ("
+        "    SELECT n, CASE WHEN length(v) = 64 AND v NOT GLOB '*[^0-9a-f]*' THEN unhex(v) ELSE v END,"
+        "           old.created_at, old.seq"
+        "    FROM (SELECT json_extract(j.value, '$[0]') AS n, json_extract(j.value, '$[1]') AS v"
+        "          FROM json_each(CASE WHEN json_valid(old.tags) THEN old.tags ELSE '[]' END) AS j"
+        "          WHERE json_type(j.value, '$[0]') = 'text' AND json_type(j.value, '$[1]') = 'text')"
+        "    WHERE n GLOB '[A-Za-z]');"
+        "END;"
         /* NIP-09 tombstones: (id, deleting author). */
         "CREATE TABLE IF NOT EXISTS deleted_event ("
         "    id BLOB NOT NULL, pubkey BLOB NOT NULL, PRIMARY KEY (id, pubkey)"

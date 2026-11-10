@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "json_lite.h"
+#include "storage_query.h"
 #include "nips/nip40.h"
 #include "nips/nip_event.h"
 
@@ -63,6 +64,108 @@ static void store_delegations(const event_t *ev) {
     (void) found_any;
 }
 
+/* Bind one tag value: 64-char lowercase hex as a 32-byte blob (the form the
+ * query side and the delete trigger use), anything else as text. */
+static void bind_tag_value(sqlite3_stmt *st, int idx, const char *v, size_t len) {
+    if (sq_is_hex64(v, len)) {
+        unsigned char raw[32];
+        for (size_t i = 0; i < 32; i++) {
+            unsigned hi = (unsigned) (v[2 * i] <= '9' ? v[2 * i] - '0' : v[2 * i] - 'a' + 10);
+            unsigned lo = (unsigned) (v[2 * i + 1] <= '9' ? v[2 * i + 1] - '0' : v[2 * i + 1] - 'a' + 10);
+            raw[i] = (unsigned char) ((hi << 4) | lo);
+        }
+        sqlite3_bind_blob(st, idx, raw, 32, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_text(st, idx, v, (int) len, SQLITE_TRANSIENT);
+    }
+}
+
+/* store_tags - NIP-01 tag index rows for a just-inserted event (seq): one
+ * per tag whose name is a single letter and whose first value is a string.
+ * Exact duplicates collapse on the primary key. Values containing NUL are
+ * skipped (they cannot round-trip through the C string API).
+ *
+ * Rows are collected first (writer-thread scratch, reused across events,
+ * so no allocation per event once warm), then inserted TAG_CHUNK rows per
+ * statement step, which halves the per-row VDBE cost of one INSERT per row.
+ * false on a database error or OOM: the caller undoes the insert so a batch
+ * never commits an event the index does not know. */
+typedef struct { char name; size_t off, len; } tag_row_t;
+static NG_THREAD_LOCAL tag_row_t *tr_rows;
+static NG_THREAD_LOCAL size_t tr_cap;
+static NG_THREAD_LOCAL char *tr_buf;
+static NG_THREAD_LOCAL size_t tr_buf_cap;
+
+static bool tag_rows_reserve(size_t rows, size_t bytes) {
+    if (rows > tr_cap) {
+        size_t cap = ng_grow_cap(tr_cap, rows, 64);
+        tag_row_t *p = (tag_row_t *) ng_realloc_array(tr_rows, cap, sizeof(*p));
+        if (!p) return false;
+        tr_rows = p; tr_cap = cap;
+    }
+    if (bytes > tr_buf_cap) {
+        size_t cap = ng_grow_cap(tr_buf_cap, bytes, 4096);
+        char *p = (char *) realloc(tr_buf, cap);
+        if (!p) return false;
+        tr_buf = p; tr_buf_cap = cap;
+    }
+    return true;
+}
+
+void ngdb_write_scratch_free(void) {
+    free(tr_rows); free(tr_buf);
+    tr_rows = NULL; tr_buf = NULL; tr_cap = tr_buf_cap = 0;
+}
+
+static void bind_tag_row(sqlite3_stmt *st, int base, const tag_row_t *r, const event_t *ev,
+                         sqlite3_int64 seq) {
+    sqlite3_bind_text(st, base + 1, &r->name, 1, SQLITE_STATIC);
+    bind_tag_value(st, base + 2, tr_buf + r->off, r->len);
+    sqlite3_bind_int64(st, base + 3, (sqlite3_int64) ev->created_at);
+    sqlite3_bind_int64(st, base + 4, seq);
+    sqlite3_bind_int(st, base + 5, ev->kind);
+}
+
+static bool store_tags(const event_t *ev, sqlite3_int64 seq) {
+    if (!ev->tags_json || !ev->tags_json[0]) return true;
+    jstr_t key, tag, tags = jl_str(ev->tags_json);
+    size_t offset = 0, n = 0, used = 0;
+    /* Unescaped values never exceed the JSON text. */
+    size_t json_len = ev->tags_json_len ? ev->tags_json_len : strlen(ev->tags_json);
+    if (!tag_rows_reserve(16, json_len + 1)) return false;
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
+        jstr_t k2, nm, v;
+        size_t to = jl_next(tag, 0, &k2, &nm);
+        if (!to || nm.len != 3 || nm.buf[0] != '"') continue;    /* "x": one-letter name */
+        char name[2] = { nm.buf[1], '\0' };
+        if (!sq_tag_name_indexable(name)) continue;
+        if (jl_next(tag, to, &k2, &v) == 0 || !v.buf || v.buf[0] != '"') continue;
+        size_t vl;
+        if (!jl_unescape(v, tr_buf + used, &vl) || memchr(tr_buf + used, '\0', vl)) continue;
+        if (n == tr_cap && !tag_rows_reserve(n + 1, json_len + 1)) return false;
+        tr_rows[n].name = name[0]; tr_rows[n].off = used; tr_rows[n].len = vl;
+        n++; used += vl;
+    }
+    size_t i = 0;
+    for (; i + TAG_CHUNK <= n; i += TAG_CHUNK) {
+        sqlite3_stmt *st = ngdb_ps(PS_TAG_INSERT_CHUNK);
+        if (!st) return false;
+        for (int r = 0; r < TAG_CHUNK; r++) bind_tag_row(st, r * 5, &tr_rows[i + (size_t) r], ev, seq);
+        int rc = sqlite3_step(st);
+        sqlite3_reset(st);
+        if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error (tag index): %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
+    }
+    for (; i < n; i++) {
+        sqlite3_stmt *st = ngdb_ps(PS_TAG_INSERT);
+        if (!st) return false;
+        bind_tag_row(st, 0, &tr_rows[i], ev, seq);
+        int rc = sqlite3_step(st);
+        sqlite3_reset(st);
+        if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error (tag index): %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
+    }
+    return true;
+}
+
 /* ngdb_insert_record - Store a new event in database
  * 
  * Inserts an event into the database. Event should be validated
@@ -110,7 +213,18 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
         return STORAGE_PUT_FAILED;
     }
     if (changes == 0) return STORAGE_PUT_DUPLICATE;   /* ON CONFLICT(id) DO NOTHING */
-    /* Index delegation tags only after the event row exists (FK). */
+    /* The event row exists: index its tags (and delegation tags, FK). A
+     * failed tag index fails the insert; the writer rolls the batch back. */
+    if (!store_tags(ev, sqlite3_last_insert_rowid(ngdb_conn))) {
+        /* Undo the row (the delete trigger drops any tag rows written). */
+        sqlite3_stmt *del = ngdb_ps(PS_DEL_ID);
+        if (del) {
+            sqlite3_bind_text(del, 1, ev->id, -1, SQLITE_STATIC);
+            if (sqlite3_step(del) != SQLITE_DONE) fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+            sqlite3_reset(del);
+        }
+        return STORAGE_PUT_FAILED;
+    }
     store_delegations(ev);
     return STORAGE_PUT_INSERTED;
 }

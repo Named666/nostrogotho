@@ -691,7 +691,9 @@ static bool append_filter_tag(filter_t *filter, const char *name,
     tag_t *resized;
     size_t offset = 0;
 
-    if (filter->tags_count >= MAX_TAG_ELEMENTS || name[0] == '\0') return false;
+    /* NIP-01: only single-letter (a-z, A-Z) tags are indexed and queryable. */
+    if (filter->tags_count >= MAX_TAG_ELEMENTS || !((name[0] >= 'a' && name[0] <= 'z') ||
+        (name[0] >= 'A' && name[0] <= 'Z')) || name[1] != '\0') return false;
     tag = tag_alloc(MAX_TAG_ELEMENTS);
     if (!tag) return false;
     tag->elements[tag->count++] = string_dup(name);

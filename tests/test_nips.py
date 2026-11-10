@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""NIP behavior tests against a live relay (one relay per section).
+Usage: tests/test_nips.py [section ...]   (default: all sections)"""
+import json, sys, time
+sys.path.insert(0, __import__("os").path.dirname(__file__))
+from ngtest import Key, WS, Relay, check, summary
+
+SECTIONS = {}
+def section(fn): SECTIONS[fn.__name__] = fn; return fn
+
+
+@section
+def tags():
+    """NIP-01 tag filters via the tag index (A1)."""
+    r = Relay(); w = WS(r.port); k = Key(); other = Key()
+    hint = k.ev("mention with relay hint", 1, [["p", other.pk, "wss://relay.example"]])
+    plain = k.ev("plain mention", 1, [["p", other.pk]])
+    root = k.ev("root")
+    reply = k.ev("reply", 1, [["e", root["id"], "wss://relay.example", "reply"], ["p", k.pk]])
+    react = k.ev("+", 7, [["e", root["id"]], ["p", k.pk], ["k", "1"]])
+    for e in (hint, plain, root, reply, react): w.publish(e)
+    evs, end = w.req("p", {"#p": [other.pk]})
+    check("#p matches tags with and without a relay hint", {e["id"] for e in evs} == {hint["id"], plain["id"]}, end)
+    evs, _ = w.req("e", {"#e": [root["id"]], "kinds": [1]})
+    check("#e matches a marker tag, kinds checked", [e["id"] for e in evs] == [reply["id"]])
+    evs, _ = w.req("e2", {"#e": [root["id"]], "#k": ["1"]})
+    check("two tag names AND", [e["id"] for e in evs] == [react["id"]])
+    evs, _ = w.req("multi", {"#p": [other.pk, k.pk]})
+    ids = [e["id"] for e in evs]
+    check("multi-value tag filter: each event once", len(ids) == len(set(ids)) == 4, len(ids))
+    evs, end = w.req("long", {"#title": ["x"]})
+    check("multi-letter tag filter refused (NIP-01 indexes single letters)", end and end[0] == "CLOSED", end)
+    # replaceable overwrite drops the old version's tag rows
+    f1 = k.ev("", 3, [["p", other.pk]], ca=int(time.time()) - 10)
+    f2 = k.ev("", 3, [["p", k.pk]])
+    w.publish(f1); w.publish(f2)
+    evs, _ = w.req("f", {"kinds": [3], "#p": [other.pk]})
+    check("replaced kind 3 no longer matches its old p tags", evs == [])
+    evs, _ = w.req("f2", {"kinds": [3], "#p": [k.pk]})
+    check("current kind 3 matches", [e["id"] for e in evs] == [f2["id"]])
+    # NIP-01 ordering: newest first, ties by lowest id
+    t = int(time.time()) - 100
+    a, b = k.ev("tie a", 1, [["t", "tie"]], ca=t), k.ev("tie b", 1, [["t", "tie"]], ca=t)
+    w.publish(a); w.publish(b)
+    evs, _ = w.req("tie", {"#t": ["tie"]})
+    check("equal created_at ordered by lowest id", [e["id"] for e in evs] == sorted([a["id"], b["id"]]))
+    r.stop()
+
+
+if __name__ == "__main__":
+    for name in sys.argv[1:] or SECTIONS:
+        print(f"-- {name}: {SECTIONS[name].__doc__}")
+        SECTIONS[name]()
+    sys.exit(summary())

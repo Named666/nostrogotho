@@ -9,3 +9,4 @@ build/
 *.so
 *.old
 TODO.md
+__pycache__/

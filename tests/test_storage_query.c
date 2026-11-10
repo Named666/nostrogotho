@@ -19,9 +19,8 @@ static void test_simple_req(void) {
     f.kinds = kinds; f.kinds_count = 1; f.since = 100;
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 20);
-    const char *want = "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, content, "
-                       "lower(hex(sig)) FROM event WHERE kind = ? AND created_at >= 100 "
-                       "ORDER BY created_at DESC LIMIT ?";
+    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM event e WHERE e.kind = ? AND e.created_at >= 100 "
+                       "ORDER BY e.created_at DESC, e.id ASC LIMIT ?";
     check("kinds+since SQL", st == NG_OK && q.sql && strcmp(q.sql, want) == 0 && q.len == strlen(want), q.sql);
     check("kinds+since params", q.n == 2 && q.params[0].type == SQ_INT && q.params[0].num == 1 &&
           q.params[1].type == SQ_INT && q.params[1].num == 20, NULL);
@@ -34,9 +33,9 @@ static void test_count_authors_ids(void) {
     f.ids = ids; f.ids_count = 2; f.authors = authors; f.authors_count = 1; f.until = 5;
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, true, 500);
-    const char *want = "SELECT COUNT(id) FROM event WHERE id IN (unhex(?),unhex(?)) AND "
-                       "(pubkey IN (unhex(?)) OR id IN (SELECT event_id FROM delegation WHERE delegator IN (unhex(?)))) "
-                       "AND created_at <= 5";
+    const char *want = "SELECT COUNT(*) FROM event e WHERE e.id IN (unhex(?),unhex(?)) AND "
+                       "(e.pubkey IN (unhex(?)) OR e.id IN (SELECT event_id FROM delegation WHERE delegator IN (unhex(?)))) "
+                       "AND e.created_at <= 5";
     check("COUNT ids+authors SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
     check("COUNT ids+authors params (no LIMIT)", q.n == 4 && q.params[0].text == H1 && q.params[1].text == H2 &&
           q.params[2].text == H2 && q.params[3].text == H2 && !q.params[0].owned, NULL);
@@ -51,17 +50,45 @@ static void test_tags_and_search_escaped(void) {
     f.search = (char *) "50%_off\\";
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 10);
-    const char *want = "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, content, "
-                       "lower(hex(sig)) FROM event WHERE ((tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR "
-                       "tags LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\')) AND content LIKE ? ESCAPE '\\' "
-                       "ORDER BY created_at DESC LIMIT ?";
-    check("tags+search SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
-    int ok = q.n == 6 && q.params[0].owned && q.params[4].owned &&
-             strcmp(q.params[0].text, "%[\"t\",\"a\\%b\"]%") == 0 &&
-             strcmp(q.params[1].text, "%[\"t\", \"a\\%b\"]%") == 0 &&
-             strcmp(q.params[2].text, "%[\"t\",\"c\\_d\"]%") == 0 &&
-             strcmp(q.params[4].text, "%50\\%\\_off\\\\%") == 0;
-    check("tag / search patterns LIKE-escaped", ok, q.n > 4 ? q.params[4].text : NULL);
+    const char *want = "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
+                       "WHERE t.name = ? AND t.value IN (?,?) AND e.content LIKE ? ESCAPE '\\' "
+                       "ORDER BY e.created_at DESC, e.id ASC LIMIT ?";
+    check("multi-value tag + search SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
+    int ok = q.n == 5 && !q.params[0].owned && strcmp(q.params[0].text, "t") == 0 &&
+             strcmp(q.params[1].text, "a%b") == 0 && strcmp(q.params[2].text, "c_d") == 0 &&
+             q.params[3].owned && strcmp(q.params[3].text, "%50\\%\\_off\\\\%") == 0;
+    check("tag values exact, search pattern LIKE-escaped", ok, q.n > 3 ? q.params[3].text : NULL);
+    sq_free(&q);
+}
+
+/* Single-value tag drives the join in index order; a second tag name is an
+ * EXISTS point lookup; hex values compare as blobs; kinds/since on the tag row. */
+static void test_tag_join(void) {
+    filter_t f; memset(&f, 0, sizeof(f));
+    char *pe[] = {(char *) "p", H1};
+    char *te[] = {(char *) "t", (char *) "nostr", (char *) "bitcoin"};
+    tag_t tags[2] = { { te, 3, 3 }, { pe, 2, 2 } };
+    int kinds[] = {1, 7};
+    f.tags = tags; f.tags_count = 2; f.kinds = kinds; f.kinds_count = 2; f.since = 9;
+    sq_query_t q = {0};
+    ng_status_t st = sq_build(&q, &f, false, 50);
+    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
+                       "WHERE t.name = ? AND t.value = unhex(?) AND t.kind IN (?,?) AND t.created_at >= 9 "
+                       "AND EXISTS (SELECT 1 FROM tag x WHERE x.name = ? AND x.value IN (?,?) "
+                       "AND x.created_at = e.created_at AND x.ev = e.seq) "
+                       "ORDER BY t.created_at DESC, e.id ASC LIMIT ?";
+    check("tag join SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
+    check("tag join params", q.n == 8 && strcmp(q.params[0].text, "p") == 0 && q.params[1].text == H1 &&
+          q.params[2].num == 1 && q.params[3].num == 7 && strcmp(q.params[4].text, "t") == 0, NULL);
+    sq_free(&q);
+    st = sq_build(&q, &f, true, 50);
+    check("tag COUNT", st == NG_OK && strncmp(q.sql, "SELECT COUNT(*) FROM tag t JOIN", 31) == 0, q.sql);
+    sq_free(&q);
+    char *bad[] = {(char *) "title", (char *) "x"};
+    tag_t badt = { bad, 2, 2 };
+    memset(&f, 0, sizeof(f)); f.tags = &badt; f.tags_count = 1;
+    st = sq_build(&q, &f, false, 50);
+    check("multi-letter tag name -> NG_E_INVALID", st == NG_E_INVALID, NULL);
     sq_free(&q);
 }
 
@@ -116,6 +143,7 @@ int main(void) {
     test_simple_req();
     test_count_authors_ids();
     test_tags_and_search_escaped();
+    test_tag_join();
     test_long_search_not_truncated();
     test_caps();
     return failures ? 1 : 0;
