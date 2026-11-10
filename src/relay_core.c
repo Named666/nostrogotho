@@ -619,6 +619,42 @@ nip01_process_result_t relay_core_commit_event(relay_conn_t *conn, const event_t
     return nip01_dispatch_event(conn, event, storage_ctx, service_url);
 }
 
+/* ---- relay-generated events (writer thread) ---------------------------- */
+
+#define EMIT_MAX 256
+static NG_THREAD_LOCAL relay_bcast_t *emits[EMIT_MAX];
+static NG_THREAD_LOCAL size_t n_emits;
+
+bool relay_core_emit(event_t *ev) {
+    bool ok = n_emits < EMIT_MAX && storage_ctx && crypto_sign_event(ev);
+    bool repl = ev->kind == 0 || ev->kind == 3 || (ev->kind >= 10000 && ev->kind < 20000);
+    bool addr = ev->kind >= 30000 && ev->kind < 40000;
+    if (ok && (repl || addr) && storage_ctx->replaceable_admit) {
+        char *d = addr ? nip_event_tag_value(ev, "d") : NULL;
+        ok = storage_ctx->replaceable_admit(ev, addr ? (d ? d : "") : NULL) == STORAGE_ADMIT_NEWEST;
+        free(d);
+    }
+    if (ok) ok = storage_ctx->insert_event(ev) == STORAGE_PUT_INSERTED;
+    if (ok) dedupe_forget(ev->id);
+    relay_bcast_t *b = relay_bcast_new(ev);           /* consumes ev */
+    if (!ok || !b) { relay_bcast_free(b); return false; }
+    emits[n_emits++] = b;
+    return true;
+}
+
+size_t relay_core_take_emits(relay_bcast_t **out, size_t cap) {
+    size_t n = n_emits < cap ? n_emits : cap;
+    memcpy(out, emits, n * sizeof(*out));
+    for (size_t i = n; i < n_emits; i++) relay_bcast_free(emits[i]);
+    n_emits = 0;
+    return n;
+}
+
+void relay_core_drop_emits(void) {
+    for (size_t i = 0; i < n_emits; i++) relay_bcast_free(emits[i]);
+    n_emits = 0;
+}
+
 void relay_core_dedupe_settle(const event_t *event, const nip01_process_result_t *r) {
     if (event->kind >= 20000 && event->kind < 30000) return;
     /* Stored, already present, superseded or tombstoned: remember the id.
@@ -715,6 +751,11 @@ static void handle_event(relay_conn_t *connection, json_value_t *values, size_t 
     result = relay_core_commit_event(connection, &event);
     if (guarded) relay_core_dedupe_settle(&event, &result);
     relay_core_send_ok(connection, &event, &result);
+    {
+        relay_bcast_t *em[EMIT_MAX];
+        size_t m = relay_core_take_emits(em, EMIT_MAX);
+        for (size_t i = 0; i < m; i++) { relay_core_broadcast_shard(0, em[i]); relay_bcast_free(em[i]); }
+    }
     if (result.accepted && result.should_broadcast && !result.duplicate) {
         relay_bcast_t *b = relay_bcast_new(&event);       /* takes ownership */
         if (b) { relay_core_broadcast_shard(0, b); relay_bcast_free(b); }

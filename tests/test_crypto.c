@@ -46,10 +46,32 @@ static void test_signature_verify(void) {
     printf("INFO: test_signature_verify - requires crypto_init first\n");
 }
 
+/* Relay key: BIP-340 test vector 1 (secret 3), sign -> verifies. */
+static void test_relay_sign(void) {
+    if (!crypto_init()) { printf("FAIL: crypto_init\n"); return; }
+    int ok = !crypto_relay_key_load("zz") && !crypto_relay_pubkey() &&
+             crypto_relay_key_load("0000000000000000000000000000000000000000000000000000000000000003") &&
+             strcmp(crypto_relay_pubkey(), "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9") == 0;
+    printf("%s: relay key load + pubkey\n", ok ? "PASS" : "FAIL");
+    event_t ev; memset(&ev, 0, sizeof ev);
+    ev.kind = 39000; ev.created_at = 1700000000;
+    ev.tags_json = (char *) "[[\"d\",\"g1\"],[\"name\",\"caf\u00e9\"]]"; ev.tags_json_len = strlen(ev.tags_json);
+    ev.content = (char *) "line\n\"q\""; ev.content_len = strlen(ev.content);
+    ok = crypto_sign_event(&ev) && check_event_status(&ev) == CHECK_EVENT_OK &&
+         strcmp(ev.pubkey, crypto_relay_pubkey()) == 0;
+    printf("%s: crypto_sign_event -> check_event OK\n", ok ? "PASS" : "FAIL");
+    ev.content = (char *) "tampered"; ev.content_len = 8;
+    printf("%s: tampered -> BAD_ID\n", check_event_status(&ev) == CHECK_EVENT_BAD_ID ? "PASS" : "FAIL");
+    crypto_relay_key_forget();
+    printf("%s: forget\n", !crypto_relay_pubkey() && !crypto_sign_event(&ev) ? "PASS" : "FAIL");
+    crypto_deinit();
+}
+
 int main(void) {
     printf("Running crypto tests...\n");
     test_count_leading_zero_bits();
     test_signature_verify();
+    test_relay_sign();
     printf("Crypto tests complete.\n");
     return 0;
 }

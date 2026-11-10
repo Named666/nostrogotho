@@ -58,6 +58,31 @@ static void apply_config(const char *service_url, int min_pow, int lower_limit, 
                         "honors only ALL_RELAYS requests\n");
 }
 
+/* The relay's signing key (relay-generated NIP-29 / NIP-43 events). The
+ * file holds the 64-hex secret; the key never reaches a log. relay_self
+ * defaults to its pubkey and must match it when set. */
+static bool load_relay_key(void) {
+    ng_relay_info_t *info = &cfg.info;
+    if (!info->secret_key_file[0]) return true;
+    FILE *f = fopen(info->secret_key_file, "r");
+    if (!f) { perror(info->secret_key_file); return false; }
+    char buf[130] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ')) buf[--n] = '\0';
+    bool ok = crypto_relay_key_load(buf);
+    memset(buf, 0, sizeof buf);
+    if (!ok) { fprintf(stderr, "%s: not a 64-hex secp256k1 secret key\n", info->secret_key_file); return false; }
+    const char *pk = crypto_relay_pubkey();
+    if (info->self[0] && strcmp(info->self, pk) != 0) {
+        fprintf(stderr, "relay_self does not match the key in %s (its pubkey is %s)\n", info->secret_key_file, pk);
+        return false;
+    }
+    snprintf(info->self, sizeof(info->self), "%s", pk);
+    ng_relay_info_apply(info);
+    return true;
+}
+
 /* Rate limits and bans (ratelimit.h). */
 static bool apply_policy(void) {
     const ng_policy_t *p = &cfg.policy;
@@ -89,6 +114,7 @@ static bool init_storage(const char *db_path) {
         return false;
     }
 
+    if (!load_relay_key()) return false;
     storage_context_init_sqlite3(&storage_ctx);
     if (!storage_ctx.init ||
         !storage_ctx.init(db_path ? db_path : "./nostrogotho.sqlite")) {

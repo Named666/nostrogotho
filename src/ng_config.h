@@ -52,6 +52,7 @@ typedef struct {
     char description[2048];     /* relay_description */
     char pubkey[65];            /* relay_pubkey: operator's pubkey (hex) */
     char self[65];              /* relay_self: the relay's own pubkey (hex) */
+    char secret_key_file[256];  /* relay_secret_key_file: hex secret of "self" */
     char contact[256];          /* relay_contact */
     char icon[512];             /* relay_icon */
     char banner[512];           /* relay_banner */

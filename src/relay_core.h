@@ -101,6 +101,16 @@ relay_bcast_t *relay_bcast_new(event_t *ev);
 void relay_bcast_free(relay_bcast_t *b);
 void relay_core_broadcast_shard(int shard, const relay_bcast_t *b);
 
+/* Relay-generated events (writer thread, inside the batch transaction).
+ * relay_core_emit signs ev with the relay key, stores it (replacing an
+ * older version of a replaceable / addressable one) and queues it for
+ * fan-out once the batch commits. Consumes ev's heap fields in every case.
+ * The writer calls relay_core_take_emits after a successful COMMIT and
+ * relay_core_drop_emits after a failed one. */
+bool relay_core_emit(event_t *ev);
+size_t relay_core_take_emits(relay_bcast_t **out, size_t cap);
+void relay_core_drop_emits(void);
+
 /* Free all subscriptions of every shard (shutdown). */
 void relay_core_shutdown(void);
 

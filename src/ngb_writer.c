@@ -162,6 +162,7 @@ static void writer_commit(storage_context_t *st, wjob_t **batch, nip01_process_r
     stat_us[0] += (unsigned long long) (t1 - t0);
     if (tx && st->commit_batch && !st->commit_batch()) {
         if (st->rollback_batch) st->rollback_batch();
+        relay_core_drop_emits();          /* relay-generated events rolled back too */
         for (int i = 0; i < n; i++) if (results[i].accepted) {
             results[i].accepted = false; results[i].should_broadcast = false; results[i].duplicate = false;
             snprintf(results[i].response_msg, sizeof(results[i].response_msg), "error: storage commit failed");
@@ -184,6 +185,10 @@ static void writer_finish(wjob_t **batch, nip01_process_result_t *results, int n
         free(batch[i]);
     }
     ngb_workers_broadcast(fan, k);
+    /* Relay-generated events (NIP-29 / NIP-43) committed with this batch. */
+    static relay_bcast_t *emitted[256];
+    size_t m = relay_core_take_emits(emitted, sizeof(emitted) / sizeof(emitted[0]));
+    if (m) ngb_workers_broadcast(emitted, (int) m);
     ngb_outbox_flush_and_unref();
 }
 

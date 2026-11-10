@@ -112,6 +112,7 @@ static const cfg_key_t keys[] = {
     { "relay_description",  K_STR,     0, sizeof(((ng_relay_info_t *) 0)->description), F(info.description) },
     { "relay_pubkey",       K_HEX64,   0, 65, F(info.pubkey) },
     { "relay_self",         K_HEX64,   0, 65, F(info.self) },
+    { "relay_secret_key_file", K_STR,  0, sizeof(((ng_relay_info_t *) 0)->secret_key_file), F(info.secret_key_file) },
     { "relay_contact",      K_STR,     0, sizeof(((ng_relay_info_t *) 0)->contact), F(info.contact) },
     { "relay_icon",         K_STR,     0, sizeof(((ng_relay_info_t *) 0)->icon), F(info.icon) },
     { "relay_banner",       K_STR,     0, sizeof(((ng_relay_info_t *) 0)->banner), F(info.banner) },

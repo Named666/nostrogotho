@@ -160,6 +160,16 @@ bool signature_verify(const char *sig_hex, const char *pubkey_hex,
  */
 bool check_event(const event_t *ev);
 
+/* The relay's own signing key (NIP-11 "self"), for relay-generated events.
+ * Load once at startup after crypto_init (false: not 64 hex / not a valid
+ * secret key). crypto_relay_pubkey: its x-only pubkey hex, NULL if none.
+ * crypto_sign_event sets pubkey, id and sig of ev (writer thread). The
+ * secret is never printed. */
+bool crypto_relay_key_load(const char *seckey_hex);
+void crypto_relay_key_forget(void);
+const char *crypto_relay_pubkey(void);
+bool crypto_sign_event(event_t *ev);
+
 /* check_event with the failure class (NIP-01 OK reasons). */
 typedef enum {
     CHECK_EVENT_OK = 0,

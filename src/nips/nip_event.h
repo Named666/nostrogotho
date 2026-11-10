@@ -12,5 +12,7 @@ bool nip_event_has_tag(const event_t *event, const char *name, const char *value
  * ignored). relay == "" matches any ws:// or wss:// URL (relay_url unset). */
 bool nip_event_has_relay_tag(const event_t *event, const char *relay);
 char *nip_tag_element(jstr_t tag, size_t index);
+/* Second element of the first tag named name (malloc'd), NULL if none. */
+char *nip_event_tag_value(const event_t *event, const char *name);
 
 #endif /* NIP_EVENT_H_ */

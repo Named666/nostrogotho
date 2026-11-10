@@ -55,3 +55,15 @@ bool nip_event_has_relay_tag(const event_t *event, const char *relay) {
     }
     return false;
 }
+
+char *nip_event_tag_value(const event_t *event, const char *name) {
+    jstr_t key, tag, tags = jl_str(event->tags_json ? event->tags_json : "[]");
+    size_t offset = 0;
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
+        char *n = nip_tag_element(tag, 0);
+        bool hit = n && strcmp(n, name) == 0;
+        free(n);
+        if (hit) return nip_tag_element(tag, 1);
+    }
+    return NULL;
+}

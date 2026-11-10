@@ -180,6 +180,7 @@ bool crypto_init(void) {
  * Thread-unsafe; must be called during single-threaded shutdown.
  */
 void crypto_deinit(void) {
+    crypto_relay_key_forget();
     if (verify_ctx) {
         secp256k1_context_destroy(verify_ctx);
         verify_ctx = NULL;
@@ -652,8 +653,8 @@ static char *canonical_tags_json(const char *raw) {
  * 
  * Fails gracefully with detailed logging on any step failure.
  */
-check_event_status_t check_event_status(const event_t *ev) {
-    if (!ev) return CHECK_EVENT_ERROR;
+/* NIP-01 event hash: sha256 of [0,pubkey,created_at,kind,tags,content]. */
+static bool event_digest(const event_t *ev, uint8_t digest[32]) {
     
     /* Build the event hash input: [0, pubkey, created_at, kind, tags, content]
      * Content and pubkey must be JSON-escaped for proper serialization.
@@ -667,7 +668,7 @@ check_event_status_t check_event_status(const event_t *ev) {
     
     /* Escape pubkey for JSON (64 hex chars -> 129-byte stack buffer, safe) */
     if (!json_escape_string(ev->pubkey, escaped_pubkey, sizeof(escaped_pubkey))) {
-        return CHECK_EVENT_ERROR;
+        return false;
     }
     
     /* Escape content for JSON - heap allocated, sized for worst-case escaping */
@@ -675,14 +676,14 @@ check_event_status_t check_event_status(const event_t *ev) {
     size_t content_len = strlen(content);
     
     size_t escaped_content_cap;
-    if (!ng_size_flex(1, content_len, 6, &escaped_content_cap)) return CHECK_EVENT_ERROR;
+    if (!ng_size_flex(1, content_len, 6, &escaped_content_cap)) return false;
     char *escaped_content = (char *) malloc(escaped_content_cap);
     if (!escaped_content) {
-        return CHECK_EVENT_ERROR;
+        return false;
     }
     if (!json_escape_string(content, escaped_content, escaped_content_cap)) {
         free(escaped_content);
-        return CHECK_EVENT_ERROR;
+        return false;
     }
     
     /* Size the serialization buffer: fixed overhead + tags + escaped content */
@@ -690,7 +691,7 @@ check_event_status_t check_event_status(const event_t *ev) {
     const char *tags_json = "[]";
     if (ev->tags_json) {
         if (tags_json_is_canonical(ev->tags_json, strlen(ev->tags_json))) tags_json = ev->tags_json;
-        else if (!(canon_tags = canonical_tags_json(ev->tags_json))) { free(escaped_content); return CHECK_EVENT_ERROR; }
+        else if (!(canon_tags = canonical_tags_json(ev->tags_json))) { free(escaped_content); return false; }
         else tags_json = canon_tags;
     }
     size_t tags_len = strlen(tags_json);
@@ -699,7 +700,7 @@ check_event_status_t check_event_status(const event_t *ev) {
     if (!buffer) {
         free(escaped_content);
         free(canon_tags);
-        return CHECK_EVENT_ERROR;
+        return false;
     }
     
     int written = snprintf(buffer, buffer_cap,
@@ -713,14 +714,18 @@ check_event_status_t check_event_status(const event_t *ev) {
     
     if (written < 0 || (size_t)written >= buffer_cap) {
         free(buffer);
-        return CHECK_EVENT_ERROR;
+        return false;
     }
     
-    /* Compute SHA256 hash */
-    uint8_t digest[32];
     sha256((const uint8_t *)buffer, strlen(buffer), digest);
     free(buffer);
-    buffer = NULL;
+    return true;
+}
+
+check_event_status_t check_event_status(const event_t *ev) {
+    if (!ev) return CHECK_EVENT_ERROR;
+    uint8_t digest[32];
+    if (!event_digest(ev, digest)) return CHECK_EVENT_ERROR;
     
     /* Convert digest to hex and compare with event ID */
     char *id_hex = bytes_to_hex(digest, 32);
@@ -741,6 +746,49 @@ check_event_status_t check_event_status(const event_t *ev) {
 
 bool check_event(const event_t *ev) {
     return check_event_status(ev) == CHECK_EVENT_OK;
+}
+
+/* ============================================================================
+ * Relay signing key (NIP-29 / NIP-43 relay-generated events)
+ * ============================================================================ */
+
+static secp256k1_keypair relay_keypair;
+static bool relay_key_loaded;
+static char relay_pubkey_hex[MAX_PUBKEY_SIZE + 1];
+
+bool crypto_relay_key_load(const char *seckey_hex) {
+    uint8_t sk[32];
+    secp256k1_xonly_pubkey xpk;
+    uint8_t pk[32];
+    size_t n = 0;
+    bool ok = verify_ctx && seckey_hex && strlen(seckey_hex) == 64 && hex_to_bytes(seckey_hex, 64, sk, sizeof sk, &n) &&
+              n == 32 &&
+              secp256k1_keypair_create(verify_ctx, &relay_keypair, sk) &&
+              secp256k1_keypair_xonly_pub(verify_ctx, &xpk, NULL, &relay_keypair) &&
+              secp256k1_xonly_pubkey_serialize(verify_ctx, pk, &xpk);
+    memset(sk, 0, sizeof sk);
+    if (!ok) { memset(&relay_keypair, 0, sizeof relay_keypair); relay_key_loaded = false; return false; }
+    for (int i = 0; i < 32; i++) snprintf(relay_pubkey_hex + 2 * i, 3, "%02x", pk[i]);
+    relay_key_loaded = true;
+    return true;
+}
+
+void crypto_relay_key_forget(void) {
+    memset(&relay_keypair, 0, sizeof relay_keypair);
+    relay_key_loaded = false;
+}
+
+const char *crypto_relay_pubkey(void) { return relay_key_loaded ? relay_pubkey_hex : NULL; }
+
+bool crypto_sign_event(event_t *ev) {
+    uint8_t digest[32], sig[64];
+    if (!relay_key_loaded || !ev) return false;
+    memcpy(ev->pubkey, relay_pubkey_hex, sizeof relay_pubkey_hex);
+    if (!event_digest(ev, digest)) return false;
+    if (!secp256k1_schnorrsig_sign32(verify_ctx, sig, digest, &relay_keypair, NULL)) return false;
+    for (int i = 0; i < 32; i++) snprintf(ev->id + 2 * i, 3, "%02x", digest[i]);
+    for (int i = 0; i < 64; i++) snprintf(ev->sig + 2 * i, 3, "%02x", sig[i]);
+    return true;
 }
 
 /* ============================================================================
