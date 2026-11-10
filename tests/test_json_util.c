@@ -12,6 +12,7 @@ static void test_filter_many_ids(void) {
     size_t n = 40;
     size_t cap = n * 70 + 32;
     char *buf = (char *) malloc(cap);
+    if (!buf) { printf("FAIL: out of memory\n"); return; }
     size_t off = (size_t) snprintf(buf, cap, "{\"ids\":[");
     for (size_t i = 0; i < n; i++)
         off += (size_t) snprintf(buf + off, cap - off, "%s\"%016llx%016llx%016llx%016llx\"",
@@ -106,6 +107,8 @@ static void test_serialize_huge_tags_terminated(void) {
  * agree; events carrying oversized tags must be rejected at parse time. */
 static void test_event_with_oversized_tag_rejected(void) {
     char *tags = (char *) malloc(65536);
+    char *wire = (char *) malloc(65536 + 512);
+    if (!tags || !wire) { printf("FAIL: out of memory\n"); free(tags); free(wire); return; }
     size_t off = (size_t) snprintf(tags, 65536, "[[");
     for (int i = 0; i < 300; i++)
         off += (size_t) snprintf(tags + off, 65536 - off, "%s\"x\"", i ? "," : "");
@@ -114,7 +117,6 @@ static void test_event_with_oversized_tag_rejected(void) {
             "\"kind=1\",\"%064d\"]]", 0);
     (void) off;
 
-    char *wire = (char *) malloc(65536 + 512);
     snprintf(wire, 65536 + 512,
              "{\"id\":\"%064d\",\"pubkey\":\"%064d\",\"created_at\":1700000000,"
              "\"kind\":1,\"tags\":%s,\"content\":\"hi\",\"sig\":\"%0128d\"}",

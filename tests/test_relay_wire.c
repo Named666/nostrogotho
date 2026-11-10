@@ -64,7 +64,9 @@ static void test_overload_reply(void) {
     /* every truncation of a valid EVENT: no crash, a valid reply */
     const char *full = "[\"EVENT\",{\"id\":\"" ID "\",\"pubkey\":\"" PK "\"}]";
     for (size_t l = 0; l <= strlen(full); l++) {
-        char *cp = (char *) malloc(l ? l : 1); memcpy(cp, full, l);               /* exact-size: ASan catches over-reads */
+        char *cp = (char *) malloc(l ? l : 1);                                    /* exact-size: ASan catches over-reads */
+        CHECK(cp); if (!cp) return;
+        memcpy(cp, full, l);
         n = relay_wire_overload_reply(cp, l, why, out, sizeof(out));
         CHECK(n > 0 && out[0] == '[' && out[n - 1] == ']');
         free(cp);
@@ -95,7 +97,9 @@ static void test_event_sig(void) {
     CHECK(id[0] == 0x55);                                                         /* untouched on failure */
 
     for (size_t l = 0; l < strlen(m); l++) {                                      /* truncations */
-        char *cp = (char *) malloc(l ? l : 1); memcpy(cp, m, l);
+        char *cp = (char *) malloc(l ? l : 1);
+        CHECK(cp); if (!cp) return;
+        memcpy(cp, m, l);
         CHECK(!relay_wire_event_sig(cp, l, id, pk, sig));
         free(cp);
     }

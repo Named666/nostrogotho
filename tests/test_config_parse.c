@@ -68,7 +68,8 @@ static void test_keys(void) {
 static void test_load(void) {
     char path[] = "/tmp/ng_cfg_XXXXXX";
     int fd = mkstemp(path); CHECK(fd >= 0);
-    FILE *f = fdopen(fd, "w");
+    FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    CHECK(f); if (!f) return;
     fputs("# comment\n\ndb_sync = normal\nworkers = 3 # trailing\nconn_pending_max = nope\nio_threads = 2\n", f);
     fclose(f);
     ng_config_t c; ng_config_error_t e;
@@ -76,10 +77,13 @@ static void test_load(void) {
     CHECK(ng_config_load(&c, path, true, &e) == NG_E_RANGE);
     CHECK(e.line == 5 && !strcmp(e.key, "conn_pending_max") && e.status == NG_E_RANGE);
     CHECK(c.db_sync == NG_DB_SYNC_NORMAL && c.workers == 3 && c.io_threads == 0);   /* stopped at line 5 */
-    f = fopen(path, "w"); fputs("db_sync = normal\nio_threads=auto\n", f); fclose(f);
+    f = fopen(path, "w"); CHECK(f); if (!f) return;
+    fputs("db_sync = normal\nio_threads=auto\n", f); fclose(f);
     ng_config_defaults(&c);
     CHECK(ng_config_load(&c, path, true, &e) == NG_OK && e.line == 0 && c.db_sync == NG_DB_SYNC_NORMAL);
-    f = fopen(path, "w"); for (int i = 0; i < 600; i++) fputc('x', f); fputs("\n", f); fclose(f);
+    f = fopen(path, "w"); CHECK(f); if (!f) return;
+    for (int i = 0; i < 600; i++) fputc('x', f);
+    fputs("\n", f); fclose(f);
     CHECK(ng_config_load(&c, path, true, &e) == NG_E_INVALID && e.line == 1);   /* overlong line */
     remove(path);
     ng_config_defaults(&c);
