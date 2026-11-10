@@ -216,6 +216,9 @@ typedef struct {
     bool (*delete_by_id)(const char *id, size_t *deleted);
     bool (*delete_by_tag)(char name, const char *value, void (*forget)(const char *hex_id),
                           size_t *deleted);
+    /* has_id_prefix: an event whose id starts with the 8-hex prefix exists
+     * (NIP-29 "previous" references). Callable from any thread. */
+    bool (*has_id_prefix)(const char *hex8);
     bool (*scan_kinds)(const int *kinds, size_t n, void (*cb)(const event_t *ev, void *arg),
                        void *arg);
 

@@ -232,3 +232,33 @@ ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, u
     *out_count = n;
     return NG_OK;
 }
+
+/* An event id starting with the 4 bytes of hex8 exists: one index seek on
+ * the id range [prefix, prefix + 1). */
+bool ngdb_has_id_prefix(const char *hex8) {
+    if (!ngdb_conn || !hex8 || strlen(hex8) != 8) return false;
+    unsigned char lo[4], hi[4];
+    for (int i = 0; i < 4; i++) {
+        unsigned v = 0;
+        for (int k = 0; k < 2; k++) {
+            char c = hex8[i * 2 + k];
+            unsigned d = (c >= '0' && c <= '9') ? (unsigned) (c - '0') : (c >= 'a' && c <= 'f') ? (unsigned) (c - 'a' + 10) : 16u;
+            if (d > 15) return false;
+            v = v * 16 + d;
+        }
+        lo[i] = hi[i] = (unsigned char) v;
+    }
+    int i = 3;
+    while (i >= 0 && hi[i] == 0xff) hi[i--] = 0;
+    bool top = i < 0;                                  /* ffffffff: no upper bound */
+    if (!top) hi[i]++;
+    sqlite3_stmt *st = NULL;
+    const char *sql = top ? "SELECT 1 FROM event WHERE id >= ? LIMIT 1"
+                          : "SELECT 1 FROM event WHERE id >= ? AND id < ? LIMIT 1";
+    if (sqlite3_prepare_v2(ngdb_conn, sql, -1, &st, NULL) != SQLITE_OK) return false;
+    sqlite3_bind_blob(st, 1, lo, 4, SQLITE_TRANSIENT);
+    if (!top) sqlite3_bind_blob(st, 2, hi, 4, SQLITE_TRANSIENT);
+    bool found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}

@@ -10,17 +10,23 @@
  * everything else never touches it. The writer is the only mutator (kind
  * listeners for the moderation and join/leave kinds run there, inside the
  * batch transaction). The table is rebuilt at startup by replaying the
- * stored state-changing events (9007, 9000, 9001, 9002, 9008, 9009) in
+ * stored state-changing events (9007, 9000-9002, 9008-9010) in
  * insertion order; every one of them was authorized when it was stored.
  *
  * Roles (kind 39003): "admin" may do everything; "moderator" may put and
  * remove plain members and delete events. The creator of a group (9007)
  * becomes its admin.
  *
- * Not implemented (see NIPS.md): "previous" timeline references, the
- * late-publication policy, subgroups (parent / child), pinned events
- * (9010 / 39005), LiveKit AV rooms (39004), kind 39002 member lists are
- * published in full.
+ * Pins (9010 -> 39005): admins and moderators replace the ordered e / a
+ * list. Kinds 9000-9020 are moderation kinds: the ones above are handled,
+ * the rest are refused "invalid: unsupported".
+ *
+ * Every user event to a group (h tag) must be recent (group_max_age,
+ * default 3600 s, 0 = off: late publication) and each "previous"
+ * reference (8-hex id prefix) must name an event this relay stores.
+ *
+ * Not implemented (see NIPS.md): subgroups (parent / child), LiveKit AV
+ * rooms (39004); kind 39002 member lists are published in full.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -32,6 +38,7 @@
 #include "nip_event.h"
 #include "nip42.h"
 #include "../crypto.h"
+#include "../ng_config.h"
 #include "../dedupe.h"
 #include "../relay_core.h"
 #include "../platform/ng_alloc.h"
@@ -50,7 +57,8 @@ typedef struct {
     int *kinds; size_t n_kinds; bool kinds_set;   /* supported_kinds */
     member_t *m; size_t n_m, cap_m;               /* sorted by pk */
     char **codes; size_t n_codes;
-    time_t last_ts[4];                            /* per 39000..39003: strictly increasing */
+    char **pins; size_t n_pins;                   /* 9010: "e:<id>" / "a:<addr>" in order */
+    time_t last_ts[6];                            /* per 39000..39005: strictly increasing */
 } group_t;
 
 static pthread_rwlock_t lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -132,6 +140,8 @@ static void group_free(group_t *g) {
     free(g->kinds); free(g->m);
     for (size_t i = 0; i < g->n_codes; i++) free(g->codes[i]);
     free(g->codes);
+    for (size_t i = 0; i < g->n_pins; i++) free(g->pins[i]);
+    free(g->pins);
     free(g);
 }
 
@@ -299,6 +309,32 @@ static void fill_roles(json_builder_t *b, group_t *g, const void *a) {
     json_builder_end_array(b);
 }
 
+static void fill_pins(json_builder_t *b, group_t *g, const void *a) {
+    (void) a;
+    for (size_t i = 0; i < g->n_pins; i++) {
+        char k[2] = { g->pins[i][0], 0 };
+        tag2(b, k, g->pins[i] + 2);
+    }
+}
+
+/* 9010: replace the pin list with the event's e / a tags, in order. */
+typedef struct { char **v; size_t n; bool oom; } pins_t;
+static bool pin_tag(jstr_t tag, void *arg) {
+    pins_t *p = (pins_t *) arg;
+    char *n = nip_tag_element(tag, 0);
+    bool want = n && (!strcmp(n, "e") || !strcmp(n, "a"));
+    char *v = want ? nip_tag_element(tag, 1) : NULL;
+    if (v && *v && p->n < 256) {
+        size_t len = strlen(v);
+        char *s = (char *) malloc(len + 3);
+        char **q = s ? (char **) ng_realloc_array(p->v, p->n + 1, sizeof(char *)) : NULL;
+        if (!q) { free(s); p->oom = true; }
+        else { snprintf(s, len + 3, "%c:%s", n[0], v); p->v = q; p->v[p->n++] = s; }
+    }
+    free(n); free(v);
+    return !p->oom;
+}
+
 static void fill_p(json_builder_t *b, group_t *g, const void *a) { (void) g; tag2(b, "p", (const char *) a); }
 
 static bool emit_state(group_t *g, bool meta, bool admins, bool members) {
@@ -443,12 +479,27 @@ static const char *apply(const event_t *ev, bool replay) {
             char *el[2] = { (char *) "d", g->id };
             tag_t d = { el, 2, 2 };
             bool ok = store->delete_by_tag('h', g->id, dedupe_forget, &n);
-            for (int k = 39000; ok && k <= 39003; k++)   /* this relay's state events only */
+            for (int k = 39000; ok && k <= 39005; k++)   /* this relay's state events only */
                 ok = store->delete_record_by_kind_and_pubkey_and_dtag(k, relay_pk, &d, (time_t) 1 << 40, &n);
             if (!ok) { why = "error: delete failed"; break; }
         }
         drop(g);
         break;
+    case 9010: {
+        if (!mod) { why = "restricted: not a group admin or moderator"; break; }
+        pins_t pn = { NULL, 0, false };
+        each_tag(ev, pin_tag, &pn);
+        if (pn.oom) {
+            for (size_t i = 0; i < pn.n; i++) free(pn.v[i]);
+            free(pn.v);
+            why = "error: out of memory"; break;
+        }
+        for (size_t i = 0; i < g->n_pins; i++) free(g->pins[i]);
+        free(g->pins);
+        g->pins = pn.v; g->n_pins = pn.n;
+        if (!replay && !emit(g, 39005, 5, "d", "", fill_pins, NULL)) why = "error: could not publish the group state";
+        break;
+    }
     case 9009:
         if (!admin) { why = "restricted: only admins create invites"; break; }
         each_tag(ev, code_tag, g);
@@ -503,7 +554,21 @@ stored_dup:
 
 /* ---- read side (workers, read lock) ------------------------------------- */
 
-static bool is_meta_kind(int k) { return k >= 39000 && k <= 39003; }
+static bool is_meta_kind(int k) { return k >= 39000 && k <= 39005; }
+
+/* "previous" references: 8-hex id prefixes of events this relay stores. */
+typedef struct { bool ok; int n; } prev_t;
+static bool prev_tag(jstr_t tag, void *arg) {
+    prev_t *p = (prev_t *) arg;
+    if (!tag_is(tag, "previous")) return true;
+    for (size_t i = 1; p->ok; i++) {
+        char *v = nip_tag_element(tag, i);
+        if (!v) break;
+        if (++p->n > 64 || !store->has_id_prefix || !store->has_id_prefix(v)) p->ok = false;
+        free(v);
+    }
+    return p->ok;
+}
 
 static bool accept_publish(relay_conn_t *c, const event_t *ev, char *reason, size_t rs, void *ctx) {
     (void) c; (void) ctx;
@@ -512,8 +577,21 @@ static bool accept_publish(relay_conn_t *c, const event_t *ev, char *reason, siz
         snprintf(reason, rs, "blocked: group state events are published by this relay only");
         return false;
     }
-    if (ev->kind == 9007 || (ev->kind >= 9000 && ev->kind <= 9022)) return true;   /* decided by the writer */
     if (!nip_event_has_tag(ev, "h", NULL)) return true;
+    const char *relay_pk = crypto_relay_pubkey();
+    if (relay_pk && !strcmp(ev->pubkey, relay_pk)) return true;
+    if (ng_relay_info.group_max_age > 0 && ev->created_at < time(NULL) - ng_relay_info.group_max_age) {
+        snprintf(reason, rs, "invalid: late publication; events to a group must be at most %d s old",
+                 ng_relay_info.group_max_age);
+        return false;
+    }
+    prev_t pv = { true, 0 };
+    each_tag(ev, prev_tag, &pv);
+    if (!pv.ok) {
+        snprintf(reason, rs, "invalid: a previous reference names an event this relay does not have");
+        return false;
+    }
+    if (ev->kind >= 9000 && ev->kind <= 9022) return true;   /* decided by the writer */
     char *gid = nip_event_tag_value(ev, "h");
     bool ok = true;
     pthread_rwlock_rdlock(&lock);
@@ -579,22 +657,37 @@ static void replay_one(const event_t *ev, void *arg) {
     (void) apply(ev, true);
 }
 
+/* After a restart the next state event must still be strictly newer than
+ * the stored one (replaceable admission), so restore last_ts. */
+static void restore_ts(const event_t *ev, void *arg) {
+    const char *self = (const char *) arg;
+    if (strcmp(ev->pubkey, self)) return;
+    char *gid = nip_event_tag_value(ev, "d");
+    group_t *g = find(gid);
+    int slot = ev->kind - 39000;
+    if (g && slot >= 0 && slot < 6 && ev->created_at > g->last_ts[slot]) g->last_ts[slot] = ev->created_at;
+    free(gid);
+}
+
 static void init(const relay_config_t *config, void *ctx) {
     (void) ctx;
     store = config->storage;
     enabled = crypto_relay_pubkey() != NULL && store && store->scan_kinds && store->delete_by_tag;
     if (!enabled) return;
-    static const int kinds[] = { 9007, 9000, 9001, 9002, 9008, 9009 };
+    static const int kinds[] = { 9007, 9000, 9001, 9002, 9008, 9009, 9010 };
     pthread_rwlock_wrlock(&lock);
     if (!store->scan_kinds(kinds, sizeof kinds / sizeof kinds[0], replay_one, NULL))
         fprintf(stderr, "nip29: could not replay the group state\n");
+    static const int state[] = { 39000, 39001, 39002, 39003, 39004, 39005 };
+    if (!store->scan_kinds(state, 6, restore_ts, (void *) crypto_relay_pubkey()))
+        fprintf(stderr, "nip29: could not read the group state events\n");
     pthread_rwlock_unlock(&lock);
 }
 
 static nip_plugin_t nip29_plugin = {
     .name = "nip29",
-    .kinds = { { 9000, 9009 }, { 9021, 9022 } },
-    .kinds_count = 2,
+    .kinds = { { 9000, 9022 } },                 /* 9000-9020 moderation, 9021/9022 join/leave */
+    .kinds_count = 1,
     .on_event = on_event,
     .init = init,
     .accept_publish = accept_publish,

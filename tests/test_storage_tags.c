@@ -143,6 +143,9 @@ int main(void) {
     memset(g1.pubkey, 'c', 64); memset(g2.pubkey, 'c', 64); memset(g3.pubkey, 'c', 64);
     check("groups: setup", s.insert_event(&g1) == STORAGE_PUT_INSERTED && s.insert_event(&g2) == STORAGE_PUT_INSERTED &&
           s.insert_event(&g3) == STORAGE_PUT_INSERTED, NULL);
+    check("has_id_prefix hit", s.has_id_prefix("00000000"), NULL);   /* ids are %064x of small n */
+    check("has_id_prefix miss", !s.has_id_prefix("ffffffff") && !s.has_id_prefix("12345678"), NULL);
+    check("has_id_prefix rejects bad hex", !s.has_id_prefix("zz") && !s.has_id_prefix("0000000g"), NULL);
     int k9 = 9; scanned = 0;
     check("scan_kinds", s.scan_kinds(&k9, 1, count_scan, NULL) && scanned == 3, NULL);
     d = 0;

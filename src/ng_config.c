@@ -34,7 +34,8 @@ void ng_limits_apply(const ng_limits_t *l) {
 }
 
 ng_relay_info_t ng_relay_info = {
-    .software = NG_SOFTWARE_URL, .version = NG_VERSION, .created_at_upper_limit = 900
+    .software = NG_SOFTWARE_URL, .version = NG_VERSION, .created_at_upper_limit = 900,
+    .group_max_age = 3600
 };
 
 void ng_relay_info_defaults(ng_relay_info_t *info) {
@@ -43,6 +44,7 @@ void ng_relay_info_defaults(ng_relay_info_t *info) {
     snprintf(info->software, sizeof(info->software), "%s", NG_SOFTWARE_URL);
     snprintf(info->version, sizeof(info->version), "%s", NG_VERSION);
     info->created_at_upper_limit = 900;
+    info->group_max_age = 3600;
 }
 
 void ng_relay_info_apply(const ng_relay_info_t *info) { ng_relay_info = *info; }
@@ -128,6 +130,7 @@ static const cfg_key_t keys[] = {
     { "min_pow_difficulty", K_INT,     0, 256,                         F(info.min_pow_difficulty) },
     { "created_at_lower_limit", K_INT, 0, (size_t) 1 << 30,            F(info.created_at_lower_limit) },
     { "created_at_upper_limit", K_INT, 0, (size_t) 1 << 30,            F(info.created_at_upper_limit) },
+    { "group_max_age",      K_INT,     0, (size_t) 1 << 30,            F(info.group_max_age) },
     { "nip43",              K_INT,     0, 1,                           F(info.nip43) },
     { "members_only",       K_INT,     0, 1,                           F(info.members_only) },
     { "invite_codes",       K_STR,     0, sizeof(((ng_relay_info_t *) 0)->invite_codes), F(info.invite_codes) },

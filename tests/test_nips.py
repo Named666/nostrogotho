@@ -571,6 +571,45 @@ def nip29():
 
 
 @section
+def nip29b():
+    """NIP-29 slice 2: pins, late publication, previous references, 9003-9020."""
+    import signal, time as _t
+    r = keyed_relay(); w = WS(r.port)
+    alice, bob = Key(), Key()
+    check("create", w.publish(alice.ev("", 9007, [["h", "g2"]]))[2] is True)
+    first = alice.ev("first", 9, [["h", "g2"]])
+    check("first message", w.publish(first)[2] is True)
+    m = w.publish(bob.ev("old", 9, [["h", "g2"]], ca=int(_t.time()) - 7200))
+    check("late publication (2 h old) -> invalid:", m[2] is False and m[3].startswith("invalid: late"), m)
+    m = w.publish(bob.ev("reply", 9, [["h", "g2"], ["previous", first["id"][:8]]]))
+    check("previous naming a stored event -> OK", m[2] is True, m)
+    m = w.publish(bob.ev("forked", 9, [["h", "g2"], ["previous", first["id"][:8], "deadbeef"]]))
+    check("previous naming an unknown event -> invalid:", m[2] is False and m[3].startswith("invalid:"), m)
+    m = w.publish(bob.ev("", 9010, [["h", "g2"], ["e", first["id"]]]))
+    check("pin by a non-moderator -> restricted:", m[2] is False and m[3].startswith("restricted:"), m)
+    m = w.publish(alice.ev("", 9010, [["h", "g2"], ["e", first["id"]], ["a", "30023:%s:post" % alice.pk]]))
+    check("update-pin-list (9010) by the admin", m[2] is True, m)
+    evs, _ = w.req("pins", {"kinds": [39005], "#d": ["g2"]})
+    check("relay publishes 39005 with the pins in order", len(evs) == 1 and evs[0]["pubkey"] == RELAY_PK and
+          [t for t in evs[0]["tags"] if t[0] in "ea"] == [["e", first["id"]], ["a", "30023:%s:post" % alice.pk]], evs)
+    m = w.publish(bob.ev("", 39005, [["d", "g2"]]))
+    check("39005 from anyone but the relay -> blocked:", m[2] is False and m[3].startswith("blocked:"), m)
+    m = w.publish(alice.ev("", 9015, [["h", "g2"]]))
+    check("unhandled moderation kind (9015) -> invalid:", m[2] is False and m[3].startswith("invalid:"), m)
+    r.stop(signal.SIGKILL); r.start(); w = WS(r.port)
+    m = w.publish(alice.ev("", 9010, [["h", "g2"]]))
+    evs, _ = w.req("pins2", {"kinds": [39005], "#d": ["g2"]})
+    check("restart: pins replayed, then cleared", m[2] is True and len(evs) == 1 and
+          not [t for t in evs[0]["tags"] if t[0] in "ea"], evs)
+    r.stop()
+    r = keyed_relay("group_max_age = 0\n"); w = WS(r.port)
+    w.publish(alice.ev("", 9007, [["h", "g3"]]))
+    m = w.publish(bob.ev("old", 9, [["h", "g3"]], ca=int(_t.time()) - 7200))
+    check("group_max_age = 0 accepts late publication", m[2] is True, m)
+    r.stop()
+
+
+@section
 def nip43():
     """NIP-43 relay membership (step 12)."""
     import signal, time as _t

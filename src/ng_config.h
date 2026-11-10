@@ -68,6 +68,7 @@ typedef struct {
     int min_pow_difficulty;     /* min_pow_difficulty: NIP-13 bits, 0 = off */
     int created_at_lower_limit; /* created_at_lower_limit: max age (s), 0 = off */
     int created_at_upper_limit; /* created_at_upper_limit: max future (s), 0 = off */
+    int group_max_age;          /* group_max_age: NIP-29 late publication cutoff (s), 0 = off */
     int nip43;                  /* nip43: 1 = relay membership (NIP-43), needs relay_secret_key_file */
     int members_only;           /* members_only: 1 = only NIP-43 members may publish */
     char invite_codes[512];     /* invite_codes: claims accepted by kind 28934, comma-separated */
