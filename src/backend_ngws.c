@@ -86,7 +86,8 @@ static struct {
     size_t worker_queue_max;            /* queued inbound bytes per worker */
     int writer_queue_max;               /* EVENTs waiting for the writer */
     int conn_pending_max;               /* queued messages per connection */
-} opt = { 0, 0, 4u << 20, 1u << 30, 16u << 20, 65536, 1024 };
+    int listen_backlog;                 /* 0 = net.core.somaxconn */
+} opt = { 0, 0, 4u << 20, 1u << 30, 16u << 20, 65536, 1024, 0 };
 
 enum { J_OPEN, J_MSG, J_CLOSE, J_BSET };
 typedef struct job {
@@ -788,6 +789,11 @@ bool server_config_set(const char *key, const char *value) {
     if (strcmp(key, "total_outbound_max") == 0) return parse_size(value, 256u << 10, (size_t) 1 << 40, &opt.total_out_max);
     if (strcmp(key, "worker_queue_max") == 0) return parse_size(value, 64u << 10, (size_t) 1 << 36, &opt.worker_queue_max);
     if (strcmp(key, "writer_queue_max") == 0) { if (!parse_size(value, 1, 1u << 24, &v)) return false; opt.writer_queue_max = (int) v; return true; }
+    if (strcmp(key, "listen_backlog") == 0) {
+        if (strcmp(value, "auto") == 0) { opt.listen_backlog = 0; return true; }
+        if (!parse_size(value, 1, 1u << 20, &v)) return false;
+        opt.listen_backlog = (int) v; return true;
+    }
     if (strcmp(key, "conn_pending_max") == 0) { if (!parse_size(value, 1, 1u << 20, &v)) return false; opt.conn_pending_max = (int) v; return true; }
     return false;
 }
@@ -828,14 +834,15 @@ bool server_run(int port) {
     cfg.max_payload = MAX_WS_MESSAGE;
     cfg.max_backpressure = opt.conn_out_max;
     cfg.max_total_backlog = opt.total_out_max;
+    cfg.listen_backlog = opt.listen_backlog;
     cfg.idle_timeout = (unsigned) env_int("NG_IDLE_TIMEOUT", 120);
     cfg.handshake_timeout = 16;
     cfg.user_size = sizeof(ng_conn_t *);
     cfg.on_open = on_open; cfg.on_message = on_message; cfg.on_close = on_close; cfg.on_drain = on_drain;
     cfg.on_http = on_http; cfg.on_loop_start = on_loop_start; cfg.on_loop_stop = on_loop_stop;
     srv = ngws_server_create(&cfg);
-    fprintf(stderr, "nostrogotho (ngws) listening on :%d  io_loops=%d workers=%d writer=1\n",
-            port, n_loops, n_workers);
+    fprintf(stderr, "nostrogotho (ngws) listening on :%d  io_loops=%d workers=%d writer=1 backlog=%d\n",
+            port, n_loops, n_workers, ngws_listen_backlog(&cfg));
     bool ok = srv && ngws_server_run(srv);
 
     atomic_store(&stopping, true);

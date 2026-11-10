@@ -996,12 +996,25 @@ static bool port_free(const char *host, int port) {
     return ok;
 }
 
+/* Effective listen backlog: configured, else the kernel maximum
+ * (net.core.somaxconn), else 4096. Values above somaxconn are capped by the
+ * kernel, so the result is also capped here to report the real value. */
+int ngws_listen_backlog(const ngws_config_t *cfg) {
+    int max = 0;
+    FILE *f = fopen("/proc/sys/net/core/somaxconn", "r");
+    if (f) { if (fscanf(f, "%d", &max) != 1) max = 0; fclose(f); }
+    int b = cfg->listen_backlog > 0 ? cfg->listen_backlog : max > 0 ? max : 4096;
+    if (max > 0 && b > max) b = max;
+    return b;
+}
+
 bool ngws_server_run(ngws_server_t *srv) {
     signal(SIGPIPE, SIG_IGN);
     if (!port_free(srv->cfg.host, srv->cfg.port)) {
         fprintf(stderr, "ngws: port %d is already in use\n", srv->cfg.port);
         return false;
     }
+    us_set_listen_backlog(ngws_listen_backlog(&srv->cfg));
     for (int i = 0; i < srv->n_loops; i++) {
         ngws_loop_t *l = &srv->loops[i];
         l->idx = i; l->srv = srv;

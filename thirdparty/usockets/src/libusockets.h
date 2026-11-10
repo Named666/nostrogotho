@@ -186,6 +186,10 @@ void *us_socket_context_ext(int ssl, struct us_socket_context_t *context);
 void us_socket_context_close(int ssl, struct us_socket_context_t *context);
 
 /* Listen for connections. Acts as the main driving cog in a server. Will call set async callbacks. */
+/* nostrogotho patch: listen(2) backlog for sockets created after the call
+ * (default 512, upstream's hardcoded value). Process-wide. */
+void us_set_listen_backlog(int backlog);
+
 struct us_listen_socket_t *us_socket_context_listen(int ssl, struct us_socket_context_t *context,
     const char *host, int port, int options, int socket_ext_size);
 

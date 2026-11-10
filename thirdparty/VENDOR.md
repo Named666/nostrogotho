@@ -15,6 +15,14 @@ thirdparty/nips is still a gitlink to the NIPs spec fork (not needed to build).
 - Commit: 166a04810c9fa970fc22096a7b35b792378364fb
 - License: Apache-2.0 (thirdparty/usockets/LICENSE)
 - Vendored: src/ only; removed sni_tree.cpp and asio.cpp (C++/TLS-only). Built with -DLIBUS_NO_SSL (epoll backend); TLS terminated by nginx.
+- **Local patch (listen backlog):** upstream hardcodes `listen(fd, 512)` in
+  `src/bsd.c` (`bsd_create_listen_socket`, `bsd_create_listen_socket_unix`).
+  Both now use a process-wide `int us_listen_backlog` (default 512, upstream's
+  value) set via the added `void us_set_listen_backlog(int)` (declared in
+  `src/libusockets.h`). ngws calls it before creating its listen sockets with
+  the `listen_backlog` config value (default `net.core.somaxconn`, 4096 if
+  unreadable; the kernel caps it at somaxconn). No other change. Re-apply when
+  updating uSockets: `grep -n "us_listen_backlog" src/bsd.c src/libusockets.h`.
 
 Removed: the previous GPLv2/commercial transport library — replaced by the in-tree ngws server.
 Evaluated and rejected: wslay (MIT) as the frame codec. Benchmarked against the

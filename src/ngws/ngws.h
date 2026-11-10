@@ -59,6 +59,8 @@ typedef struct {
     size_t max_total_backlog;    /* process-wide user-space backlog budget (bytes, 0 = none).
                                   * Over it, any socket that must grow a backlog beyond the
                                   * drain watermark (64 KiB), i.e. a slow reader, is closed. */
+    int listen_backlog;          /* listen(2) backlog; 0 = net.core.somaxconn (fallback 4096).
+                                  * The kernel silently caps it at somaxconn. */
     unsigned idle_timeout;       /* seconds; 0 = off. A ping is sent at timeout,
                                   * the socket is closed if nothing arrives by the
                                   * next one. Must be a multiple of 4. */
@@ -73,6 +75,8 @@ ngws_server_t *ngws_server_create(const ngws_config_t *cfg);
 bool ngws_server_run(ngws_server_t *srv);
 void ngws_server_stop(ngws_server_t *srv);     /* thread-safe */
 void ngws_server_free(ngws_server_t *srv);
+/* listen(2) backlog actually requested for cfg (see listen_backlog). */
+int ngws_listen_backlog(const ngws_config_t *cfg);
 void *ngws_server_user(ngws_server_t *srv);
 int ngws_server_loop_count(ngws_server_t *srv);
 /* Bytes currently held in socket backlogs (capacity of the private output

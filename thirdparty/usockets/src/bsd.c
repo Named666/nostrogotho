@@ -465,6 +465,10 @@ int bsd_would_block() {
 
 // return LIBUS_SOCKET_ERROR or the fd that represents listen socket
 // listen both on ipv6 and ipv4
+/* nostrogotho patch: listen(2) backlog was hardcoded to 512 (see thirdparty/VENDOR.md). */
+int us_listen_backlog = 512;
+void us_set_listen_backlog(int backlog) { us_listen_backlog = backlog > 0 ? backlog : 512; }
+
 LIBUS_SOCKET_DESCRIPTOR bsd_create_listen_socket(const char *host, int port, int options) {
     struct addrinfo hints, *result;
     memset(&hints, 0, sizeof(struct addrinfo));
@@ -529,7 +533,7 @@ LIBUS_SOCKET_DESCRIPTOR bsd_create_listen_socket(const char *host, int port, int
     setsockopt(listenFd, IPPROTO_IPV6, IPV6_V6ONLY, (void *) &disabled, sizeof(disabled));
 #endif
 
-    if (bind(listenFd, listenAddr->ai_addr, (socklen_t) listenAddr->ai_addrlen) || listen(listenFd, 512)) {
+    if (bind(listenFd, listenAddr->ai_addr, (socklen_t) listenAddr->ai_addrlen) || listen(listenFd, us_listen_backlog)) {
         bsd_close_socket(listenFd);
         freeaddrinfo(result);
         return LIBUS_SOCKET_ERROR;
@@ -575,7 +579,7 @@ LIBUS_SOCKET_DESCRIPTOR bsd_create_listen_socket_unix(const char *path, int opti
     unlink(path);
 #endif
 
-    if (bind(listenFd, (struct sockaddr *)&server_address, size) || listen(listenFd, 512)) {
+    if (bind(listenFd, (struct sockaddr *)&server_address, size) || listen(listenFd, us_listen_backlog)) {
         bsd_close_socket(listenFd);
         return LIBUS_SOCKET_ERROR;
     }

@@ -67,6 +67,8 @@ for text, valid, explicit in [
     ("writer_queue_max = 0\n", False, True),
     ("io_threads = -1\n", False, True),
     ("conn_pending_max = 5X\n", False, True),
+    ("listen_backlog = 8192\n", True, True),
+    ("listen_backlog = 0\n", False, True),
 ]:
     check(text, valid, explicit)
-print("PASS: 17 runtime config startup cases")
+print("PASS: 19 runtime config startup cases")
