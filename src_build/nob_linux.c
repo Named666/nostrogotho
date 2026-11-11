@@ -125,7 +125,7 @@ static void pgo_flags(Cmd *cmd)
     SRC_FOLDER"backend_ngws.c", SRC_FOLDER"ngb_outbox.c", SRC_FOLDER"ngb_workers.c", \
     SRC_FOLDER"ngb_writer.c", SRC_FOLDER"relay_wire.c", SRC_FOLDER"dedupe.c", \
     SRC_FOLDER"json_lite.c", SRC_FOLDER"crypto.c", SRC_FOLDER"storage_sqlite.c", \
-    SRC_FOLDER"storage_write.c", SRC_FOLDER"storage_query.c", SRC_FOLDER"storage_read.c", \
+    SRC_FOLDER"storage_write.c", SRC_FOLDER"memidx.c", SRC_FOLDER"storage_query.c", SRC_FOLDER"storage_read.c", \
     SRC_FOLDER"storage_vfs.c", SRC_FOLDER"ratelimit.c", \
     SRC_FOLDER"nostrogotho.c", SRC_FOLDER"json_util.c", \
     SRC_FOLDER"schnorr_batch.c" /* includes the vendored secp256k1.c TU (as a system header) */

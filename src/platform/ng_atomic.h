@@ -34,6 +34,7 @@ typedef struct { bool v; } ng_atomic_bool;
 typedef struct { size_t v; } ng_atomic_size;
 typedef struct { long long v; } ng_atomic_llong;
 typedef struct { unsigned long long v; } ng_atomic_ullong;
+typedef struct { void *v; } ng_atomic_ptr;
 
 #define ng_atomic_init(p, x)                   ((void) ((p)->v = (x)))
 #define ng_atomic_load_explicit(p, mo)         __atomic_load_n(&(p)->v, mo)
