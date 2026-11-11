@@ -41,9 +41,9 @@ def frame(text):
 
 
 class WS:
-    def __init__(self, port, host="127.0.0.1"):
+    def __init__(self, port, host="127.0.0.1", headers=b""):
         s = socket.socket(); s.connect((host, port)); s.settimeout(10)
-        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" + headers +
                   b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
         buf = b""
         while b"\r\n\r\n" not in buf:

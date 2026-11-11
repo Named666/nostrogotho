@@ -49,6 +49,7 @@
 #include "ngb_workers.h"
 #include "ngb_writer.h"
 #include "ngws/ngws.h"
+#include "ratelimit.h"
 #include "platform/ng_atomic.h"
 #include "relay_core.h"
 #include "relay_wire.h"
@@ -146,7 +147,6 @@ static void on_http(ngws_socket_t *s, const ngws_http_req_t *req) {
 }
 
 static void on_open(ngws_socket_t *ws, const ngws_http_req_t *req) {
-    (void) req;
     ng_conn_t *c = (ng_conn_t *) calloc(1, sizeof(*c));
     if (!c) { ngws_terminate(ws); return; }
     c->base.id = ng_atomic_fetch_add(&next_conn_id, 1);
@@ -156,7 +156,11 @@ static void on_open(ngws_socket_t *ws, const ngws_http_req_t *req) {
     ng_atomic_init(&c->base.refs, 1);            /* held by the socket */
     c->loop = ngws_socket_loop(ws);
     c->ws = ws;
-    ngws_remote_address(ws, c->base.peer, sizeof(c->base.peer));
+    char tcp_peer[sizeof(c->base.peer)];
+    ngws_remote_address(ws, tcp_peer, sizeof(tcp_peer));
+    /* Behind a trusted reverse proxy: the forwarded client address, so
+     * per-IP rate limits, IP bans and logs see the client, not the proxy. */
+    rl_client_ip(tcp_peer, req ? req->headers : NULL, req ? req->headers_len : 0, c->base.peer, sizeof(c->base.peer));
     *(ng_conn_t **) ngws_user(ws) = c;
     ng_atomic_fetch_add(&stat_open_conns, 1);
     if (!ngb_queue_open(c)) {                    /* no protocol state: refuse */

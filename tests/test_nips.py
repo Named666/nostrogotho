@@ -444,6 +444,41 @@ def ratelimit():
 
 
 @section
+def xff():
+    """X-Forwarded-For / X-Real-IP from trusted proxies only, for IP limits and bans."""
+    def first(w):
+        m = w.recv(timeout=2)
+        while m and m[0] == "AUTH": m = w.recv(timeout=2)
+        return m
+    def xf(v): return b"X-Forwarded-For: " + v.encode() + b"\r\n"
+    r = Relay("banned_ips = 198.51.100.7\n")
+    m = first(WS(r.port, headers=xf("198.51.100.7")))
+    check("trusted proxy (127.0.0.1): forwarded banned IP -> NOTICE blocked:", m and m[0] == "NOTICE" and m[1].startswith("blocked:"), m)
+    m = first(WS(r.port, headers=b"X-Real-IP: 198.51.100.7\r\n"))
+    check("X-Real-IP honored too", m and m[0] == "NOTICE" and m[1].startswith("blocked:"), m)
+    w = WS(r.port, headers=xf("198.51.100.7, 203.0.113.5"))
+    m = w.publish(Key().ev("spoof"))
+    check("a client-supplied left entry is ignored (rightmost untrusted wins)", m[2] is True, m)
+    w = WS(r.port, headers=xf("203.0.113.5, 198.51.100.7, 127.0.0.1"))
+    m = first(w)
+    check("trusted hops on the right are skipped", m and m[0] == "NOTICE" and m[1].startswith("blocked:"), m)
+    r.stop()
+    r = Relay("banned_ips = 198.51.100.7\ntrusted_proxies = 10.0.0.0/8\n")
+    w = WS(r.port, headers=xf("198.51.100.7"))
+    m = w.publish(Key().ev("untrusted peer"))
+    check("peer not in trusted_proxies: header ignored", m[2] is True, m)
+    r.stop()
+    r = Relay("rate_events_per_min_ip = 60\nrate_events_burst_ip = 2\n")
+    a1 = WS(r.port, headers=xf("198.51.100.1")); a2 = WS(r.port, headers=xf("198.51.100.1"))
+    b1 = WS(r.port, headers=xf("198.51.100.2"))
+    res = [a1.publish(Key().ev("a")), a2.publish(Key().ev("b")), a2.publish(Key().ev("c"))]
+    check("per-IP budget keyed by the forwarded client", [m[2] for m in res] == [True, True, False], res)
+    m = b1.publish(Key().ev("d"))
+    check("another forwarded client has its own budget", m[2] is True, m)
+    r.stop()
+
+
+@section
 def nip70():
     """NIP-70 protected events, declared in NIP-11 with 13 and 40 (step 9)."""
     r = Relay(); w = WS(r.port); k = Key(); other = Key()

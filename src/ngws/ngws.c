@@ -38,7 +38,8 @@ int ngws_remote_address(ngws_socket_t *ws, char *buf, size_t cap) {
     us_socket_remote_address(0, s, ip, &iplen);
     if (iplen == 4) inet_ntop(AF_INET, ip, txt, sizeof(txt));
     else if (iplen == 16) inet_ntop(AF_INET6, ip, txt, sizeof(txt));
-    return snprintf(buf, cap, "%s:%d", txt, us_socket_remote_port(0, s));
+    /* "[v6]:port": a bare v6 address followed by ":port" is ambiguous. */
+    return snprintf(buf, cap, iplen == 16 ? "[%s]:%d" : "%s:%d", txt, us_socket_remote_port(0, s));
 }
 
 void nx_ws_list_add(sockx_t *x) {

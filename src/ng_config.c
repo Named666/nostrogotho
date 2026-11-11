@@ -64,6 +64,7 @@ void ng_config_defaults(ng_config_t *cfg) {
     cfg->policy.event_ip_burst = 60;
     cfg->policy.event_pubkey_burst = 30;
     cfg->policy.req_ip_burst = 60;
+    snprintf(cfg->policy.trusted_proxies, sizeof(cfg->policy.trusted_proxies), "%s", "127.0.0.1,::1");
 }
 
 bool ng_parse_size(const char *v, size_t lo, size_t hi, size_t *out) {
@@ -150,6 +151,7 @@ static const cfg_key_t keys[] = {
     { "banned_pubkeys",     K_STR,     0, sizeof(((ng_policy_t *) 0)->banned_pubkeys), F(policy.banned_pubkeys) },
     { "banned_ips",         K_STR,     0, sizeof(((ng_policy_t *) 0)->banned_ips), F(policy.banned_ips) },
     { "ban_file",           K_STR,     0, sizeof(((ng_policy_t *) 0)->ban_file), F(policy.ban_file) },
+    { "trusted_proxies",    K_STR,     0, sizeof(((ng_policy_t *) 0)->trusted_proxies), F(policy.trusted_proxies) },
 };
 #undef F
 

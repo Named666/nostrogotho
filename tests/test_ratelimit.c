@@ -76,8 +76,69 @@ static void test_bans(void) {
     unlink(path);
 }
 
+#define H(x) x "\r\n"
+static bool cip(const char *peer, const char *hdrs, char *out) {
+    return rl_client_ip(peer, hdrs, hdrs ? strlen(hdrs) : 0, out, 64);
+}
+
+static void test_forwarded(void) {
+    rl_config_t c; memset(&c, 0, sizeof c);              /* trusted_proxies NULL: 127.0.0.1, ::1 */
+    CHECK(rl_configure(&c, NULL) == NG_OK);
+    char o[64];
+    CHECK(rl_trusted_proxy("127.0.0.1:5000") && rl_trusted_proxy("[::1]:5000") && !rl_trusted_proxy("10.0.0.1:1"));
+    /* untrusted peer: headers ignored */
+    CHECK(!cip("203.0.113.9:4000", H("X-Forwarded-For: 198.51.100.1") H("X-Real-IP: 198.51.100.2"), o) &&
+          !strcmp(o, "203.0.113.9:4000"));
+    /* trusted peer, single entry */
+    CHECK(cip("127.0.0.1:4000", H("Host: x") H("X-Forwarded-For: 198.51.100.1") H("Upgrade: websocket"), o) &&
+          !strcmp(o, "198.51.100.1"));
+    /* client-supplied left part is not believed: rightmost untrusted wins */
+    CHECK(cip("127.0.0.1:4000", H("x-forwarded-for: 6.6.6.6, 198.51.100.1"), o) && !strcmp(o, "198.51.100.1"));
+    /* trusted hops on the right are skipped */
+    CHECK(cip("[::1]:4000", H("X-Forwarded-For: 6.6.6.6, 198.51.100.1, 127.0.0.1 ,::1"), o) && !strcmp(o, "198.51.100.1"));
+    /* several header lines: later lines are nearer proxies */
+    CHECK(cip("127.0.0.1:1", H("X-Forwarded-For: 6.6.6.6") H("X-Forwarded-For: 198.51.100.4, 127.0.0.1"), o) &&
+          !strcmp(o, "198.51.100.4"));
+    CHECK(cip("127.0.0.1:1", H("X-Forwarded-For: 198.51.100.4") H("X-Forwarded-For: 127.0.0.1"), o) &&
+          !strcmp(o, "198.51.100.4"));
+    /* all trusted: the leftmost */
+    CHECK(cip("127.0.0.1:1", H("X-Forwarded-For: 127.0.0.1, ::1"), o) && !strcmp(o, "127.0.0.1"));
+    /* garbage stops the walk at the last good hop; garbage only: header unusable */
+    CHECK(cip("127.0.0.1:1", H("X-Forwarded-For: 6.6.6.6, bogus, 127.0.0.1"), o) && !strcmp(o, "127.0.0.1"));
+    CHECK(!cip("127.0.0.1:1", H("X-Forwarded-For: bogus"), o) && !strcmp(o, "127.0.0.1:1"));
+    /* IPv6, ports and brackets, mapped v4: canonical text */
+    CHECK(cip("127.0.0.1:1", H("X-Forwarded-For: [2001:DB8::7]:443"), o) && !strcmp(o, "2001:db8::7"));
+    CHECK(cip("127.0.0.1:1", H("X-Forwarded-For: ::ffff:198.51.100.9"), o) && !strcmp(o, "198.51.100.9"));
+    /* X-Real-IP when there is no X-Forwarded-For */
+    CHECK(cip("127.0.0.1:1", H("X-Real-IP:  198.51.100.3"), o) && !strcmp(o, "198.51.100.3"));
+    CHECK(cip("127.0.0.1:1", H("X-Real-IP: 198.51.100.3") H("X-Forwarded-For: 198.51.100.5"), o) && !strcmp(o, "198.51.100.5"));
+    CHECK(!cip("127.0.0.1:1", H("X-Real-IP: nope"), o) && !strcmp(o, "127.0.0.1:1"));
+    CHECK(!cip("127.0.0.1:1", NULL, o) && !strcmp(o, "127.0.0.1:1"));
+    /* a header whose name merely starts the same is not it */
+    CHECK(!cip("127.0.0.1:1", H("X-Forwarded-For-Evil: 198.51.100.1"), o));
+    /* configured list with CIDRs; the forwarded address feeds bans and keys */
+    c.trusted_proxies = "10.0.0.0/8, 2001:db8:ffff::/48";
+    c.banned_ips = "198.51.100.1";
+    CHECK(rl_configure(&c, NULL) == NG_OK);
+    CHECK(!rl_trusted_proxy("127.0.0.1:1") && rl_trusted_proxy("10.200.3.4:1") && !rl_trusted_proxy("11.0.0.1:1"));
+    CHECK(rl_trusted_proxy("[2001:db8:ffff:12::1]:9") && !rl_trusted_proxy("[2001:db8:fffe::1]:9"));
+    CHECK(!cip("127.0.0.1:1", H("X-Forwarded-For: 198.51.100.1"), o));
+    CHECK(cip("10.9.9.9:1", H("X-Forwarded-For: 198.51.100.1, 10.1.1.1"), o) && rl_peer_banned(o));
+    unsigned char k1[16], k2[16];
+    CHECK(rl_peer_key(o, k1) == 4 && rl_peer_key("198.51.100.1:77", k2) == 4 && !memcmp(k1, k2, 4));
+    c.trusted_proxies = "";                               /* none */
+    CHECK(rl_configure(&c, NULL) == NG_OK && !rl_trusted_proxy("127.0.0.1:1") &&
+          !cip("127.0.0.1:1", H("X-Forwarded-For: 198.51.100.1"), o));
+    c.trusted_proxies = "10.0.0.0/33";
+    CHECK(rl_configure(&c, NULL) == NG_E_INVALID);
+    c.trusted_proxies = "10.0.0.0/x";
+    CHECK(rl_configure(&c, NULL) == NG_E_INVALID);
+    rl_shutdown();
+}
+
 int main(void) {
     test_bucket();
+    test_forwarded();
     test_peer_key();
     test_bans();
     if (fails) { printf("%d failure(s)\n", fails); return 1; }

@@ -100,12 +100,13 @@ static bool apply_policy(void) {
     rc.banned_pubkeys = p->banned_pubkeys;
     rc.banned_ips = p->banned_ips;
     rc.ban_file = p->ban_file;
+    rc.trusted_proxies = p->trusted_proxies;
     unsigned line = 0;
     ng_status_t st = rl_configure(&rc, &line);
     if (st == NG_OK) return true;
     if (st == NG_E_IO) perror(p->ban_file);
     else if (line) fprintf(stderr, "%s:%u: invalid ban entry (expected \"pubkey <hex>\" or \"ip <address>\")\n", p->ban_file, line);
-    else fprintf(stderr, "invalid banned_pubkeys / banned_ips entry: %s\n", ng_status_str(st));
+    else fprintf(stderr, "invalid banned_pubkeys / banned_ips / trusted_proxies entry: %s\n", ng_status_str(st));
     return false;
 }
 

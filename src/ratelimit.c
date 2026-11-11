@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -27,6 +28,11 @@ static unsigned char (*ban_pk)[32];
 static size_t ban_pk_n;
 static unsigned char (*ban_ip)[16];
 static size_t ban_ip_n;
+/* trusted proxies: 16-byte ip_entry form + prefix bits (on the 4- or
+ * 16-byte address); a short list, scanned linearly. */
+typedef struct { unsigned char e[16]; unsigned bits; } rl_net_t;
+static rl_net_t *trust;
+static size_t trust_n;
 
 static uint64_t mono_ns(void) {
     struct timespec t;
@@ -151,6 +157,103 @@ bool rl_peer_banned(const char *peer) {
     return bsearch(e, ban_ip, ban_ip_n, 16, cmp16) != NULL;
 }
 
+/* ---- trusted proxies / forwarded client address --------------------- */
+
+static bool net_match(const rl_net_t *n, const unsigned char e[16]) {
+    bool nv4 = n->e[15] == 4 && !memcmp(n->e + 4, "\0\0\0\0\0\0\0\0\0\0\0", 11);
+    bool av4 = e[15] == 4 && !memcmp(e + 4, "\0\0\0\0\0\0\0\0\0\0\0", 11);
+    if (nv4 != av4) return false;
+    unsigned full = n->bits / 8, rem = n->bits % 8;
+    if (memcmp(n->e, e, full)) return false;
+    if (rem) {
+        unsigned char m = (unsigned char) (0xff << (8 - rem));
+        if ((n->e[full] & m) != (e[full] & m)) return false;
+    }
+    return true;
+}
+
+static bool entry_trusted(const unsigned char e[16]) {
+    for (size_t i = 0; i < trust_n; i++) if (net_match(&trust[i], e)) return true;
+    return false;
+}
+
+bool rl_trusted_proxy(const char *addr) {
+    unsigned char a[16], e[16]; bool v4;
+    if (!trust_n || !addr || !parse_ip(addr, a, &v4)) return false;
+    ip_entry(a, v4, e);
+    return entry_trusted(e);
+}
+
+/* s[0..n) trimmed of spaces/tabs; parse into a (ip_entry form) + v4. */
+static bool parse_token(const char *s, size_t n, unsigned char a[16], unsigned char e[16], bool *v4) {
+    while (n && (*s == ' ' || *s == '\t')) { s++; n--; }
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t' || s[n - 1] == '\r')) n--;
+    char buf[80];
+    if (n == 0 || n >= sizeof buf) return false;
+    memcpy(buf, s, n); buf[n] = '\0';
+    if (!parse_ip(buf, a, v4)) return false;
+    ip_entry(a, *v4, e);
+    return true;
+}
+
+static void format_ip(const unsigned char a[16], bool v4, char *out, size_t cap) {
+    char txt[INET6_ADDRSTRLEN] = "";
+    inet_ntop(v4 ? AF_INET : AF_INET6, a, txt, sizeof txt);
+    snprintf(out, cap, "%s", txt);
+}
+
+/* The value of the LAST header line `name` (case-insensitive) before
+ * position `end` in the block, or NULL. */
+static const char *header_before(const char *h, const char *end, const char *name, size_t nlen,
+                                 const char **vend, const char **line_start) {
+    const char *found = NULL;
+    for (const char *p = h; p < end;) {
+        const char *eol = memchr(p, '\n', (size_t) (end - p));
+        if (!eol) eol = end;
+        if ((size_t) (eol - p) > nlen && strncasecmp(p, name, nlen) == 0 && p[nlen] == ':') {
+            found = p + nlen + 1; *vend = eol; *line_start = p;
+        }
+        p = eol + 1;
+    }
+    return found;
+}
+
+bool rl_client_ip(const char *peer, const char *headers, size_t headers_len, char *out, size_t cap) {
+    char saved[80];
+    snprintf(saved, sizeof saved, "%s", peer ? peer : "");
+    snprintf(out, cap, "%s", saved);
+    if (!headers || !headers_len || !rl_trusted_proxy(saved)) return false;
+    const char *hend = headers + headers_len;
+    /* X-Forwarded-For: walk the entries right to left across all its
+     * header lines (later lines were appended by nearer proxies). */
+    unsigned char a[16], e[16], best[16]; bool v4, best_v4 = false, have = false;
+    const char *limit = hend, *vend, *ls;
+    const char *v;
+    while ((v = header_before(headers, limit, "X-Forwarded-For", 15, &vend, &ls)) != NULL) {
+        const char *q = vend;
+        while (q > v) {
+            const char *c = q;
+            while (c > v && c[-1] != ',') c--;
+            if (!parse_token(c, (size_t) (q - c), a, e, &v4)) {
+                /* garbage (or an empty item): stop at the last good hop */
+                bool blank = true;
+                for (const char *z = c; z < q; z++) if (*z != ' ' && *z != '\t' && *z != '\r') blank = false;
+                if (!blank) goto done;
+            } else {
+                memcpy(best, a, 16); best_v4 = v4; have = true;
+                if (!entry_trusted(e)) goto done;
+            }
+            q = c > v ? c - 1 : v;
+        }
+        limit = ls;
+    }
+done:
+    if (have) { format_ip(best, best_v4, out, cap); return true; }
+    v = header_before(headers, hend, "X-Real-IP", 9, &vend, &ls);
+    if (v && parse_token(v, (size_t) (vend - v), a, e, &v4)) { format_ip(a, v4, out, cap); return true; }
+    return false;
+}
+
 /* ---- configuration ------------------------------------------------------ */
 
 typedef struct { unsigned char *p; size_t n, cap, w; } vec_t;
@@ -243,6 +346,31 @@ void rl_shutdown(void) {
     for (int c = 0; c < RL_CLASSES; c++) { free(classes[c].tat); classes[c].tat = NULL; }
     free(ban_pk); ban_pk = NULL; ban_pk_n = 0;
     free(ban_ip); ban_ip = NULL; ban_ip_n = 0;
+    free(trust); trust = NULL; trust_n = 0;
+}
+
+/* "addr" or "addr/bits" -> rl_net_t (vec width sizeof(rl_net_t)). */
+static ng_status_t add_net(vec_t *v, const char *s, size_t n) {
+    char buf[80]; unsigned char a[16]; bool v4;
+    if (n == 0 || n >= sizeof buf) return NG_E_INVALID;
+    memcpy(buf, s, n); buf[n] = '\0';
+    char *slash = strchr(buf, '/');
+    long bits = -1;
+    if (slash) {
+        char *end = NULL;
+        *slash = '\0';
+        bits = strtol(slash + 1, &end, 10);
+        if (end == slash + 1 || *end || bits < 0) return NG_E_INVALID;
+    }
+    if (!parse_ip(buf, a, &v4)) return NG_E_INVALID;
+    long max = v4 ? 32 : 128;
+    if (bits < 0) bits = max;
+    if (bits > max) return NG_E_INVALID;
+    rl_net_t net;
+    memset(&net, 0, sizeof net);
+    ip_entry(a, v4, net.e);
+    net.bits = (unsigned) bits;
+    return vec_push(v, (const unsigned char *) &net) ? NG_OK : NG_E_NOMEM;
 }
 
 ng_status_t rl_configure(const rl_config_t *cfg, unsigned *bad_line) {
@@ -267,7 +395,11 @@ ng_status_t rl_configure(const rl_config_t *cfg, unsigned *bad_line) {
     ng_status_t st = add_list(&pk, cfg->banned_pubkeys, add_pubkey);
     if (st == NG_OK) st = add_list(&ip, cfg->banned_ips, add_ip);
     if (st == NG_OK && cfg->ban_file && *cfg->ban_file) st = load_file(cfg->ban_file, &pk, &ip, bad_line);
-    if (st != NG_OK) { free(pk.p); free(ip.p); rl_shutdown(); return st; }
+    vec_t tn = { NULL, 0, 0, sizeof(rl_net_t) };
+    if (st == NG_OK)
+        st = add_list(&tn, cfg->trusted_proxies ? cfg->trusted_proxies : RL_TRUSTED_PROXIES_DEFAULT, add_net);
+    if (st != NG_OK) { free(pk.p); free(ip.p); free(tn.p); rl_shutdown(); return st; }
+    trust = (rl_net_t *) (void *) tn.p; trust_n = tn.n;
     if (pk.n) qsort(pk.p, pk.n, 32, cmp32);
     if (ip.n) qsort(ip.p, ip.n, 16, cmp16);
     dedup_sorted(&pk); dedup_sorted(&ip);

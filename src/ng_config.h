@@ -87,6 +87,7 @@ typedef struct {
     char banned_pubkeys[480];   /* banned_pubkeys: hex, comma separated */
     char banned_ips[480];       /* banned_ips: comma separated */
     char ban_file[256];         /* ban_file: "pubkey <hex>" / "ip <addr>" lines */
+    char trusted_proxies[480];  /* trusted_proxies: addresses / CIDRs whose X-Forwarded-For is believed */
 } ng_policy_t;
 
 #define NG_SOFTWARE_URL "https://github.com/Named666/nostrogotho"
