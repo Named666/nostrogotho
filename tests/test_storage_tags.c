@@ -47,6 +47,31 @@ static int query(storage_context_t *s, const char *filter_json, bool do_count) {
 static int scanned;
 static void count_scan(const event_t *ev, void *arg) { (void) arg; if (ev && ev->kind == 9) scanned++; }
 
+static int count_sql(const char *sql) {
+    sqlite3_stmt *st; int n = -1;
+    if (sqlite3_prepare_v2(ngdb_conn, sql, -1, &st, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_step(st) == SQLITE_ROW) n = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* FTS5 structure is sound and the indexed documents are exactly the
+ * searchable rows (content != '', kind not excluded). */
+static bool fts_ok(void) {
+    if (sqlite3_exec(ngdb_conn, "INSERT INTO event_fts(event_fts) VALUES('integrity-check')", NULL, NULL, NULL) != SQLITE_OK)
+        return false;
+    return count_sql("SELECT COUNT(*) FROM (SELECT seq FROM event WHERE content != '' AND " NG_SEARCH_KIND_SQL("kind")
+                     " EXCEPT SELECT id FROM event_fts_docsize)") == 0 &&
+           count_sql("SELECT COUNT(*) FROM (SELECT id FROM event_fts_docsize EXCEPT SELECT seq FROM event WHERE content != ''"
+                     " AND " NG_SEARCH_KIND_SQL("kind") ")") == 0;
+}
+
+static event_t mkc(int n, int kind, long long at, const char *tags, const char *content) {
+    event_t e = mk(n, kind, at, tags);
+    e.content = (char *) content; e.content_len = strlen(content);
+    return e;
+}
+
 static int tag_rows(void) {
     sqlite3_stmt *st; int n = -1;
     if (sqlite3_prepare_v2(ngdb_conn, "SELECT COUNT(*) FROM tag", -1, &st, NULL) != SQLITE_OK) return -1;
@@ -154,6 +179,47 @@ int main(void) {
     check("delete_by_tag h", s.delete_by_tag('h', "pizza", NULL, &d) && d == 1, NULL);
     check("... other groups untouched", query(&s, "{\"#h\":[\"other\"]}", false) == 1 &&
           query(&s, "{\"#h\":[\"pizza\"]}", false) == 0, NULL);
+
+    /* NIP-50 bulk feed: deletes and replacements inside the batch that
+     * inserted the rows, then search and an FTS5 integrity check. */
+    {
+        event_t a = mkc(40, 1, 7000, "[]", "zebra alpha"), b = mkc(41, 0, 7001, "[]", "zebra profile one"),
+                b2 = mkc(42, 0, 7002, "[]", "zebra profile two"), c = mkc(43, 1, 7003, "[[\"t\",\"gone\"]]", "zebra gamma"),
+                d4 = mkc(44, 1, 7004, "[]", "zebra delta"), e4 = mkc(45, 4, 7005, "[]", "zebra secret dm");
+        memset(b.pubkey, 'd', 64); memset(b2.pubkey, 'd', 64);
+        event_t x = mkc(46, 1, 7006, "[[\"expiration\",\"1\"]]", "zebra expired");
+        check("fts: integrity before the batch", fts_ok(), NULL);
+        check("fts batch: begin", s.begin_batch(), NULL);
+        check("fts batch: inserts", s.insert_event(&a) == STORAGE_PUT_INSERTED && s.insert_event(&b) == STORAGE_PUT_INSERTED &&
+              s.insert_event(&c) == STORAGE_PUT_INSERTED && s.insert_event(&e4) == STORAGE_PUT_INSERTED &&
+              s.insert_event(&x) == STORAGE_PUT_INSERTED, NULL);
+        check("fts batch: kind 0 replaced in the same batch", s.replaceable_admit(&b2, NULL) == STORAGE_ADMIT_NEWEST &&
+              s.insert_event(&b2) == STORAGE_PUT_INSERTED, NULL);
+        check("fts batch: delete_by_tag in the same batch", s.delete_by_tag('t', "gone", NULL, &d) && d == 1, NULL);
+        check("fts batch: insert then delete_by_id", s.insert_event(&d4) == STORAGE_PUT_INSERTED && s.delete_by_id(d4.id, &d) && d == 1, NULL);
+        check("fts batch: NIP-40 purge in the same batch", s.purge_expired(999999, &d) && d == 1, NULL);
+        check("fts batch: commit", s.commit_batch(), NULL);
+        check("fts: integrity-check", fts_ok(), NULL);
+        check("fts: survivors searchable", query(&s, "{\"search\":\"zebra\"}", false) == 2 &&
+              query(&s, "{\"search\":\"profile two\"}", false) == 1, NULL);
+        check("fts: replaced / deleted / purged / kind 4 not found",
+              query(&s, "{\"search\":\"one\"}", false) == 0 && query(&s, "{\"search\":\"gamma\"}", false) == 0 &&
+              query(&s, "{\"search\":\"delta\"}", false) == 0 && query(&s, "{\"search\":\"expired\"}", false) == 0 &&
+              query(&s, "{\"search\":\"secret\"}", false) == 0, NULL);
+        event_t r = mkc(47, 1, 7007, "[]", "zebra rolled");
+        check("fts: rolled back batch", s.begin_batch() && s.insert_event(&r) == STORAGE_PUT_INSERTED && s.rollback_batch() &&
+              fts_ok() && query(&s, "{\"search\":\"rolled\"}", false) == 0, NULL);
+        event_t v1 = mkc(48, 1, 7008, "[]", "zebra vanishing");
+        memset(v1.pubkey, 'e', 64);
+        char vpk[65]; memset(vpk, 'e', 64); vpk[64] = 0;
+        check("fts: vanish in the inserting batch", s.begin_batch() && s.insert_event(&v1) == STORAGE_PUT_INSERTED &&
+              s.vanish(vpk, 9000, NULL, &d) && d == 1 && s.commit_batch() && fts_ok() &&
+              query(&s, "{\"search\":\"vanishing\"}", false) == 0, NULL);
+        event_t w1 = mkc(49, 1, 7009, "[]", "zebra omega"), w2 = mkc(50, 30023, 7010, "[[\"d\",\"post\"]]", "zebra article");
+        check("fts: batch of inserts only, fed at commit", s.begin_batch() && s.insert_event(&w1) == STORAGE_PUT_INSERTED &&
+              s.insert_event(&w2) == STORAGE_PUT_INSERTED && s.commit_batch() && fts_ok() &&
+              query(&s, "{\"search\":\"omega\"}", false) == 1 && query(&s, "{\"search\":\"article\"}", false) == 1, NULL);
+    }
 
     s.deinit();
     char side[96];

@@ -64,7 +64,30 @@ static bool tag_rows_reserve(size_t rows, size_t bytes) {
  * back vanish leaves it 1, which only costs an extra point lookup. */
 static NG_THREAD_LOCAL int vanished_state = -1;
 
+/* NIP-50 bulk feed. seq is INTEGER PRIMARY KEY (max + 1 on insert), and
+ * every DELETE on event flushes first, so the rows inserted since the last
+ * flush are exactly seq >= fts_pending: one INSERT ... SELECT feeds them.
+ * 0 = nothing pending. */
+static NG_THREAD_LOCAL sqlite3_int64 fts_pending;
+
+void ngdb_fts_reset(void) { fts_pending = 0; }
+
+bool ngdb_fts_flush(void) {
+    if (!fts_pending) return true;
+    sqlite3_int64 from = fts_pending;
+    fts_pending = 0;
+    if (!ngdb_search_enabled()) return true;
+    sqlite3_stmt *st = ngdb_ps(PS_FTS_FEED);
+    if (!st) return false;
+    sqlite3_bind_int64(st, 1, from);
+    int rc = sqlite3_step(st);
+    sqlite3_reset(st);
+    if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
+    return true;
+}
+
 void ngdb_write_scratch_free(void) {
+    fts_pending = 0;
     vanished_state = -1;
     free(tr_rows); free(tr_buf);
     tr_rows = NULL; tr_buf = NULL; tr_cap = tr_buf_cap = 0;
@@ -196,8 +219,12 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
     if (changes == 0) return STORAGE_PUT_DUPLICATE;   /* ON CONFLICT(id) DO NOTHING */
     /* The event row exists: index its tags. A
      * failed tag index fails the insert; the writer rolls the batch back. */
-    if (!store_tags(ev, sqlite3_last_insert_rowid(ngdb_conn))) {
+    sqlite3_int64 seq = sqlite3_last_insert_rowid(ngdb_conn);
+    if (ngdb_search_enabled() && !fts_pending && ev->content && ev->content[0] && ng_search_kind(ev->kind))
+        fts_pending = seq;
+    if (!store_tags(ev, seq)) {
         /* Undo the row (the delete trigger drops any tag rows written). */
+        (void) ngdb_fts_flush();
         sqlite3_stmt *del = ngdb_ps(PS_DEL_ID);
         if (del) {
             sqlite3_bind_text(del, 1, ev->id, -1, SQLITE_STATIC);
@@ -206,6 +233,8 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
         }
         return STORAGE_PUT_FAILED;
     }
+    /* Outside a batch transaction (tests, tools): feed it now. */
+    if (fts_pending && sqlite3_get_autocommit(ngdb_conn) && !ngdb_fts_flush()) return STORAGE_PUT_FAILED;
     return STORAGE_PUT_INSERTED;
 }
 
@@ -269,6 +298,7 @@ storage_admit_t ngdb_replaceable_admit(const event_t *ev, const char *dtag) {
     }
     if (verdict == STORAGE_ADMIT_NEWEST && rc != SQLITE_DONE) verdict = STORAGE_ADMIT_FAILED;
     sqlite3_reset(sel);
+    if (verdict == STORAGE_ADMIT_NEWEST && nv && !ngdb_fts_flush()) verdict = STORAGE_ADMIT_FAILED;
     if (verdict == STORAGE_ADMIT_NEWEST) {
         sqlite3_stmt *del = ngdb_ps(PS_DEL_ID);
         for (size_t i = 0; del && i < nv; i++) {
@@ -285,6 +315,7 @@ storage_admit_t ngdb_replaceable_admit(const event_t *ev, const char *dtag) {
 /* Run a prepared DELETE to completion and finalize it. true on success,
  * *deleted (if not NULL) = rows changed. */
 static bool run_delete(sqlite3_stmt *stmt, size_t *deleted) {
+    if (!ngdb_fts_flush()) { sqlite3_finalize(stmt); return false; }   /* see fts_pending */
     bool ok = sqlite3_step(stmt) == SQLITE_DONE;
     if (!ok) fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
     else if (deleted) *deleted = (size_t) sqlite3_changes(ngdb_conn);
@@ -485,8 +516,9 @@ bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *he
 }
 
 bool ngdb_delete_by_id(const char *id, size_t *deleted) {
+    if (!id || !ngdb_fts_flush()) return false;
     sqlite3_stmt *stmt = ngdb_ps(PS_DEL_ID);
-    if (!stmt || !id) return false;
+    if (!stmt) return false;
     sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
     int rc = sqlite3_step(stmt);
     if (deleted) *deleted = rc == SQLITE_DONE ? (size_t) sqlite3_changes(ngdb_conn) : 0;

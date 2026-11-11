@@ -379,7 +379,7 @@ def nip50():
     check("NIP-11 declares 50", 50 in d.get("supported_nips", []), d.get("supported_nips"))
     r.stop()
     db = sqlite3.connect(r.db)
-    db.executescript("DROP TRIGGER event_fts_insert; DROP TRIGGER event_fts_delete; DROP TABLE event_fts;")
+    db.executescript("DROP TRIGGER IF EXISTS event_fts_insert; DROP TRIGGER event_fts_delete; DROP TABLE event_fts;")
     db.close()
     r.start(); w = WS(r.port)
     evs, _ = w.req("s7", {"search": "nostr apps"})
@@ -607,6 +607,40 @@ def nip29b():
     m = w.publish(bob.ev("old", 9, [["h", "g3"]], ca=int(_t.time()) - 7200))
     check("group_max_age = 0 accepts late publication", m[2] is True, m)
     r.stop()
+
+
+@section
+def nip50b():
+    """NIP-50 bulk feed: replace / delete in flight with inserts, then search."""
+    import threading
+    r = Relay(); k = Key(); now = int(time.time())
+    conns = [WS(r.port) for _ in range(8)]
+    # Pipelined publishes from 8 connections land in shared writer batches.
+    p1 = k.ev("profile walrus", 0, [], ca=now - 3); p2 = k.ev("profile narwhal", 0, [], ca=now - 2)
+    a1 = k.ev("article v1 manatee", 30023, [["d", "x"]], ca=now - 3); a2 = k.ev("article v2 dugong", 30023, [["d", "x"]], ca=now - 2)
+    victim = k.ev("doomed axolotl", 1, [], ca=now - 3)
+    kill = k.ev("", 5, [["e", victim["id"]]], ca=now - 1)
+    fillers = [Key().ev("filler okapi %d" % i, 1, []) for i in range(400)]
+    groups = [[p1, p2], [a1, a2], [victim, kill]] + [fillers[i::5] for i in range(5)]
+    def send(c, evs):
+        for e in evs: c.send(["EVENT", e])
+        for _ in evs: c.recv(10)
+    ts = [threading.Thread(target=send, args=(conns[i], g)) for i, g in enumerate(groups)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    w = WS(r.port)
+    def hits(q): return len(w.req("s" + q, {"search": q, "limit": 500})[0])
+    check("replaced kind 0: old words gone, new found", hits("walrus") == 0 and hits("narwhal") == 1, (hits("walrus"), hits("narwhal")))
+    check("replaced addressable: old words gone, new found", hits("manatee") == 0 and hits("dugong") == 1, (hits("manatee"), hits("dugong")))
+    check("NIP-09 deleted in the same burst: not found", hits("axolotl") == 0, hits("axolotl"))
+    check("every filler searchable", hits("okapi") == 400, hits("okapi"))
+    r.stop()
+    import sqlite3
+    db = sqlite3.connect(r.db)
+    ic = db.execute("INSERT INTO event_fts(event_fts) VALUES('integrity-check')") and True
+    n_idx = db.execute("SELECT COUNT(*) FROM event_fts_docsize").fetchone()[0]
+    n_ev = db.execute("SELECT COUNT(*) FROM event WHERE content != '' AND kind NOT IN (4,13,1059,1060,21059,22242,24133)").fetchone()[0]
+    check("FTS5 integrity-check and indexed docs == searchable rows", ic and n_idx == n_ev, (n_idx, n_ev))
 
 
 @section

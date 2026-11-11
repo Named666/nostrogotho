@@ -34,6 +34,8 @@ static const char *const ps_sql[PS_COUNT] = {
     [PS_TAG_INSERT_CHUNK] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES "
                             "(?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
     [PS_VANISH_CHECK] = "SELECT 1 FROM vanished WHERE pubkey = unhex(?) AND until >= ?",
+    [PS_FTS_FEED] = "INSERT INTO event_fts (rowid, content) SELECT seq, content FROM event"
+                    " WHERE seq >= ? AND content != '' AND " NG_SEARCH_KIND_SQL("kind"),
 };
 static NG_THREAD_LOCAL sqlite3_stmt *ps[PS_COUNT];
 
@@ -60,19 +62,20 @@ static const char *db_sync = "FULL";
 void storage_set_sync_full(bool full) { db_sync = full ? "FULL" : "NORMAL"; }
 static bool db_search = true;
 void storage_set_search(bool on) { db_search = on; }
+bool ngdb_search_enabled(void) { return db_search; }
 
 /* NIP-50 full-text index over content (FTS5, external content =
  * the event table, keyed by seq). Encrypted / AUTH kinds and empty
- * content are not indexed; insert and delete triggers share that
- * WHEN so the index never sees a delete for a row it lacks. */
+ * content are not indexed. Inserts are fed in bulk, once per batch
+ * (PS_FTS_FEED, storage_write.c), not by a per-row trigger: a per-row
+ * FTS5 insert cost ~15-20 us/event on the writer. The delete trigger
+ * stays; every DELETE on event first flushes the pending rows, so it
+ * never issues an FTS5 'delete' for a row the index lacks. */
 static const char search_sql[] =
     "CREATE VIRTUAL TABLE IF NOT EXISTS event_fts USING fts5("
     "    content, content='event', content_rowid='seq',"
     "    tokenize='unicode61 remove_diacritics 2');"
-    "CREATE TRIGGER IF NOT EXISTS event_fts_insert AFTER INSERT ON event"
-    "  WHEN new.content != '' AND " NG_SEARCH_KIND_SQL("new.kind") " BEGIN"
-    "  INSERT INTO event_fts (rowid, content) VALUES (new.seq, new.content);"
-    "END;"
+    "DROP TRIGGER IF EXISTS event_fts_insert;"
     "CREATE TRIGGER IF NOT EXISTS event_fts_delete AFTER DELETE ON event"
     "  WHEN old.content != '' AND " NG_SEARCH_KIND_SQL("old.kind") " BEGIN"
     "  INSERT INTO event_fts (event_fts, rowid, content) VALUES ('delete', old.seq, old.content);"
@@ -367,9 +370,12 @@ static bool storage_checkpoint_sqlite3(void) {
         sqlite3_wal_checkpoint_v2(ngdb_conn, NULL, SQLITE_CHECKPOINT_RESTART, &log, &done);
     return true;
 }
-static bool storage_begin_sqlite3(void) { return storage_exec_sqlite3("BEGIN IMMEDIATE"); }
-static bool storage_commit_sqlite3(void) { return storage_exec_sqlite3("COMMIT"); }
+static bool storage_begin_sqlite3(void) { ngdb_fts_reset(); return storage_exec_sqlite3("BEGIN IMMEDIATE"); }
+/* The batch's pending search rows go in with the batch: a failed feed
+ * fails the commit (the writer rolls back and answers error:). */
+static bool storage_commit_sqlite3(void) { return ngdb_fts_flush() && storage_exec_sqlite3("COMMIT"); }
 static bool storage_rollback_sqlite3(void) {
+    ngdb_fts_reset();
     /* COMMIT failed (e.g. SQLITE_BUSY/IOERR/FULL): the transaction may still be
      * open; roll it back so the writer starts the next batch cleanly. */
     if (!ngdb_conn || sqlite3_get_autocommit(ngdb_conn)) return true;
