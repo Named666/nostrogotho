@@ -13,7 +13,7 @@ Everything in this audit is done except NIP-86 and NIP-77, which the owner put o
 
 | Item | Status | Commit(s) | Notes / remaining |
 |---|---|---|---|
-| A1 NIP-01 `#tag` filters | **done** | 182fe68, 755e00d | `tag` table + delete trigger; WAL write-coalescing VFS (`ngwal`) recovers most of the write cost |
+| A1 NIP-01 `#tag` filters | **done** | 182fe68, 755e00d, 9b1c4fc | `tag` table + delete trigger; WAL write-coalescing VFS (`ngwal`). Only `tag_index_letters` (default e,p,a,q,t,d,h,k) are indexed, at most `tag_index_max_per_event` (default 2000) per event; other letters and tags past the cap are answered from the stored tags JSON (correct, slower). The `kind` column stays: kinds filters are checked on the tag row before the join |
 | A2 `limit:0` | **done** | 94aeaf6 | |
 | A3/B7 tag count, sizes | **done** | 2d5e673 | configurable (`max_event_tags`, `max_content_length`, ...) |
 | A4 OK for invalid events | **done** | 9257dad | NIP-01 prefixes |
@@ -22,13 +22,13 @@ Everything in this audit is done except NIP-86 and NIP-77, which the owner put o
 | A8 NIP-09 | **done** | 76c3042 | recipient deletes gift wraps |
 | A9 NIP-42 | **done** | d340020 | works without SERVICE_URL |
 | A10-A12 | **done** | (baseline) | id tie-break covered in A1 ordering |
-| B1 NIP-50 | **done** | 2f1138c | FTS5 external content; `search = 0` turns it off (publish cost, see perf) |
+| B1 NIP-50 | **done** | 2f1138c, e6c656a | FTS5 external content, fed once per writer batch (one INSERT…SELECT before COMMIT and before any DELETE in the batch) instead of a per-row trigger; `search = 0` turns it off |
 | B2 NIP-45 | **done** | c2cd747 | gift-wrap gating, HyperLogLog |
 | B3 NIP-17/59 | **done** | 76c3042, fe947c5 | `auth-required:` CLOSED; NIP-67 `auth` hint |
 | B4 NIP-70 | **done** | a682d05 | declared; reposts embedding protected events blocked |
 | B5 NIP-62 | **done** | c046669 | durable `vanished` table |
 | B6 NIP-40, B9 NIP-13 | **done**, declared | a682d05 | |
-| B10 rate limits / bans | **done** | f7846d6 | GCRA lock-free per IP (/64 for v6) and pubkey; `rate-limited:` / `blocked:`; ban lists load at startup only |
+| B10 rate limits / bans | **done** | f7846d6, d8d8a31 | GCRA lock-free per IP (/64 for v6) and pubkey; `rate-limited:` / `blocked:`; ban lists load at startup only. Behind a reverse proxy listed in `trusted_proxies` (default 127.0.0.1, ::1; CIDRs allowed) the client IP is the rightmost untrusted X-Forwarded-For entry (else X-Real-IP); nginx snippet in `nostrogotho.conf` |
 | B11 NIP-86 | **out of scope** | – | owner decision |
 | NIP-77 | **out of scope** | – | owner decision |
 | NIP-26 | **removed** | e822225 | unrecommended |
@@ -38,20 +38,61 @@ Everything in this audit is done except NIP-86 and NIP-77, which the owner put o
 
 Known limitations:
 - NIP-29/43 in-memory state is updated before COMMIT. If a writer COMMIT fails, the relay-generated events roll back, but the in-memory state does not until restart, when the state is replayed from the DB.
-- IP limits use the socket peer address. There is no X-Forwarded-For / proxy support.
+- Tag filters on letters outside `tag_index_letters` (e.g. NIP-22 `#E`/`#K`/`#P`, `#r`, `#g`) scan the tags JSON of the events the rest of the filter selects: correct, but O(candidates) instead of an index lookup. Add heavily queried letters to the list (the index is rebuilt at the next start).
 - Ban lists are read at startup only, because changing them at runtime would need NIP-86.
 
 Durability: `tools/fsync_check/` (LD_PRELOAD tracer) shows that every `OK true` is sent only after an fdatasync of the WAL that started after the event's frames were written. This holds with coalescing on and off. The `db_sync = normal` negative control is caught. Results are in `tools/fsync_check` output at 1f961ac: 2400/2400 OKs covered, 0 violations; 704 WAL pwrites / 668 syncs with coalescing, 19211 pwrites without; the NORMAL control flags all 2400.
 
-Publish events/s, FULL sync, 64 conns × pipeline 16, relay on CPUs 0-3. Median of 3 interleaved runs (individual runs in `/workspace/bench/gate-results/nips-final-pub-*.txt`, 2026-11-10 17:16 CST):
+Durability at d8d8a31 (`tools/fsync_check/run.sh`, 18:44 CST, `/workspace/bench/gate-results/perf2-fsync.txt`): every `OK true` was sent only after an fsync of the WAL that covered its frames.
 
-| dataset | d2f276e (base) | 182fe68 (tag index) | 755e00d (+ WAL shim) | HEAD | HEAD `search = 0` |
+| run | OKs covered | violations | WAL pwrites / syncs |
+|---|---|---|---|
+| coalescing on | 2400/2400 | 0 | 1038 / 1038 |
+| coalescing off | 2400/2400 | 0 | 22257 / 706 |
+| `db_sync = normal` control | – | 2400, as expected | – |
+
+Publish events/s, FULL sync, 64 conns × pipeline 16, relay on CPUs 0-3. Median of 3 interleaved runs, 18:46-18:52 CST (`/workspace/bench/gate-results/perf2-pub.txt`):
+
+| dataset | d2f276e (base) | 04f344e (before fixes) | d8d8a31 (HEAD) | HEAD vs 04f344e | HEAD vs base |
 |---|---|---|---|---|---|
-| ev1500k (1 tag, content "0") | 42,977 | 39,754 | 53,618 | 29,847 | 52,211 |
-| ev400k_tags (4 tags with hints) | 36,550 | 19,270 | 24,346 | 17,328 | 25,044 |
-| ev400k_text (25-word content) | 32,094 | 17,397 | 23,332 | 15,411 | 23,631 |
+| ev1500k (1 tag, content "0") | 45,492 | 29,580 | 48,332 | +63% | +6% |
+| ev400k_tags (4 tags with hints) | 43,310 | 20,193 | 25,070 | +24% | −42% |
+| ev400k_text (25-word content) | 40,519 | 17,054 | 24,121 | +41% | −40% |
 
-Reading: the tag index costs about 45% on tagged/text events, and the WAL shim recovers about a quarter of that. Comparing HEAD with `search = 0` against 755e00d shows the NIP-50 FTS5 index accounts for almost all of the further drop (−34 to −45%). Everything else added since 755e00d is within noise. Gate at 3f18090: gcc/clang strict 0 warnings, cppcheck 0, full suite + 11 C tests pass, ASan+UBSan and TSan suites pass with 0 reports.
+Reading:
+- FTS5 bulk feed (e6c656a) and the smaller tag index (9b1c4fc) recover the search cost on short and text events.
+- ev400k_tags uses only indexed letters (e/p), so the remaining gap is the tag rows themselves.
+- Base numbers are about 5-35% higher than the 17:16 CST runs (host load varies), so compare within one table.
+
+Earlier numbers from 17:16 CST, for reference:
+
+| dataset | 182fe68 (tag index) | 755e00d (+ WAL shim) | 0dc4ea3 | 0dc4ea3 `search = 0` |
+|---|---|---|---|---|
+| ev1500k | 39,754 | 53,618 | 29,847 | 52,211 |
+| ev400k_tags | 19,270 | 24,346 | 17,328 | 25,044 |
+| ev400k_text | 17,397 | 23,332 | 15,411 | 23,631 |
+
+Fan-out and echo at HEAD only; the d2f276e baselines are in `nips-final-fan.txt` and `nips-final-echo.txt`:
+
+| test | d2f276e baseline | HEAD |
+|---|---|---|
+| fan-out, 1000 subs | 1.99M/s | 1.99M/s (p50 2.9 ms) |
+| fan-out, 5000 subs | 2.50M/s | 2.50M/s (p50 15.3 ms) |
+| uncapped fan2, 1000 subs × 4000 ev/s | – | 3.98M/s delivered (p50 4.2 ms, p99 26.7 ms) |
+| 50k idle | 650 B/conn | 666 B/conn |
+| echo 64 B | 3.17M/s | 3.15M/s |
+| echo 4 KB | ~1.61M/s | 1.59M/s |
+
+Gate at d8d8a31 (`perf2-gate.txt`, 18:27-18:44 CST): all checks pass.
+
+| check | result |
+|---|---|
+| gcc / clang strict | 0 warnings |
+| cppcheck | 0 findings |
+| full suite | nips 205/205 |
+| C tests | 11/11 |
+| ASan+UBSan | suite and C tests, 0 reports |
+| TSan | suite, 0 reports |
 
 Method:
 1. Read the code (file:function references below).

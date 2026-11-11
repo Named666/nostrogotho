@@ -356,6 +356,36 @@ Publish with FULL sync, 64 connections x 16 in flight, 6 s, events/s:
   a quieter host. Disk and host contention explain the lower absolute values
   today; compare within a table only.
 
+### 5. Writer cost of the NIP-01 tag index and NIP-50 search (e6c656a, 9b1c4fc)
+
+The tag index (182fe68) and the FTS5 search index (2f1138c) both add writes to
+the one writer thread. Two changes recover most of that cost:
+
+- FTS5 is fed once per batch with one `INSERT ... SELECT` before COMMIT (and
+  before any DELETE in the same batch). It no longer uses a per-row trigger.
+- Only `tag_index_letters` (default e,p,a,q,t,d,h,k) are indexed, capped at
+  `tag_index_max_per_event` (default 2000). Other letters, and tags past the
+  cap, are answered from the tags JSON.
+
+Publish with FULL sync, 64 connections x 16 in flight, relay on CPUs 0-3.
+Events/s, median of 3 interleaved runs (18:46-18:52 CST, runs in
+`/workspace/bench/gate-results/perf2-pub.txt`):
+
+| dataset | d2f276e (no tag/search index) | 04f344e | d8d8a31 | d8d8a31 vs 04f344e |
+|---|---|---|---|---|
+| ev1500k (1 tag, content "0") | 45,492 | 29,580 | 48,332 | +63% |
+| ev400k_tags (4 tags with hints) | 43,310 | 20,193 | 25,070 | +24% |
+| ev400k_text (25-word content) | 40,519 | 17,054 | 24,121 | +41% |
+
+Tagged and text events still cost about 40% compared with having no index.
+That is the price of O(log N) `#e`/`#p` lookups and search. The fan-out and
+echo results at d8d8a31 match the earlier baselines:
+
+- fan-out: 1.99M/s for 1k subscribers and 2.50M/s for 5k
+- uncapped fan-out: 3.98M/s of 4M/s offered
+- 50k idle connections: 666 B/conn
+- echo: 3.15M/s at 64 B and 1.59M/s at 4 KB
+
 ### Still open
 
 - One busy connection's verification remains serialized on its worker.
