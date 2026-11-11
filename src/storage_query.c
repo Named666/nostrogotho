@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "platform/ng_alloc.h"
+#include "platform/ng_platform.h"
 #include "storage.h"
 
 /* escape_like - Escape SQL LIKE special characters ('%', '_', '\') with a
@@ -101,6 +102,41 @@ bool sq_tag_name_indexable(const char *name) {
            name[1] == '\0';
 }
 
+/* Letters the tag table indexes (tag_index_letters). Set once at startup
+ * before any thread runs; read-only afterwards. */
+static bool sq_letters[128] = {
+    ['e'] = true, ['p'] = true, ['a'] = true, ['q'] = true,
+    ['t'] = true, ['d'] = true, ['h'] = true, ['k'] = true,
+};
+static char sq_letters_str[64] = SQ_TAG_LETTERS_DEFAULT;
+
+bool sq_set_tag_letters(const char *letters) {
+    bool set[128] = { false };
+    char out[64];
+    size_t n = 0;
+    if (!letters) return false;
+    if (strcmp(letters, "*") == 0) letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    for (const char *c = letters; *c; c++) {
+        if (*c == ',' || *c == ' ') continue;
+        char nm[2] = { *c, '\0' };
+        if (!sq_tag_name_indexable(nm)) return false;
+        if (!set[(unsigned char) *c]) { set[(unsigned char) *c] = true; out[n++] = *c; }
+    }
+    out[n] = '\0';
+    memcpy(sq_letters, set, sizeof(set));
+    memcpy(sq_letters_str, out, n + 1);
+    return true;
+}
+
+const char *sq_tag_letters(void) { return sq_letters_str; }
+
+bool sq_tag_indexed(const char *name) {
+    return sq_tag_name_indexable(name) && sq_letters[(unsigned char) name[0]];
+}
+
+static NG_THREAD_LOCAL bool sq_overflow;
+void sq_set_overflow(bool on) { sq_overflow = on; }
+
 bool sq_is_hex64(const char *s, size_t len) {
     if (len != 64) return false;
     for (size_t i = 0; i < 64; i++)
@@ -130,6 +166,26 @@ static void sq_tag_match(sq_query_t *q, const char *alias, const tag_t *tag) {
     sq_sql(q, ")");
 }
 
+/* Fallback for a tag condition the index cannot answer (a letter outside
+ * tag_index_letters, or an event whose tags passed tag_index_max_per_event):
+ * scan the stored tags JSON of `alias`. Exact text match on the first
+ * value, as NIP-01 requires; slower than the index (one JSON walk per
+ * candidate event). */
+static void sq_tag_json(sq_query_t *q, const char *alias, const tag_t *tag) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(%s.tags) THEN %s.tags", alias, alias);
+    sq_sql(q, buf);
+    sq_sql(q, " ELSE '[]' END) j WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') ");
+    sq_text(q, tag->elements[0]);
+    if (tag->count == 2) { sq_sql(q, "= ?"); sq_text(q, tag->elements[1]); }
+    else {
+        sq_sql(q, "IN (");
+        for (size_t v = 1; v < tag->count; v++) { if (v > 1) sq_sql(q, ","); sq_sql(q, "?"); sq_text(q, tag->elements[v]); }
+        sq_sql(q, ")");
+    }
+    sq_sql(q, ")");
+}
+
 /* ----------------------------------------------------------- compiler --- */
 /* Plain filters scan `event e` (pubkindidx / kindtimeidx / timeidx). Filters
  * with tag conditions are driven by the tag index: the condition with the
@@ -147,6 +203,7 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     for (size_t t = 0; t < f->tags_count; t++) {
         const tag_t *tag = &f->tags[t];
         if (tag->count < 2 || !sq_tag_name_indexable(tag->elements[0])) { sq_fail(q, NG_E_INVALID); return q->status; }
+        if (!sq_tag_indexed(tag->elements[0])) continue;   /* JSON fallback below */
         if (drive == f->tags_count || tag->count < f->tags[drive].count) drive = t;
     }
     bool tagged = drive < f->tags_count;
@@ -157,7 +214,18 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     if (do_count) sq_sql(q, multi ? "SELECT COUNT(DISTINCT e.seq) FROM " : "SELECT COUNT(*) FROM ");
     else if (mode == SQ_MODE_PUBKEYS) sq_sql(q, multi ? "SELECT DISTINCT e.seq, e.pubkey FROM " : "SELECT e.seq, e.pubkey FROM ");
     else sq_sql(q, multi ? "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM " : "SELECT " SQ_EVENT_COLUMNS " FROM ");
-    sq_sql(q, tagged ? "tag t JOIN event e ON e.seq = t.ev" : "event e");
+    if (tagged && sq_overflow) {
+        /* Some events carry more tags than tag_index_max_per_event: their
+         * unindexed tags are found by the JSON fallback, merged into the
+         * driving rows (same ev, created_at, kind shape as the tag table). */
+        sq_sql(q, "(SELECT g.ev, g.created_at, g.kind FROM tag g WHERE ");
+        sq_tag_match(q, "g", &f->tags[drive]);
+        sq_sql(q, " UNION SELECT o.ev, o.created_at, o.kind FROM tag_overflow o JOIN event y ON y.seq = o.ev WHERE ");
+        sq_tag_json(q, "y", &f->tags[drive]);
+        sq_sql(q, ") t JOIN event e ON e.seq = t.ev");
+    } else {
+        sq_sql(q, tagged ? "tag t JOIN event e ON e.seq = t.ev" : "event e");
+    }
     /* NIP-50: the FTS5 index drives or joins; ranked by bm25 below. */
     char *fts = f->search && ng_search_has_terms(f->search) ? ng_search_fts_query(f->search) : NULL;
     if (f->search && !fts && ng_search_has_terms(f->search)) sq_fail(q, NG_E_NOMEM);
@@ -165,7 +233,7 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     const char *sep = " WHERE ";
 #define NEXT() (sq_sql(q, sep), sep = " AND ")
 
-    if (tagged) { NEXT(); sq_tag_match(q, "t", &f->tags[drive]); }
+    if (tagged && !sq_overflow) { NEXT(); sq_tag_match(q, "t", &f->tags[drive]); }
     if (f->ids_count > 0) {
         NEXT();
         if (f->ids_count == 1) sq_sql(q, "e.id = unhex(?)");
@@ -200,9 +268,15 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     for (size_t t = 0; t < f->tags_count; t++) {        /* AND across tag names */
         if (t == drive) continue;
         NEXT();
-        sq_sql(q, "EXISTS (SELECT 1 FROM tag x WHERE ");
+        if (!sq_tag_indexed(f->tags[t].elements[0])) { sq_tag_json(q, "e", &f->tags[t]); continue; }
+        sq_sql(q, sq_overflow ? "(EXISTS (SELECT 1 FROM tag x WHERE " : "EXISTS (SELECT 1 FROM tag x WHERE ");
         sq_tag_match(q, "x", &f->tags[t]);
         sq_sql(q, " AND x.created_at = e.created_at AND x.ev = e.seq)");
+        if (sq_overflow) {
+            sq_sql(q, " OR (e.seq IN (SELECT ev FROM tag_overflow) AND ");
+            sq_tag_json(q, "e", &f->tags[t]);
+            sq_sql(q, "))");
+        }
     }
     if (fts) { NEXT(); sq_sql(q, "event_fts MATCH ?"); sq_owned(q, fts); }
 #undef NEXT

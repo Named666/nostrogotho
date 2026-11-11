@@ -9,7 +9,7 @@
 
 ng_limits_t ng_limits = {
     (size_t) 5 << 20, (size_t) 512 << 10, (size_t) 256 << 10, 5000,
-    100, 20, 100, 500, 500, 5000, 10000, 1
+    100, 20, 100, 500, 500, 5000, 10000, 1, "epaqtdhk", 2000
 };
 
 void ng_limits_defaults(ng_limits_t *l) {
@@ -25,6 +25,8 @@ void ng_limits_defaults(ng_limits_t *l) {
     l->max_filter_items = 5000;
     l->max_req_authors = 10000;
     l->search = 1;
+    snprintf(l->tag_index_letters, sizeof(l->tag_index_letters), "%s", "epaqtdhk");
+    l->tag_index_max_per_event = 2000;
 }
 
 void ng_limits_apply(const ng_limits_t *l) {
@@ -137,6 +139,8 @@ static const cfg_key_t keys[] = {
     { "max_filter_items",   K_INT,     1, 20000,                       F(limits.max_filter_items) },
     { "max_req_authors",    K_INT,     1, 100000,                      F(limits.max_req_authors) },
     { "search",             K_INT,     0, 1,                           F(limits.search) },
+    { "tag_index_letters",  K_STR,     1, sizeof(((ng_limits_t *) 0)->tag_index_letters), F(limits.tag_index_letters) },
+    { "tag_index_max_per_event", K_INT, 1, 100000,                     F(limits.tag_index_max_per_event) },
     { "rate_events_per_min_ip",     K_INT, 0, 10000000, F(policy.event_ip_per_min) },
     { "rate_events_burst_ip",       K_INT, 1, 1000000,  F(policy.event_ip_burst) },
     { "rate_events_per_min_pubkey", K_INT, 0, 10000000, F(policy.event_pubkey_per_min) },

@@ -9,6 +9,7 @@
 #include "storage.h"
 #include "storage_internal.h"
 #include "json_util.h"
+#include "storage_query.h"
 
 static int failures;
 static void check(const char *name, int ok, const char *detail) {
@@ -219,6 +220,78 @@ int main(void) {
         check("fts: batch of inserts only, fed at commit", s.begin_batch() && s.insert_event(&w1) == STORAGE_PUT_INSERTED &&
               s.insert_event(&w2) == STORAGE_PUT_INSERTED && s.commit_batch() && fts_ok() &&
               query(&s, "{\"search\":\"omega\"}", false) == 1 && query(&s, "{\"search\":\"article\"}", false) == 1, NULL);
+    }
+
+    /* Tag index scope: letters outside tag_index_letters and tags past
+     * tag_index_max_per_event are answered from the tags JSON. */
+    {
+        s.deinit();
+        unlink(path);
+        char side0[96];
+        snprintf(side0, sizeof(side0), "%s-wal", path); unlink(side0);
+        snprintf(side0, sizeof(side0), "%s-shm", path); unlink(side0);
+        check("tag index: bad letters rejected", !storage_set_tag_index("e,p,1", 3) && ngdb_tag_cap() == NG_TAG_CAP_DEFAULT, NULL);
+        check("tag index: letters e,p,t cap 3", storage_set_tag_index("e, p,t", 3) && strcmp(sq_tag_letters(), "ept") == 0, NULL);
+        check("tag index: reopen", s.init(dsn), NULL);
+        char tx[1024];
+        snprintf(tx, sizeof(tx), "[[\"x\",\"foo\"],[\"E\",\"%s\"],[\"t\",\"a\"],[\"p\",\"%s\"],"
+                 "[\"x\",\"bar\"]]", H1, H2);
+        event_t a = mk(60, 1, 8000, tx), b = mk(61, 7, 8001, "[[\"x\",\"foo\"],[\"k\",\"1\"]]");
+        check("non-indexed letters store no rows", s.insert_event(&a) == STORAGE_PUT_INSERTED &&
+              s.insert_event(&b) == STORAGE_PUT_INSERTED && tag_rows() == 2, NULL);
+        check("#x fallback", query(&s, "{\"#x\":[\"foo\"]}", false) == 2 &&
+              query(&s, "{\"#x\":[\"bar\"]}", false) == 1 && query(&s, "{\"#x\":[\"baz\"]}", false) == 0, NULL);
+        check("#x fallback multi-value + COUNT", query(&s, "{\"#x\":[\"foo\",\"bar\"]}", false) == 2 &&
+              query(&s, "{\"#x\":[\"foo\",\"bar\"]}", true) == 2, NULL);
+        check("#x fallback + kinds", query(&s, "{\"#x\":[\"foo\"],\"kinds\":[7]}", false) == 1, NULL);
+        check("#k (not indexed here) fallback", query(&s, "{\"#k\":[\"1\"]}", false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#E\":[\"%s\"]}", H1);
+        check("#E hex value via fallback (text compare)", query(&s, fq, false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#x\":[\"bar\"],\"#p\":[\"%s\"]}", H2);
+        check("indexed driver + fallback condition", query(&s, fq, false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#x\":[\"foo\"],\"#p\":[\"%s\"]}", H1);
+        check("indexed driver + fallback condition (miss)", query(&s, fq, false) == 0, NULL);
+
+        /* Cap 3: five p tags, the last two only in the JSON. */
+        char tc[2048]; size_t o = 0;
+        o += (size_t) snprintf(tc + o, sizeof(tc) - o, "[");
+        for (int i = 0; i < 5; i++)
+            o += (size_t) snprintf(tc + o, sizeof(tc) - o, "%s[\"p\",\"%064x\"]", i ? "," : "", 0x100 + i);
+        snprintf(tc + o, sizeof(tc) - o, ",[\"t\",\"late\"]]");
+        event_t c = mk(62, 3, 8002, tc);
+        check("capped event: 3 rows + overflow", s.insert_event(&c) == STORAGE_PUT_INSERTED && tag_rows() == 5 &&
+              count_sql("SELECT COUNT(*) FROM tag_overflow") == 1, NULL);
+        char p0[65], p4[65]; snprintf(p0, sizeof(p0), "%064x", 0x100); snprintf(p4, sizeof(p4), "%064x", 0x104);
+        snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"]}", p0);
+        check("capped: indexed tag found", query(&s, fq, false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"]}", p4);
+        check("capped: tag past the cap found (driver)", query(&s, fq, false) == 1 && query(&s, fq, true) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\",\"%s\"],\"kinds\":[3]}", p0, p4);
+        check("capped: both values, one event", query(&s, fq, false) == 1 && query(&s, fq, true) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#t\":[\"late\"],\"#p\":[\"%s\"]}", p4);
+        check("capped: past-cap tags in driver and EXISTS", query(&s, fq, false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#t\":[\"a\"],\"#p\":[\"%s\"]}", H2);
+        check("overflow present: ordinary indexed query", query(&s, fq, false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"],\"kinds\":[1]}", p4);
+        check("capped: kinds still applied", query(&s, fq, false) == 0, NULL);
+
+        /* Reopen with other settings: the index is rebuilt to match. */
+        s.deinit();
+        check("rebuild: letters p,x cap 2", storage_set_tag_index("px", 2) && s.init(dsn), NULL);
+        /* a: x,p,x -> 2 rows (x foo, p) + overflow; b: x -> 1; c: 5 p -> 2 + overflow */
+        check("rebuild: rows and overflow match the new settings", tag_rows() == 5 &&
+              count_sql("SELECT COUNT(*) FROM tag_overflow") == 2 &&
+              count_sql("SELECT COUNT(*) FROM tag WHERE name = 'x'") == 2, NULL);
+        check("rebuild: queries agree", query(&s, "{\"#x\":[\"bar\"]}", false) == 1 &&
+              query(&s, "{\"#t\":[\"late\"]}", false) == 1, NULL);
+        snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"]}", p4);
+        check("rebuild: past-cap tag found", query(&s, fq, false) == 1, NULL);
+        size_t dd = 0;
+        check("delete drops the overflow row", s.delete_record_by_id_and_pubkey(c.id, c.pubkey, &dd) && dd == 1 &&
+              count_sql("SELECT COUNT(*) FROM tag_overflow") == 1 && query(&s, fq, false) == 0, NULL);
+        s.deinit();
+        check("reopen with same settings: no rebuild needed", s.init(dsn) && tag_rows() == 3, NULL);
+        storage_set_tag_index(SQ_TAG_LETTERS_DEFAULT, NG_TAG_CAP_DEFAULT);
     }
 
     s.deinit();

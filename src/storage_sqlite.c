@@ -1,6 +1,7 @@
 /* storage_sqlite - SQLite backend lifecycle (see storage_internal.h). */
 #include "storage_internal.h"
 #include "storage_vfs.h"
+#include "storage_query.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@ static const char *const ps_sql[PS_COUNT] = {
     [PS_TOMB_ADD] = "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (unhex(?), unhex(?))",
     [PS_REPL_SEL] = "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = unhex(?) AND kind = ?",
     [PS_DEL_ID] = "DELETE FROM event WHERE id = unhex(?)",
+    [PS_TAG_OVERFLOW] = "INSERT OR IGNORE INTO tag_overflow (ev, created_at, kind) VALUES (?, ?, ?)",
     [PS_TAG_INSERT] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES (?, ?, ?, ?, ?)",
     [PS_TAG_INSERT_CHUNK] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES "
                             "(?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
@@ -63,6 +65,14 @@ void storage_set_sync_full(bool full) { db_sync = full ? "FULL" : "NORMAL"; }
 static bool db_search = true;
 void storage_set_search(bool on) { db_search = on; }
 bool ngdb_search_enabled(void) { return db_search; }
+static int db_tag_cap = NG_TAG_CAP_DEFAULT;
+bool storage_set_tag_index(const char *letters, int max_per_event) {
+    if (max_per_event < 1) return false;
+    if (letters && !sq_set_tag_letters(letters)) return false;
+    db_tag_cap = max_per_event;
+    return true;
+}
+int ngdb_tag_cap(void) { return db_tag_cap; }
 
 /* NIP-50 full-text index over content (FTS5, external content =
  * the event table, keyed by seq). Encrypted / AUTH kinds and empty
@@ -101,6 +111,58 @@ static bool exec_or_close(const char *sql) {
     sqlite3_close_v2(ngdb_conn);
     ngdb_conn = NULL;
     return false;
+}
+
+/* The tag table holds rows for the configured letters and cap only. When
+ * the settings differ from the ones it was built with (or it predates
+ * them: every letter, no cap), rebuild it and tag_overflow from the stored
+ * events in one transaction. Same selection as store_tags: string first
+ * values, the first `cap` qualifying tags in order, hex ids as blobs. */
+static bool tag_index_sync(void) {
+    char want[96], have[96] = "";
+    snprintf(want, sizeof(want), "%s|%d", sq_tag_letters(), db_tag_cap);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT v FROM meta WHERE k = 'tag_index'", -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        return false;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *v = sqlite3_column_text(st, 0);
+        if (v) snprintf(have, sizeof(have), "%s", (const char *) v);
+    }
+    sqlite3_finalize(st);
+    if (strcmp(want, have) == 0) return true;
+    /* letters are validated A-Za-z (sq_set_tag_letters): safe to inline. */
+    static const char rows[] =
+        "SELECT e.seq AS seq, e.created_at AS created_at, e.kind AS kind,"
+        "       json_extract(j.value, '$[0]') AS n, json_extract(j.value, '$[1]') AS v,"
+        "       row_number() OVER (PARTITION BY e.seq ORDER BY j.key) AS rn"
+        " FROM event e, json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j"
+        " WHERE json_type(j.value, '$[0]') = 'text' AND json_type(j.value, '$[1]') = 'text'"
+        "   AND length(json_extract(j.value, '$[0]')) = 1"
+        "   AND instr('%s', json_extract(j.value, '$[0]')) > 0";
+    char sel[1024], sql[4096];
+    snprintf(sel, sizeof(sel), rows, sq_tag_letters());
+    int w = snprintf(sql, sizeof(sql),
+        "BEGIN IMMEDIATE;"
+        "DELETE FROM tag; DELETE FROM tag_overflow;"
+        "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind)"
+        " SELECT n, CASE WHEN length(v) = 64 AND v NOT GLOB '*[^0-9a-f]*' THEN unhex(v) ELSE v END,"
+        "        created_at, seq, kind FROM (%s) WHERE rn <= %d;"
+        "INSERT INTO tag_overflow (ev, created_at, kind)"
+        " SELECT seq, created_at, kind FROM (%s) WHERE rn = %d;"
+        "INSERT OR REPLACE INTO meta (k, v) VALUES ('tag_index', '%s');"
+        "COMMIT;", sel, db_tag_cap, sel, db_tag_cap + 1, want);
+    if (w < 0 || (size_t) w >= sizeof(sql)) return false;
+    bool any = false;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT 1 FROM event LIMIT 1", -1, &st, NULL) == SQLITE_OK)
+        any = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    if (any)
+        fprintf(stderr, "storage: rebuilding the tag index (letters %s, max %d per event)...\n",
+                sq_tag_letters(), db_tag_cap);
+    if (!exec_or_close(sql)) return false;
+    return true;
 }
 
 
@@ -237,6 +299,16 @@ static bool storage_init_sqlite3(const char *dsn) {
         "          WHERE json_type(j.value, '$[0]') = 'text' AND json_type(j.value, '$[1]') = 'text')"
         "    WHERE n GLOB '[A-Za-z]');"
         "END;"
+        /* Events with more indexed tags than tag_index_max_per_event:
+         * only the first ones are in tag; queries check these events'
+         * tags JSON for the rest (storage_query.c). */
+        "CREATE TABLE IF NOT EXISTS tag_overflow ("
+        "    ev INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, kind INTEGER NOT NULL);"
+        "CREATE TRIGGER IF NOT EXISTS event_tag_overflow_delete AFTER DELETE ON event BEGIN"
+        "  DELETE FROM tag_overflow WHERE ev = old.seq;"
+        "END;"
+        /* Settings the stored indexes were built with (tag_index). */
+        "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;"
         /* NIP-09 tombstones: (id, deleting author). */
         "CREATE TABLE IF NOT EXISTS deleted_event ("
         "    id BLOB NOT NULL, pubkey BLOB NOT NULL, PRIMARY KEY (id, pubkey)"
@@ -250,6 +322,7 @@ static bool storage_init_sqlite3(const char *dsn) {
     bool had_events = has_table("event"), had_fts = has_table("event_fts");
 
     if (!exec_or_close(schema_sql)) return false;
+    if (!tag_index_sync()) return false;
     if (!exec_or_close(db_search ? search_sql :
                        "DROP TRIGGER IF EXISTS event_fts_insert; DROP TRIGGER IF EXISTS event_fts_delete;"
                        "DROP TABLE IF EXISTS event_fts;")) return false;

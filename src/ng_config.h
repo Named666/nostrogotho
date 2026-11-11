@@ -42,6 +42,8 @@ typedef struct {
     int max_filter_items;       /* max_filter_items: ids/authors/kinds/#tag values per filter */
     int max_req_authors;        /* max_req_authors: authors summed over a REQ's filters */
     int search;                 /* search: 1 = NIP-50 full-text index on (default), 0 = off */
+    char tag_index_letters[64]; /* tag_index_letters: tag names the tag table indexes */
+    int tag_index_max_per_event;/* tag_index_max_per_event: indexed tags per event */
 } ng_limits_t;
 
 /* Relay identity and policy (NIP-11 document, NIP-42 relay tag, NIP-62).

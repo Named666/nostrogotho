@@ -26,7 +26,7 @@ extern NG_THREAD_LOCAL sqlite3 *ngdb_conn;
 
 /* Per-connection prepared statements for the hot write path, reused across
  * events (reset instead of prepare/finalize per insert). */
-enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_TAG_INSERT, PS_TAG_INSERT_CHUNK, PS_VANISH_CHECK, PS_FTS_FEED, PS_COUNT };
+enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_TAG_INSERT, PS_TAG_INSERT_CHUNK, PS_VANISH_CHECK, PS_FTS_FEED, PS_TAG_OVERFLOW, PS_COUNT };
 /* Tag index rows per multi-row INSERT step (PS_TAG_INSERT_CHUNK). */
 #define TAG_CHUNK 4
 
@@ -58,6 +58,9 @@ bool ngdb_purge_expired(time_t now, size_t *deleted);
 void ngdb_write_scratch_free(void);
 /* NIP-50: rows are fed to event_fts in bulk (see storage_write.c). */
 bool ngdb_search_enabled(void);
+/* tag_index_max_per_event: indexed tag rows per event; an event with more
+ * gets a tag_overflow row and its extra tags are found by the JSON fallback. */
+int ngdb_tag_cap(void);
 bool ngdb_fts_flush(void);
 void ngdb_fts_reset(void);
 

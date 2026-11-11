@@ -28,7 +28,9 @@ static void bind_tag_value(sqlite3_stmt *st, int idx, const char *v, size_t len)
 }
 
 /* store_tags - NIP-01 tag index rows for a just-inserted event (seq): one
- * per tag whose name is a single letter and whose first value is a string.
+ * per tag whose name is an indexed letter (tag_index_letters) and whose
+ * first value is a string, up to tag_index_max_per_event; past that the
+ * event is listed in tag_overflow and queries check its tags JSON.
  * Exact duplicates collapse on the primary key. Values containing NUL are
  * skipped (they cannot round-trip through the C string API).
  *
@@ -106,6 +108,8 @@ static bool store_tags(const event_t *ev, sqlite3_int64 seq) {
     if (!ev->tags_json || !ev->tags_json[0]) return true;
     jstr_t key, tag, tags = jl_str(ev->tags_json);
     size_t offset = 0, n = 0, used = 0;
+    const size_t cap = (size_t) ngdb_tag_cap();
+    bool overflow = false;
     /* Unescaped values never exceed the JSON text. */
     size_t json_len = ev->tags_json_len ? ev->tags_json_len : strlen(ev->tags_json);
     if (!tag_rows_reserve(16, json_len + 1)) return false;
@@ -114,8 +118,9 @@ static bool store_tags(const event_t *ev, sqlite3_int64 seq) {
         size_t to = jl_next(tag, 0, &k2, &nm);
         if (!to || nm.len != 3 || nm.buf[0] != '"') continue;    /* "x": one-letter name */
         char name[2] = { nm.buf[1], '\0' };
-        if (!sq_tag_name_indexable(name)) continue;
+        if (!sq_tag_indexed(name)) continue;
         if (jl_next(tag, to, &k2, &v) == 0 || !v.buf || v.buf[0] != '"') continue;
+        if (n >= cap) { overflow = true; break; }
         size_t vl;
         if (!jl_unescape(v, tr_buf + used, &vl) || memchr(tr_buf + used, '\0', vl)) continue;
         if (n == tr_cap && !tag_rows_reserve(n + 1, json_len + 1)) return false;
@@ -130,6 +135,16 @@ static bool store_tags(const event_t *ev, sqlite3_int64 seq) {
         int rc = sqlite3_step(st);
         sqlite3_reset(st);
         if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error (tag index): %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
+    }
+    if (overflow) {
+        sqlite3_stmt *st = ngdb_ps(PS_TAG_OVERFLOW);
+        if (!st) return false;
+        sqlite3_bind_int64(st, 1, seq);
+        sqlite3_bind_int64(st, 2, (sqlite3_int64) ev->created_at);
+        sqlite3_bind_int(st, 3, ev->kind);
+        int rc = sqlite3_step(st);
+        sqlite3_reset(st);
+        if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error (tag overflow): %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
     }
     for (; i < n; i++) {
         sqlite3_stmt *st = ngdb_ps(PS_TAG_INSERT);

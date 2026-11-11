@@ -48,6 +48,19 @@ typedef struct {
 /* NIP-01 indexes tags whose name is a single letter (a-z, A-Z): only those
  * are stored in the tag table and only those may appear as #<name> filters. */
 bool sq_tag_name_indexable(const char *name);
+/* The tag table indexes only the letters in tag_index_letters (default
+ * SQ_TAG_LETTERS_DEFAULT, "*" = all 52); filters on other letters fall back
+ * to scanning the tags JSON. sq_set_tag_letters: startup only, before any
+ * thread runs; false (nothing changed) on a character that is not a letter.
+ * Commas and spaces are ignored. sq_tag_letters: the effective set. */
+#define SQ_TAG_LETTERS_DEFAULT "epaqtdhk"
+bool sq_set_tag_letters(const char *letters);
+const char *sq_tag_letters(void);
+bool sq_tag_indexed(const char *name);
+/* Per reader thread: the tag_overflow table is non-empty (some event has
+ * more tags than tag_index_max_per_event), so indexed tag conditions also
+ * check those events' JSON. Set before sq_build. */
+void sq_set_overflow(bool on);
 /* s[0..len) is exactly 64 lowercase hex digits (stored as a 32-byte blob). */
 bool sq_is_hex64(const char *s, size_t len);
 

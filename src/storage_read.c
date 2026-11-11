@@ -117,6 +117,17 @@ static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, cons
     return true;
 }
 
+/* Whether any stored event overflowed tag_index_max_per_event (see
+ * sq_set_overflow); probed once per query call that has tag conditions. */
+static bool tag_overflow_present(void) {
+    sqlite3_stmt *st = NULL;
+    bool yes = false;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT 1 FROM tag_overflow LIMIT 1", -1, &st, NULL) == SQLITE_OK)
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return yes;
+}
+
 /* send_records - Query and stream events matching filters (NIP-01, NIP-45)
  *
  * Filters are OR'd: each compiles (storage_query) to one statement with its
@@ -140,6 +151,10 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
     size_t total_authors = 0;
     for (size_t f = 0; f < filters_count; f++) total_authors += filters[f].authors_count;
     if (total_authors > (size_t) ng_limits.max_req_authors) return NG_E_TOOBIG;
+
+    bool any_tags = false;
+    for (size_t f = 0; f < filters_count; f++) any_tags |= filters[f].tags_count > 0;
+    sq_set_overflow(any_tags && tag_overflow_present());
 
     int total_count = 0;
     for (size_t f = 0; f < filters_count; f++) {
@@ -198,6 +213,7 @@ ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, u
         filter->kinds_count > max_items || filter->tags_count > max_items) return NG_E_TOOBIG;
     memset(hll, 0, 256);
     *out_count = 0;
+    sq_set_overflow(filter->tags_count > 0 && tag_overflow_present());
     sq_query_t q = {0};
     ng_status_t st = sq_build_mode(&q, filter, SQ_MODE_PUBKEYS, 0);
     if (st != NG_OK) { sq_free(&q); return st; }

@@ -317,6 +317,14 @@ void storage_set_sync_full(bool full);
 /* NIP-50 full-text index (default on). Off: init drops the index and its
  * triggers (re-enabling rebuilds it from the stored events). */
 void storage_set_search(bool on);
+/* NIP-01 tag index scope: only tags named by a letter in `letters`
+ * (NULL = keep; default "epaqtdhk", "*" = all 52) are indexed, at most
+ * max_per_event per event (default NG_TAG_CAP_DEFAULT). Filters on other
+ * letters, and on tags past the cap, are answered from the stored tags
+ * JSON (correct, slower). init() rebuilds the index when these differ from
+ * what it was built with. Startup only. false = invalid (nothing set). */
+#define NG_TAG_CAP_DEFAULT 2000
+bool storage_set_tag_index(const char *letters, int max_per_event);
 
 void storage_context_init_sqlite3(storage_context_t *ctx);
 

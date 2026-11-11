@@ -41,7 +41,7 @@ static bool load_config(const char *path, bool required) {
 }
 
 /* Environment / command-line values override the config file. */
-static void apply_config(const char *service_url, int min_pow, int lower_limit, int upper_limit) {
+static bool apply_config(const char *service_url, int min_pow, int lower_limit, int upper_limit) {
     ng_relay_info_t *info = &cfg.info;
     if (service_url) snprintf(info->relay_url, sizeof(info->relay_url), "%s", service_url);
     if (min_pow >= 0) info->min_pow_difficulty = min_pow;
@@ -49,6 +49,11 @@ static void apply_config(const char *service_url, int min_pow, int lower_limit, 
     if (upper_limit >= 0) info->created_at_upper_limit = upper_limit;
     storage_set_sync_full(cfg.db_sync == NG_DB_SYNC_FULL);
     storage_set_search(cfg.limits.search != 0);
+    if (!storage_set_tag_index(cfg.limits.tag_index_letters, cfg.limits.tag_index_max_per_event)) {
+        fprintf(stderr, "invalid tag_index_letters '%s': letters a-z / A-Z (commas and spaces ignored) or *\n",
+                cfg.limits.tag_index_letters);
+        return false;
+    }
     ng_limits_apply(&cfg.limits);
     ng_relay_info_apply(info);
     server_set_config(&cfg);
@@ -56,6 +61,7 @@ static void apply_config(const char *service_url, int min_pow, int lower_limit, 
         fprintf(stderr, "warning: relay_url is not set (nostrogotho.conf or SERVICE_URL): NIP-42 AUTH accepts any "
                         "ws(s):// relay tag (the per-connection challenge still binds it to this relay) and NIP-62 "
                         "honors only ALL_RELAYS requests\n");
+    return true;
 }
 
 /* The relay's signing key (relay-generated NIP-29 / NIP-43 events). The
@@ -190,7 +196,7 @@ int main(int argc, const char **argv) {
     }
 
     if (!load_config(config_path, config_required)) return 1;
-    apply_config(service_url && *service_url ? service_url : NULL, min_pow, lower_limit, upper_limit);
+    if (!apply_config(service_url && *service_url ? service_url : NULL, min_pow, lower_limit, upper_limit)) return 1;
     if (!apply_policy()) return 1;
 
     if (!init_storage(db_path)) {
