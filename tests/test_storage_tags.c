@@ -256,12 +256,12 @@ int main(void) {
         char tc[2048]; size_t o = 0;
         o += (size_t) snprintf(tc + o, sizeof(tc) - o, "[");
         for (int i = 0; i < 5; i++)
-            o += (size_t) snprintf(tc + o, sizeof(tc) - o, "%s[\"p\",\"%064x\"]", i ? "," : "", 0x100 + i);
+            o += (size_t) snprintf(tc + o, sizeof(tc) - o, "%s[\"p\",\"%08x%056d\"]", i ? "," : "", 0x100 + i, 0);
         snprintf(tc + o, sizeof(tc) - o, ",[\"t\",\"late\"]]");
         event_t c = mk(62, 3, 8002, tc);
         check("capped event: 3 rows + overflow", s.insert_event(&c) == STORAGE_PUT_INSERTED && tag_rows() == 5 &&
               count_sql("SELECT COUNT(*) FROM tag_overflow") == 1, NULL);
-        char p0[65], p4[65]; snprintf(p0, sizeof(p0), "%064x", 0x100); snprintf(p4, sizeof(p4), "%064x", 0x104);
+        char p0[65], p4[65]; snprintf(p0, sizeof(p0), "%08x%056d", 0x100, 0); snprintf(p4, sizeof(p4), "%08x%056d", 0x104, 0);
         snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"]}", p0);
         check("capped: indexed tag found", query(&s, fq, false) == 1, NULL);
         snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"]}", p4);
@@ -281,7 +281,7 @@ int main(void) {
         /* a: x,p,x -> 2 rows (x foo, p) + overflow; b: x -> 1; c: 5 p -> 2 + overflow */
         check("rebuild: rows and overflow match the new settings", tag_rows() == 5 &&
               count_sql("SELECT COUNT(*) FROM tag_overflow") == 2 &&
-              count_sql("SELECT COUNT(*) FROM tag WHERE name = 'x'") == 2, NULL);
+              count_sql("SELECT COUNT(*) FROM tag WHERE name = unicode('x')") == 2, NULL);
         check("rebuild: queries agree", query(&s, "{\"#x\":[\"bar\"]}", false) == 1 &&
               query(&s, "{\"#t\":[\"late\"]}", false) == 1, NULL);
         snprintf(fq, sizeof(fq), "{\"#p\":[\"%s\"]}", p4);

@@ -63,6 +63,9 @@ bool sq_tag_indexed(const char *name);
 void sq_set_overflow(bool on);
 /* s[0..len) is exactly 64 lowercase hex digits (stored as a 32-byte blob). */
 bool sq_is_hex64(const char *s, size_t len);
+/* 8-byte index key of a tag value (64-hex prefix or seeded FNV-1a 64,
+ * big-endian); collisions are possible, matches are rechecked. */
+void sq_tag_key8(const char *v, size_t len, unsigned char out[8]);
 
 /* Compile `filter` into q (q must be zeroed or sq_free'd). do_count selects
  * a COUNT (no ORDER BY / LIMIT); otherwise SQ_EVENT_COLUMNS,

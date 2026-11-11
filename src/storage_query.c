@@ -144,19 +144,45 @@ bool sq_is_hex64(const char *s, size_t len) {
     return true;
 }
 
-/* One tag value placeholder: 64-char lowercase hex values are stored as
- * 32-byte blobs in the tag table (storage_write.c), everything else as text. */
-static void sq_tag_value(sq_query_t *q, char *value) {
-    sq_sql(q, sq_is_hex64(value, strlen(value)) ? "unhex(?)" : "?");
-    sq_text(q, value);
+/* The 8-byte key both tag indexes (the SQLite tag table and memidx) use
+ * for a tag value: a 64-char lowercase hex value (ids, pubkeys) maps to
+ * its first 8 bytes, anything else to a seeded FNV-1a 64 of its text,
+ * big-endian. Lossy on purpose (strfry / eventstore do the same): every
+ * indexed match is rechecked against the event's tags JSON. */
+void sq_tag_key8(const char *v, size_t len, unsigned char out[8]) {
+    if (sq_is_hex64(v, len)) {
+        for (size_t i = 0; i < 8; i++) {
+            unsigned hi = (unsigned) (v[2 * i] <= '9' ? v[2 * i] - '0' : v[2 * i] - 'a' + 10);
+            unsigned lo = (unsigned) (v[2 * i + 1] <= '9' ? v[2 * i + 1] - '0' : v[2 * i + 1] - 'a' + 10);
+            out[i] = (unsigned char) ((hi << 4) | lo);
+        }
+        return;
+    }
+    unsigned long long h = 0xcbf29ce484222325ull ^ 0x6e67746167ull;
+    for (size_t i = 0; i < len; i++) { h ^= (unsigned char) v[i]; h *= 0x100000001b3ull; }
+    for (int i = 0; i < 8; i++) out[i] = (unsigned char) (h >> (56 - 8 * i));
 }
 
-/* "<alias>.name = ? AND <alias>.value IN (...)" for one tag condition. */
+/* One tag-table key placeholder: unhex('<16 hex digits of sq_tag_key8>'). */
+static void sq_tag_value(sq_query_t *q, const char *value) {
+    static const char hexd[] = "0123456789abcdef";
+    unsigned char k[8];
+    sq_tag_key8(value, strlen(value), k);
+    char *hx = (char *) malloc(17);
+    if (hx) {
+        for (int i = 0; i < 8; i++) { hx[2 * i] = hexd[k[i] >> 4]; hx[2 * i + 1] = hexd[k[i] & 15]; }
+        hx[16] = '\0';
+    }
+    sq_sql(q, "unhex(?)");
+    sq_owned(q, hx);
+}
+
+/* "<alias>.name = <letter code> AND <alias>.value IN (<keys>)" for one tag
+ * condition (letters are validated A-Za-z, so the code is inlined). */
 static void sq_tag_match(sq_query_t *q, const char *alias, const tag_t *tag) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%s.name = ? AND %s.value ", alias, alias);
+    snprintf(buf, sizeof(buf), "%s.name = %d AND %s.value ", alias, (int) (unsigned char) tag->elements[0][0], alias);
     sq_sql(q, buf);
-    sq_text(q, tag->elements[0]);
     if (tag->count == 2) { sq_sql(q, "= "); sq_tag_value(q, tag->elements[1]); return; }
     sq_sql(q, "IN (");
     for (size_t v = 1; v < tag->count; v++) {
@@ -234,6 +260,7 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
 #define NEXT() (sq_sql(q, sep), sep = " AND ")
 
     if (tagged && !sq_overflow) { NEXT(); sq_tag_match(q, "t", &f->tags[drive]); }
+    if (tagged) { NEXT(); sq_tag_json(q, "e", &f->tags[drive]); }   /* key collisions: exact recheck */
     if (f->ids_count > 0) {
         NEXT();
         if (f->ids_count == 1) sq_sql(q, "e.id = unhex(?)");
@@ -271,7 +298,8 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
         if (!sq_tag_indexed(f->tags[t].elements[0])) { sq_tag_json(q, "e", &f->tags[t]); continue; }
         sq_sql(q, sq_overflow ? "(EXISTS (SELECT 1 FROM tag x WHERE " : "EXISTS (SELECT 1 FROM tag x WHERE ");
         sq_tag_match(q, "x", &f->tags[t]);
-        sq_sql(q, " AND x.created_at = e.created_at AND x.ev = e.seq)");
+        sq_sql(q, " AND x.created_at = e.created_at AND x.ev = e.seq) AND ");
+        sq_tag_json(q, "e", &f->tags[t]);                              /* exact recheck */
         if (sq_overflow) {
             sq_sql(q, " OR (e.seq IN (SELECT ev FROM tag_overflow) AND ");
             sq_tag_json(q, "e", &f->tags[t]);

@@ -113,14 +113,54 @@ static bool exec_or_close(const char *sql) {
     return false;
 }
 
-/* The tag table holds rows for the configured letters and cap only. When
- * the settings differ from the ones it was built with (or it predates
- * them: every letter, no cap), rebuild it and tag_overflow from the stored
- * events in one transaction. Same selection as store_tags: string first
- * values, the first `cap` qualifying tags in order, hex ids as blobs. */
+/* tag_index = sqlite: the NIP-01 tag index as a table. One row per
+ * (single-letter tag name, first value) of each stored event, written by
+ * storage_write.c in the writer's batch transaction: name is the letter's
+ * code point, value the 8-byte sq_tag_key8 key (collisions are rechecked
+ * against the tags JSON by every reader). The key serves #<name> filters
+ * newest-first; kind rides along so kinds filters are checked before the
+ * join to event.
+ *
+ * Every delete path (replaceable overwrite, NIP-09, NIP-40, NIP-62) drops
+ * the event's tag rows by recomputing their keys from the stored tags JSON
+ * (ng_tagkey, registered on every read-write connection): point deletes on
+ * the primary key, no second index on ev.
+ *
+ * tag_overflow lists events with more indexed tags than
+ * tag_index_max_per_event: only the first ones are in tag; queries check
+ * these events' tags JSON for the rest (storage_query.c). */
+static const char tag_table_sql[] =
+    "CREATE TABLE IF NOT EXISTS tag ("
+    "    name INTEGER NOT NULL, value BLOB NOT NULL, created_at INTEGER NOT NULL,"
+    "    ev INTEGER NOT NULL, kind INTEGER NOT NULL,"
+    "    PRIMARY KEY (name, value, created_at, ev)"
+    ") WITHOUT ROWID;"
+    "CREATE TRIGGER IF NOT EXISTS event_tag_delete AFTER DELETE ON event BEGIN"
+    "  DELETE FROM tag WHERE (name, value, created_at, ev) IN ("
+    "    SELECT unicode(n), ng_tagkey(v), old.created_at, old.seq"
+    "    FROM (SELECT json_extract(j.value, '$[0]') AS n, json_extract(j.value, '$[1]') AS v"
+    "          FROM json_each(CASE WHEN json_valid(old.tags) THEN old.tags ELSE '[]' END) AS j"
+    "          WHERE json_type(j.value, '$[0]') = 'text' AND json_type(j.value, '$[1]') = 'text')"
+    "    WHERE n GLOB '[A-Za-z]');"
+    "END;"
+    "CREATE TABLE IF NOT EXISTS tag_overflow ("
+    "    ev INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, kind INTEGER NOT NULL);"
+    "CREATE TRIGGER IF NOT EXISTS event_tag_overflow_delete AFTER DELETE ON event BEGIN"
+    "  DELETE FROM tag_overflow WHERE ev = old.seq;"
+    "END;";
+static const char tag_table_drop_sql[] =
+    "DROP TRIGGER IF EXISTS event_tag_delete; DROP TRIGGER IF EXISTS event_tag_overflow_delete;"
+    "DROP TABLE IF EXISTS tag; DROP TABLE IF EXISTS tag_overflow;";
+
+/* The tag table holds rows for the configured letters and cap only, in
+ * the k8 layout. When the settings differ from the ones it was built with
+ * (or it predates them, or the k8 key), drop it and rebuild it and
+ * tag_overflow from the stored events in one transaction. Same selection
+ * as store_tags: string first values, the first `cap` qualifying tags in
+ * order. */
 static bool tag_index_sync(void) {
     char want[96], have[96] = "";
-    snprintf(want, sizeof(want), "%s|%d", sq_tag_letters(), db_tag_cap);
+    snprintf(want, sizeof(want), "k8|%s|%d", sq_tag_letters(), db_tag_cap);
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(ngdb_conn, "SELECT v FROM meta WHERE k = 'tag_index'", -1, &st, NULL) != SQLITE_OK) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
@@ -131,7 +171,7 @@ static bool tag_index_sync(void) {
         if (v) snprintf(have, sizeof(have), "%s", (const char *) v);
     }
     sqlite3_finalize(st);
-    if (strcmp(want, have) == 0) return true;
+    if (strcmp(want, have) == 0) return exec_or_close(tag_table_sql);
     /* letters are validated A-Za-z (sq_set_tag_letters): safe to inline. */
     static const char rows[] =
         "SELECT e.seq AS seq, e.created_at AS created_at, e.kind AS kind,"
@@ -141,18 +181,16 @@ static bool tag_index_sync(void) {
         " WHERE json_type(j.value, '$[0]') = 'text' AND json_type(j.value, '$[1]') = 'text'"
         "   AND length(json_extract(j.value, '$[0]')) = 1"
         "   AND instr('%s', json_extract(j.value, '$[0]')) > 0";
-    char sel[1024], sql[4096];
+    char sel[1024], sql[6144];
     snprintf(sel, sizeof(sel), rows, sq_tag_letters());
     int w = snprintf(sql, sizeof(sql),
-        "BEGIN IMMEDIATE;"
-        "DELETE FROM tag; DELETE FROM tag_overflow;"
+        "BEGIN IMMEDIATE;%s%s"
         "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind)"
-        " SELECT n, CASE WHEN length(v) = 64 AND v NOT GLOB '*[^0-9a-f]*' THEN unhex(v) ELSE v END,"
-        "        created_at, seq, kind FROM (%s) WHERE rn <= %d;"
+        " SELECT unicode(n), ng_tagkey(v), created_at, seq, kind FROM (%s) WHERE rn <= %d;"
         "INSERT INTO tag_overflow (ev, created_at, kind)"
         " SELECT seq, created_at, kind FROM (%s) WHERE rn = %d;"
         "INSERT OR REPLACE INTO meta (k, v) VALUES ('tag_index', '%s');"
-        "COMMIT;", sel, db_tag_cap, sel, db_tag_cap + 1, want);
+        "COMMIT;", tag_table_drop_sql, tag_table_sql, sel, db_tag_cap, sel, db_tag_cap + 1, want);
     if (w < 0 || (size_t) w >= sizeof(sql)) return false;
     bool any = false;
     if (sqlite3_prepare_v2(ngdb_conn, "SELECT 1 FROM event LIMIT 1", -1, &st, NULL) == SQLITE_OK)
@@ -161,8 +199,7 @@ static bool tag_index_sync(void) {
     if (any)
         fprintf(stderr, "storage: rebuilding the tag index (letters %s, max %d per event)...\n",
                 sq_tag_letters(), db_tag_cap);
-    if (!exec_or_close(sql)) return false;
-    return true;
+    return exec_or_close(sql);
 }
 
 
@@ -208,6 +245,21 @@ static bool tag_index_sync(void) {
  * 
  * Thread safety: NOT thread-safe; must be called during init
  */
+
+/* ng_tagkey(text) -> the 8-byte sq_tag_key8 blob, for the tag table's
+ * delete trigger and rebuild. Registered on every connection we open. */
+static void sql_tagkey(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void) argc;
+    const unsigned char *v = sqlite3_value_text(argv[0]);
+    if (!v) { sqlite3_result_null(ctx); return; }
+    unsigned char k[8];
+    sq_tag_key8((const char *) v, (size_t) sqlite3_value_bytes(argv[0]), k);
+    sqlite3_result_blob(ctx, k, 8, SQLITE_TRANSIENT);
+}
+static void register_fns(sqlite3 *db) {
+    sqlite3_create_function(db, "ng_tagkey", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_tagkey, NULL, NULL);
+}
+
 static bool storage_init_sqlite3(const char *dsn) {
     snprintf(db_dsn, sizeof(db_dsn), "%s", dsn ? dsn : "");
     if (!ngdb_vfs_register()) fprintf(stderr, "warning: WAL write coalescing unavailable\n");
@@ -220,6 +272,7 @@ static bool storage_init_sqlite3(const char *dsn) {
                          SQLITE_OPEN_CREATE,
                          NULL);
     
+    if (ret == SQLITE_OK) register_fns(ngdb_conn);
     if (ret != SQLITE_OK) {
         fprintf(stderr, "Unable to connect to database: %s\n", sqlite3_errmsg(ngdb_conn));
         return false;
@@ -275,38 +328,6 @@ static bool storage_init_sqlite3(const char *dsn) {
         "CREATE INDEX IF NOT EXISTS pubkindidx ON event(pubkey,kind);"
         "CREATE INDEX IF NOT EXISTS timeidx ON event(created_at DESC);"
         "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);"
-        /* NIP-01 tag index: one row per (single-letter tag name, first
-         * value) of each stored event, written by storage_write.c in the
-         * writer's batch transaction. 64-char lowercase hex values (e, p,
-         * q, E, P ... ids and pubkeys) are stored as 32-byte blobs. The key
-         * serves #<name> filters newest-first; kind rides along so kinds
-         * filters are checked before the join to event. */
-        "CREATE TABLE IF NOT EXISTS tag ("
-        "    name TEXT NOT NULL, value NOT NULL, created_at INTEGER NOT NULL,"
-        "    ev INTEGER NOT NULL, kind INTEGER NOT NULL,"
-        "    PRIMARY KEY (name, value, created_at, ev)"
-        ") WITHOUT ROWID;"
-        /* Every delete path (replaceable overwrite, NIP-09, NIP-40, NIP-62)
-         * drops the event's tag rows by recomputing their keys from the
-         * stored tags JSON: point deletes on the primary key, no second
-         * index on ev. Same selection and blob mapping as the insert side. */
-        "CREATE TRIGGER IF NOT EXISTS event_tag_delete AFTER DELETE ON event BEGIN"
-        "  DELETE FROM tag WHERE (name, value, created_at, ev) IN ("
-        "    SELECT n, CASE WHEN length(v) = 64 AND v NOT GLOB '*[^0-9a-f]*' THEN unhex(v) ELSE v END,"
-        "           old.created_at, old.seq"
-        "    FROM (SELECT json_extract(j.value, '$[0]') AS n, json_extract(j.value, '$[1]') AS v"
-        "          FROM json_each(CASE WHEN json_valid(old.tags) THEN old.tags ELSE '[]' END) AS j"
-        "          WHERE json_type(j.value, '$[0]') = 'text' AND json_type(j.value, '$[1]') = 'text')"
-        "    WHERE n GLOB '[A-Za-z]');"
-        "END;"
-        /* Events with more indexed tags than tag_index_max_per_event:
-         * only the first ones are in tag; queries check these events'
-         * tags JSON for the rest (storage_query.c). */
-        "CREATE TABLE IF NOT EXISTS tag_overflow ("
-        "    ev INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, kind INTEGER NOT NULL);"
-        "CREATE TRIGGER IF NOT EXISTS event_tag_overflow_delete AFTER DELETE ON event BEGIN"
-        "  DELETE FROM tag_overflow WHERE ev = old.seq;"
-        "END;"
         /* Settings the stored indexes were built with (tag_index). */
         "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL) WITHOUT ROWID;"
         /* NIP-09 tombstones: (id, deleting author). */
@@ -385,6 +406,7 @@ static bool storage_thread_open_sqlite3(bool readonly) {
         sqlite3_close_v2(ngdb_conn); ngdb_conn = NULL;
         return false;
     }
+    register_fns(ngdb_conn);
     sqlite3_exec(ngdb_conn,
                  "PRAGMA busy_timeout = 5000;"
                  "PRAGMA cache_size = -65536;"

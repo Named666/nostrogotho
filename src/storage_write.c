@@ -11,22 +11,6 @@
 #include "nips/nip40.h"
 #include "nips/nip_event.h"
 
-/* Bind one tag value: 64-char lowercase hex as a 32-byte blob (the form the
- * query side and the delete trigger use), anything else as text. */
-static void bind_tag_value(sqlite3_stmt *st, int idx, const char *v, size_t len) {
-    if (sq_is_hex64(v, len)) {
-        unsigned char raw[32];
-        for (size_t i = 0; i < 32; i++) {
-            unsigned hi = (unsigned) (v[2 * i] <= '9' ? v[2 * i] - '0' : v[2 * i] - 'a' + 10);
-            unsigned lo = (unsigned) (v[2 * i + 1] <= '9' ? v[2 * i + 1] - '0' : v[2 * i + 1] - 'a' + 10);
-            raw[i] = (unsigned char) ((hi << 4) | lo);
-        }
-        sqlite3_bind_blob(st, idx, raw, 32, SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_text(st, idx, v, (int) len, SQLITE_TRANSIENT);
-    }
-}
-
 /* store_tags - NIP-01 tag index rows for a just-inserted event (seq): one
  * per tag whose name is an indexed letter (tag_index_letters) and whose
  * first value is a string, up to tag_index_max_per_event; past that the
@@ -97,8 +81,10 @@ void ngdb_write_scratch_free(void) {
 
 static void bind_tag_row(sqlite3_stmt *st, int base, const tag_row_t *r, const event_t *ev,
                          sqlite3_int64 seq) {
-    sqlite3_bind_text(st, base + 1, &r->name, 1, SQLITE_STATIC);
-    bind_tag_value(st, base + 2, tr_buf + r->off, r->len);
+    unsigned char k8[8];
+    sq_tag_key8(tr_buf + r->off, r->len, k8);
+    sqlite3_bind_int(st, base + 1, (int) (unsigned char) r->name);
+    sqlite3_bind_blob(st, base + 2, k8, 8, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, base + 3, (sqlite3_int64) ev->created_at);
     sqlite3_bind_int64(st, base + 4, seq);
     sqlite3_bind_int(st, base + 5, ev->kind);
@@ -484,7 +470,7 @@ bool ngdb_delete_all_events_by_pubkey(const char *pubkey, time_t created_at,
 /* ngdb_vanish - NIP-62: durable vanish record plus the deletes (see
  * storage.h). Runs inside the writer's batch transaction. */
 #define VANISH_AUTHOR "pubkey = unhex(?1) AND created_at <= ?2 AND kind != 62"
-#define VANISH_WRAPS "seq IN (SELECT ev FROM tag WHERE name = 'p' AND value = unhex(?1) AND kind = 1059)"
+#define VANISH_WRAPS "seq IN (SELECT t.ev FROM tag t JOIN event x ON x.seq = t.ev WHERE t.name = 112 AND t.value = ng_tagkey(?1) AND t.kind = 1059 AND EXISTS (SELECT 1 FROM json_each(x.tags) j WHERE json_extract(j.value, '$[0]') = 'p' AND json_extract(j.value, '$[1]') = ?1))"
 
 bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *hex_id),
                  size_t *deleted) {
@@ -541,30 +527,16 @@ bool ngdb_delete_by_id(const char *id, size_t *deleted) {
     return rc == SQLITE_DONE;
 }
 
-/* The tag table stores 64-char lowercase hex values as 32-byte blobs. */
-static void bind_tag_value_text(sqlite3_stmt *st, int i, const char *v) {
-    size_t n = strlen(v);
-    bool hex = n == 64;
-    for (size_t k = 0; hex && k < n; k++) hex = (v[k] >= '0' && v[k] <= '9') || (v[k] >= 'a' && v[k] <= 'f');
-    if (!hex) { sqlite3_bind_text(st, i, v, (int) n, SQLITE_TRANSIENT); return; }
-    unsigned char b[32];
-    for (size_t k = 0; k < 32; k++) {
-        int hi = v[2 * k] <= '9' ? v[2 * k] - '0' : v[2 * k] - 'a' + 10;
-        int lo = v[2 * k + 1] <= '9' ? v[2 * k + 1] - '0' : v[2 * k + 1] - 'a' + 10;
-        b[k] = (unsigned char) (hi * 16 + lo);
-    }
-    sqlite3_bind_blob(st, i, b, 32, SQLITE_TRANSIENT);
-}
-
+/* Tag rows hold sq_tag_key8 keys: the exact value is rechecked in JSON. */
 bool ngdb_delete_by_tag(char name, const char *value, void (*forget)(const char *hex_id), size_t *deleted) {
     sqlite3_stmt *stmt;
     char n[2] = { name, '\0' };
     if (!ngdb_conn || !value) return false;
     if (forget) {
-        if (!prepare("SELECT lower(hex(e.id)) FROM tag t JOIN event e ON e.seq = t.ev WHERE t.name = ? AND t.value = ?", &stmt))
+        if (!prepare("SELECT lower(hex(x.id)) FROM tag t JOIN event x ON x.seq = t.ev WHERE t.name = unicode(?1) AND t.value = ng_tagkey(?2) AND EXISTS (SELECT 1 FROM json_each(x.tags) j WHERE json_extract(j.value, '$[0]') = ?1 AND json_extract(j.value, '$[1]') = ?2)", &stmt))
             return false;
         sqlite3_bind_text(stmt, 1, n, 1, SQLITE_TRANSIENT);
-        bind_tag_value_text(stmt, 2, value);
+        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
         int rc;
         while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             const char *id = (const char *) sqlite3_column_text(stmt, 0);
@@ -573,10 +545,10 @@ bool ngdb_delete_by_tag(char name, const char *value, void (*forget)(const char 
         sqlite3_finalize(stmt);
         if (rc != SQLITE_DONE) return false;
     }
-    if (!prepare("DELETE FROM event WHERE seq IN (SELECT ev FROM tag WHERE name = ? AND value = ?)", &stmt))
+    if (!prepare("DELETE FROM event WHERE seq IN (SELECT t.ev FROM tag t JOIN event x ON x.seq = t.ev WHERE t.name = unicode(?1) AND t.value = ng_tagkey(?2) AND EXISTS (SELECT 1 FROM json_each(x.tags) j WHERE json_extract(j.value, '$[0]') = ?1 AND json_extract(j.value, '$[1]') = ?2))", &stmt))
         return false;
     sqlite3_bind_text(stmt, 1, n, 1, SQLITE_TRANSIENT);
-    bind_tag_value_text(stmt, 2, value);
+    sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
     return run_delete(stmt, deleted);
 }
 
