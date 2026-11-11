@@ -210,10 +210,10 @@ int main(void) {
         event_t r = mkc(47, 1, 7007, "[]", "zebra rolled");
         check("fts: rolled back batch", s.begin_batch() && s.insert_event(&r) == STORAGE_PUT_INSERTED && s.rollback_batch() &&
               fts_ok() && query(&s, "{\"search\":\"rolled\"}", false) == 0, NULL);
-        event_t v1 = mkc(48, 1, 7008, "[]", "zebra vanishing");
-        memset(v1.pubkey, 'e', 64);
+        event_t vz = mkc(48, 1, 7008, "[]", "zebra vanishing");
+        memset(vz.pubkey, 'e', 64);
         char vpk[65]; memset(vpk, 'e', 64); vpk[64] = 0;
-        check("fts: vanish in the inserting batch", s.begin_batch() && s.insert_event(&v1) == STORAGE_PUT_INSERTED &&
+        check("fts: vanish in the inserting batch", s.begin_batch() && s.insert_event(&vz) == STORAGE_PUT_INSERTED &&
               s.vanish(vpk, 9000, NULL, &d) && d == 1 && s.commit_batch() && fts_ok() &&
               query(&s, "{\"search\":\"vanishing\"}", false) == 0, NULL);
         event_t w1 = mkc(49, 1, 7009, "[]", "zebra omega"), w2 = mkc(50, 30023, 7010, "[[\"d\",\"post\"]]", "zebra article");
