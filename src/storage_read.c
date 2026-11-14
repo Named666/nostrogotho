@@ -27,61 +27,51 @@
  * 
  * Database columns retrieved: id, pubkey, created_at, kind, tags, content, sig
  */
+static void hex_column(sqlite3_stmt *stmt, int col, char *out, size_t cap) {
+    static const char digits[] = "0123456789abcdef";
+    const unsigned char *b = (const unsigned char *) sqlite3_column_blob(stmt, col);
+    size_t n = b ? (size_t) sqlite3_column_bytes(stmt, col) : 0;
+    if (n > (cap - 1) / 2) n = (cap - 1) / 2;
+    for (size_t i = 0; i < n; i++) { out[2 * i] = digits[b[i] >> 4]; out[2 * i + 1] = digits[b[i] & 15]; }
+    out[2 * n] = '\0';
+}
+
+void ngdb_row_event(sqlite3_stmt *stmt, event_t *ev) {
+    hex_column(stmt, 0, ev->id, sizeof(ev->id));
+    hex_column(stmt, 1, ev->pubkey, sizeof(ev->pubkey));
+    ev->created_at = (time_t) sqlite3_column_int64(stmt, 2);
+    ev->kind = sqlite3_column_int(stmt, 3);
+    ev->tags_json = (char *) sqlite3_column_text(stmt, 4);
+    ev->tags_json_len = ev->tags_json ? (size_t) sqlite3_column_bytes(stmt, 4) : 0;
+    ev->content = (char *) sqlite3_column_text(stmt, 5);
+    ev->content_len = ev->content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
+    hex_column(stmt, 6, ev->sig, sizeof(ev->sig));
+}
+
 event_t *ngdb_get_event_by_id(const char *id) {
     if (!ngdb_conn || !id) return NULL;
-    
-    const char *sql = "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, content, lower(hex(sig)) FROM event WHERE id = unhex(?)";
     sqlite3_stmt *stmt = NULL;
-    
-    if (sqlite3_prepare_v2(ngdb_conn, sql, -1, &stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT " NGDB_EVENT_COLUMNS " FROM event WHERE id = unhex(?)", -1, &stmt, NULL) != SQLITE_OK) {
         fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
         return NULL;
     }
-    
     sqlite3_bind_text(stmt, 1, id, -1, SQLITE_TRANSIENT);
-    
     event_t *ev = NULL;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        ev = event_alloc();
-        if (ev) {
-            strncpy(ev->id, (const char *)sqlite3_column_text(stmt, 0), MAX_ID_SIZE);
-            ev->id[MAX_ID_SIZE] = '\0';
-            strncpy(ev->pubkey, (const char *)sqlite3_column_text(stmt, 1), MAX_PUBKEY_SIZE);
-            ev->pubkey[MAX_PUBKEY_SIZE] = '\0';
-            ev->created_at = (time_t) sqlite3_column_int64(stmt, 2);
-            ev->kind = sqlite3_column_int(stmt, 3);
-            
-            const char *tags_json = (const char *)sqlite3_column_text(stmt, 4);
-            if (tags_json) {
-                ev->tags_json_len = strlen(tags_json);
-                ev->tags_json = (char *) ng_malloc_add(ev->tags_json_len, 1);
-                if (ev->tags_json) {
-                    strcpy(ev->tags_json, tags_json);
-                } else {
-                    sqlite3_finalize(stmt);
-                    free(ev);
-                    return NULL;
-                }
-            }
-            
-            const char *content = (const char *)sqlite3_column_text(stmt, 5);
-            if (content) {
-                ev->content_len = strlen(content);
-                ev->content = (char *) ng_malloc_add(ev->content_len, 1);
-                if (!ev->content) {
-                    free(ev->tags_json);
-                    sqlite3_finalize(stmt);
-                    free(ev);
-                    return NULL;
-                }
-                strcpy(ev->content, content);
-            }
-            
-            strncpy(ev->sig, (const char *)sqlite3_column_text(stmt, 6), MAX_SIG_SIZE);
-            ev->sig[MAX_SIG_SIZE] = '\0';
+    if (sqlite3_step(stmt) == SQLITE_ROW && (ev = event_alloc()) != NULL) {
+        event_t row; memset(&row, 0, sizeof row);
+        ngdb_row_event(stmt, &row);
+        *ev = row;                                    /* then own copies of the borrowed text */
+        ev->tags_json = (char *) ng_malloc_add(row.tags_json_len, 1);
+        ev->content = (char *) ng_malloc_add(row.content_len, 1);
+        if (!ev->tags_json || !ev->content) {
+            free(ev->tags_json); free(ev->content); free(ev); ev = NULL;
+        } else {
+            if (row.tags_json_len) memcpy(ev->tags_json, row.tags_json, row.tags_json_len);
+            ev->tags_json[row.tags_json_len] = '\0';
+            if (row.content_len) memcpy(ev->content, row.content, row.content_len);
+            ev->content[row.content_len] = '\0';
         }
     }
-    
     sqlite3_finalize(stmt);
     return ev;
 }
@@ -96,16 +86,9 @@ event_t *ngdb_get_event_by_id(const char *id) {
  * proves there are more (NIP-67) and is not sent. */
 static void render_row(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub) {
     if (!sender) return;                                  /* COUNT / HLL passes render nothing */
-    event_t event = {0};
-    snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
-    snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
-    event.created_at = (time_t) sqlite3_column_int64(stmt, 2);
-    event.kind = sqlite3_column_int(stmt, 3);
-    event.tags_json = (char *) sqlite3_column_text(stmt, 4);
-    event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
-    event.content = (char *) sqlite3_column_text(stmt, 5);
-    event.content_len = event.content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
-    snprintf(event.sig, sizeof(event.sig), "%s", (const char *) sqlite3_column_text(stmt, 6));
+    event_t event;
+    memset(&event, 0, sizeof event);
+    ngdb_row_event(stmt, &event);
     json_builder_t *builder = json_builder_scratch(JSON_SCRATCH_QUERY);
     json_builder_append_string(builder, "EVENT");
     json_builder_append_string(builder, sub);
@@ -249,7 +232,7 @@ static ng_status_t mem_filter(const filter_t *f, size_t drive, sq_mode_t mode, i
                         g = ng; gcap = ncap;
                     }
                     g[gn].seq = c[i].seq;
-                    snprintf(g[gn].id, sizeof(g[gn].id), "%s", (const char *) sqlite3_column_text(stmt, 0));
+                    hex_column(stmt, 0, g[gn].id, sizeof(g[gn].id));
                     gn++;
                     gca = c[i].ca;
                 } else {

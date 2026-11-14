@@ -42,8 +42,7 @@ typedef struct {
 } sq_query_t;
 
 /* The 7 event columns every stored-event query returns, in this order. */
-#define SQ_EVENT_COLUMNS "lower(hex(e.id)), lower(hex(e.pubkey)), e.created_at, e.kind, e.tags, " \
-                         "e.content, lower(hex(e.sig))"
+#define SQ_EVENT_COLUMNS "e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig"   /* ngdb_row_event order */
 
 /* NIP-01 indexes tags whose name is a single letter (a-z, A-Z): only those
  * are stored in the tag table and only those may appear as #<name> filters. */

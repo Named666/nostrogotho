@@ -655,8 +655,7 @@ bool ngdb_delete_by_tag(char name, const char *value, void (*forget)(const char 
 bool ngdb_scan_kinds(const int *kinds, size_t n, void (*cb)(const event_t *ev, void *arg), void *arg) {
     if (!ngdb_conn || !kinds || !n || n > 64 || !cb) return false;
     char sql[1024];
-    size_t len = (size_t) snprintf(sql, sizeof sql, "SELECT lower(hex(id)), lower(hex(pubkey)), created_at, kind, tags, "
-                                   "content, lower(hex(sig)) FROM event WHERE kind IN (");
+    size_t len = (size_t) snprintf(sql, sizeof sql, "SELECT " NGDB_EVENT_COLUMNS " FROM event WHERE kind IN (");
     for (size_t i = 0; i < n && len < sizeof sql - 32; i++)
         len += (size_t) snprintf(sql + len, sizeof sql - len, i ? ",%d" : "%d", kinds[i]);
     snprintf(sql + len, sizeof sql - len, ") ORDER BY seq");
@@ -665,15 +664,7 @@ bool ngdb_scan_kinds(const int *kinds, size_t n, void (*cb)(const event_t *ev, v
     int rc;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         event_t ev; memset(&ev, 0, sizeof ev);
-        snprintf(ev.id, sizeof ev.id, "%s", (const char *) sqlite3_column_text(stmt, 0));
-        snprintf(ev.pubkey, sizeof ev.pubkey, "%s", (const char *) sqlite3_column_text(stmt, 1));
-        ev.created_at = (time_t) sqlite3_column_int64(stmt, 2);
-        ev.kind = sqlite3_column_int(stmt, 3);
-        ev.tags_json = (char *) sqlite3_column_text(stmt, 4);
-        ev.tags_json_len = ev.tags_json ? (size_t) sqlite3_column_bytes(stmt, 4) : 0;
-        ev.content = (char *) sqlite3_column_text(stmt, 5);
-        ev.content_len = ev.content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
-        snprintf(ev.sig, sizeof ev.sig, "%s", (const char *) sqlite3_column_text(stmt, 6));
+        ngdb_row_event(stmt, &ev);
         cb(&ev, arg);
     }
     sqlite3_finalize(stmt);

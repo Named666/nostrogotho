@@ -30,6 +30,13 @@ enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_TAG_INS
 /* Tag index rows per multi-row INSERT step (PS_TAG_INSERT_CHUNK). */
 #define TAG_CHUNK 4
 
+/* Raw event columns (binary id/pubkey/sig) in the order ngdb_row_event
+ * reads them; hex encoding happens in C, not in per-row SQL functions. */
+#define NGDB_EVENT_COLUMNS "id, pubkey, created_at, kind, tags, content, sig"
+/* Fill ev from a row of NGDB_EVENT_COLUMNS starting at column 0. tags_json
+ * and content borrow the row (valid until the next step/reset). */
+void ngdb_row_event(sqlite3_stmt *stmt, event_t *ev);
+
 /* The statement, reset and with bindings cleared; NULL on prepare error. */
 sqlite3_stmt *ngdb_ps(int which);
 
