@@ -215,7 +215,7 @@ static void sq_tag_json(sq_query_t *q, const char *alias, const tag_t *tag) {
 }
 
 /* ----------------------------------------------------------- compiler --- */
-/* Plain filters scan `event e` (pubkindidx / kindtimeidx / timeidx). Filters
+/* Plain filters scan `event e` (pubkindtimeidx / kindtimeidx / timeidx). Filters
  * with tag conditions are driven by the tag index: the condition with the
  * fewest values is joined (tag t, ordered by its (name, value, created_at,
  * ev) key), the others are EXISTS point lookups on the same key. kinds and

@@ -459,16 +459,13 @@ static void mem_index_close(void) {
  *   - 256MB cache for performance
  * 
  * Indexes Created:
- *   - ididx: unique on event.id (primary key)
- *   - pubkeyprefix: on event.pubkey
+ *   - ididx: unique on event.id
+ *   - pubkindtimeidx: (pubkey, kind, created_at DESC)
  *   - timeidx: on event.created_at DESC
- *   - kindidx: on event.kind
  *   - kindtimeidx: composite on (kind, created_at DESC)
  * Page size:
- *   - PRAGMA page_size = 1048576 (~1MB) set before any table exists; larger
- *     pages reduce B-tree depth and I/O for big events (content + tags JSON
- *     can be tens of KB each). Existing databases keep their page size,
- *     which SQLite fixes at first table creation.
+ *   - 2048 for a new database (NG_PAGE_SIZE overrides); existing databases
+ *     keep theirs, which SQLite fixes at first table creation.
  * 
  * Thread safety: NOT thread-safe; must be called during init
  */
@@ -508,8 +505,7 @@ static bool storage_init_sqlite3(const char *dsn) {
     }
     
     /* Page size must be set before the first table is created (it is baked
-     * into the database file on creation). 1MB is the SQLite maximum and
-     * suits large Nostr payloads; existing databases keep their page size. */
+     * into the database file on creation); existing databases keep theirs. */
     char page_sql[64];
     {
         /* Only effective for a new database (fixed at first table). Small
@@ -552,9 +548,11 @@ static bool storage_init_sqlite3(const char *dsn) {
         "    sig BLOB NOT NULL"
         ");"
         "CREATE UNIQUE INDEX IF NOT EXISTS ididx ON event(id);"
-        /* (pubkey,kind) serves authors filters (prefix) and the replaceable
-         * lookup; kindidx was a redundant prefix of kindtimeidx. */
-        "CREATE INDEX IF NOT EXISTS pubkindidx ON event(pubkey,kind);"
+        /* (pubkey,kind,created_at) serves authors filters (prefix), the
+         * replaceable lookup and the newest-first top-k probes
+         * (storage_read.c); it replaces the older (pubkey,kind) index. */
+        "CREATE INDEX IF NOT EXISTS pubkindtimeidx ON event(pubkey,kind,created_at DESC);"
+        "DROP INDEX IF EXISTS pubkindidx;"
         "CREATE INDEX IF NOT EXISTS timeidx ON event(created_at DESC);"
         "CREATE INDEX IF NOT EXISTS kindtimeidx ON event(kind,created_at DESC);"
         /* Settings the stored indexes were built with (tag_index). */
@@ -570,6 +568,8 @@ static bool storage_init_sqlite3(const char *dsn) {
         ") WITHOUT ROWID;";
     /* A database from before the search index: index its events once. */
     bool had_events = has_table("event"), had_fts = has_table("event_fts");
+    if (has_table("pubkindidx"))
+        fprintf(stderr, "storage: rebuilding the author index as (pubkey, kind, created_at)...\n");
 
     if (!exec_or_close(schema_sql)) return false;
     /* tag_index = memory: the SQL builder sees no indexed letter (its tag

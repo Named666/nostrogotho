@@ -275,6 +275,82 @@ static ng_status_t mem_filter(const filter_t *f, size_t drive, sq_mode_t mode, i
     return st;
 }
 
+/* ------------------------------------------- authors x kinds top-k --- */
+/* A home feed (hundreds of authors, a few kinds, limit 500) matches every
+ * stored event of those authors: SQLite reads them all through
+ * pubkindtimeidx and sorts for the newest limit. Instead, find the
+ * created_at T of the (limit+1)-th newest match with covering-index probes,
+ * one per (author, kind) newest first, each bounded below by the running
+ * heap minimum (most probes read 0-2 entries once the heap is full); then
+ * run the same SQL with since = T. Every row of the full answer has
+ * created_at >= T and the bounded query sees the same rows down to T, so
+ * the result is identical; probe and query share one read snapshot. Only
+ * for filters whose row set the probes describe exactly. */
+#define TOPK_MAX_PROBES 50000
+
+static void heap_sift_down(int64_t *h, size_t n, size_t i) {
+    for (;;) {
+        size_t l = 2 * i + 1, r = l + 1, m = i;
+        if (l < n && h[l] < h[m]) m = l;
+        if (r < n && h[r] < h[m]) m = r;
+        if (m == i) return;
+        int64_t t = h[i]; h[i] = h[m]; h[m] = t; i = m;
+    }
+}
+static void heap_push(int64_t *h, size_t *n, int64_t v) {
+    size_t i = (*n)++;
+    h[i] = v;
+    while (i > 0 && h[(i - 1) / 2] > h[i]) { int64_t t = h[i]; h[i] = h[(i - 1) / 2]; h[(i - 1) / 2] = t; i = (i - 1) / 2; }
+}
+
+static bool topk_applies(const filter_t *f) {
+    if (f->ids_count || f->tags_count || f->search || f->hide_gift_wraps || f->authors_count == 0) return false;
+    size_t probes = f->authors_count * (f->kinds_count ? f->kinds_count : 1);
+    return probes >= 2 && probes <= TOPK_MAX_PROBES;
+}
+
+/* *since_out = T (or the filter's since when fewer than need rows match). */
+static ng_status_t topk_since(const filter_t *f, size_t need, time_t *since_out) {
+    *since_out = f->since;
+    const char *sql = f->kinds_count
+        ? "SELECT created_at FROM event WHERE pubkey = unhex(?1) AND kind = ?2 AND created_at >= ?3 AND created_at <= ?4"
+          " ORDER BY created_at DESC LIMIT ?5"
+        : "SELECT created_at FROM event WHERE pubkey = unhex(?1) AND created_at >= ?3 AND created_at <= ?4"
+          " ORDER BY created_at DESC LIMIT ?5";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(ngdb_conn, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        return NG_E_IO;
+    }
+    int64_t *h = (int64_t *) ng_malloc_array(need, sizeof(*h));
+    if (!h) { sqlite3_finalize(st); return NG_E_NOMEM; }
+    size_t n = 0;
+    ng_status_t rs = NG_OK;
+    sqlite3_bind_int64(st, 4, f->until > 0 ? (sqlite3_int64) f->until : INT64_MAX);
+    sqlite3_bind_int64(st, 5, (sqlite3_int64) need);
+    size_t nk = f->kinds_count ? f->kinds_count : 1;
+    for (size_t a = 0; a < f->authors_count && rs == NG_OK; a++) {
+        sqlite3_bind_text(st, 1, f->authors[a], -1, SQLITE_STATIC);
+        for (size_t k = 0; k < nk && rs == NG_OK; k++) {
+            if (f->kinds_count) sqlite3_bind_int(st, 2, f->kinds[k]);
+            sqlite3_bind_int64(st, 3, n == need ? h[0] : (f->since > 0 ? (sqlite3_int64) f->since : 0));
+            int rc;
+            while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+                int64_t ca = sqlite3_column_int64(st, 0);
+                if (n < need) heap_push(h, &n, ca);
+                else if (ca > h[0]) { h[0] = ca; heap_sift_down(h, n, 0); }
+                else break;                              /* the rest are older */
+            }
+            if (rc != SQLITE_ROW && rc != SQLITE_DONE) { fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn)); rs = NG_E_IO; }
+            sqlite3_reset(st);
+        }
+    }
+    if (rs == NG_OK && n == need && (time_t) h[0] > f->since) *since_out = (time_t) h[0];
+    free(h);
+    sqlite3_finalize(st);
+    return rs;
+}
+
 /* Whether any stored event overflowed tag_index_max_per_event (see
  * sq_set_overflow); probed once per query call that has tag conditions. */
 static bool tag_overflow_present(void) {
@@ -335,16 +411,30 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
             if (ms != NG_E_UNKNOWN) return ms;
             /* the letter was dropped by the memory cap meanwhile: SQL path */
         }
+        /* authors x kinds: bound by the top-k threshold inside one read snapshot */
+        filter_t bounded;
+        bool topk = !do_count && topk_applies(filter);
+        if (topk) {
+            if (sqlite3_exec(ngdb_conn, "SAVEPOINT ng_topk", NULL, NULL, NULL) != SQLITE_OK) topk = false;
+            else {
+                bounded = *filter;
+                ng_status_t ts = topk_since(filter, (size_t) limit + 1, &bounded.since);
+                if (ts != NG_OK) { sqlite3_exec(ngdb_conn, "RELEASE ng_topk", NULL, NULL, NULL); return ts; }
+                filter = &bounded;
+            }
+        }
         sq_query_t q = {0};
         ng_status_t st = sq_build(&q, filter, do_count, limit + 1);
         if (st != NG_OK) {
             sq_free(&q);
+            if (topk) sqlite3_exec(ngdb_conn, "RELEASE ng_topk", NULL, NULL, NULL);
             return st;                                  /* TOOBIG: over SQ_MAX_* */
         }
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
             fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
             sq_free(&q);
+            if (topk) sqlite3_exec(ngdb_conn, "RELEASE ng_topk", NULL, NULL, NULL);
             return NG_E_IO;
         }
         for (size_t i = 0; i < q.n; i++) {             /* n <= SQ_MAX_PARAMS */
@@ -364,6 +454,7 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
             ok = stream_rows(stmt, sender, sub, limit, &more);
         }
         sqlite3_finalize(stmt);
+        if (topk) sqlite3_exec(ngdb_conn, "RELEASE ng_topk", NULL, NULL, NULL);
         if (!ok) return NG_E_IO;
     }
     if (do_count && out_count) *out_count = total_count;
