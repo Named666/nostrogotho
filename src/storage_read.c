@@ -95,6 +95,7 @@ event_t *ngdb_get_event_by_id(const char *id) {
 /* The statement is bound with LIMIT limit+1: a row past the limit only
  * proves there are more (NIP-67) and is not sent. */
 static void render_row(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub) {
+    if (!sender) return;                                  /* COUNT / HLL passes render nothing */
     event_t event = {0};
     snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
     snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
