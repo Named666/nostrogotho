@@ -75,7 +75,7 @@ typedef struct {
                                   * next one. Must be a multiple of 4. */
     unsigned handshake_timeout;  /* seconds (default 12) */
     size_t user_size;            /* bytes of per-socket user data */
-    void *user;                  /* opaque, see ngws_server_user() */
+    void *user;                  /* opaque, owned by the caller */
     int skip_utf8_check;        /* 1: don't validate TEXT payloads as UTF-8 (RFC 6455 8.1 requires it) */
 } ngws_config_t;
 
@@ -83,10 +83,8 @@ ngws_server_t *ngws_server_create(const ngws_config_t *cfg);
 /* Runs all loops; blocks until ngws_server_stop(). Returns false if listen failed. */
 bool ngws_server_run(ngws_server_t *srv);
 void ngws_server_stop(ngws_server_t *srv);     /* thread-safe */
-void ngws_server_free(ngws_server_t *srv);
 /* listen(2) backlog actually requested for cfg (see listen_backlog). */
 int ngws_listen_backlog(const ngws_config_t *cfg);
-void *ngws_server_user(ngws_server_t *srv);
 /* Bytes currently held in socket backlogs (capacity of the private output
  * buffers, i.e. memory), all loops. Any thread, relaxed. */
 size_t ngws_server_backlog_bytes(ngws_server_t *srv);
@@ -100,12 +98,11 @@ ngws_loop_t *ngws_server_loop(ngws_server_t *srv, int idx);
 
 /* --- loop thread only ----------------------------------------------------- */
 int  ngws_send(ngws_socket_t *ws, const void *data, size_t len, int opcode);
-/* Append an already-framed message (see ngws_frame_build). */
-int  ngws_send_raw(ngws_socket_t *ws, const void *frame, size_t len);
-/* Same, frame given as three consecutive pieces (copied into one region). */
+/* Append an already-framed message given as three consecutive pieces
+ * (copied into one region; see ngws_frame_build). */
 int  ngws_send_raw3(ngws_socket_t *ws, const void *a, size_t an, const void *b, size_t bn, const void *c, size_t cn);
 /* Zero-copy: queue caller memory holding a complete frame. It must stay valid
- * until the end of the current loop iteration (see ngws_loop_alloc/defer). */
+ * until the end of the current loop iteration (see ngws_loop_alloc_frame/defer). */
 int  ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len);
 void ngws_close(ngws_socket_t *ws, int code, const char *reason);  /* graceful */
 void ngws_terminate(ngws_socket_t *ws);                            /* abrupt */
@@ -127,17 +124,14 @@ bool ngws_paused(ngws_socket_t *ws);
 void ngws_loop_foreach_paused(ngws_loop_t *loop, void (*fn)(ngws_socket_t *ws, void *arg), void *arg);
 /* Visit every open WebSocket on this loop (loop thread). */
 void ngws_loop_foreach(ngws_loop_t *loop, void (*fn)(ngws_socket_t *ws, void *arg), void *arg);
-/* Scratch memory valid until the end of the current loop iteration. */
-void *ngws_loop_alloc(ngws_loop_t *loop, size_t n);
-/* Same, unaligned: frames allocated back to back this way and passed to
+/* Scratch memory valid until the end of the current loop iteration,
+ * unaligned: frames allocated back to back this way and passed to
  * ngws_send_shared() in order coalesce into one iovec per socket. */
 void *ngws_loop_alloc_frame(ngws_loop_t *loop, size_t n);
 /* Run fn(arg) at the end of the current iteration, after output is flushed
  * (e.g. to drop a reference on a frame passed to ngws_send_shared). */
 void ngws_loop_defer(ngws_loop_t *loop, void (*fn)(void *), void *arg);
 int  ngws_loop_index(ngws_loop_t *loop);
-void *ngws_loop_get_user(ngws_loop_t *loop);
-void ngws_loop_set_user(ngws_loop_t *loop, void *p);
 
 /* --- any thread -------------------------------------------------------------- */
 typedef struct ngws_task {
@@ -149,7 +143,7 @@ void ngws_loop_post(ngws_loop_t *loop, ngws_task_t *t);
 
 /* Serialize a server->client frame into out (needs len + 10 bytes).
  * Returns total frame length. Thread-safe; use it to frame a broadcast once
- * and ngws_send_raw() the same bytes to many sockets. */
+ * and ngws_send_shared() the same bytes to many sockets. */
 size_t ngws_frame_build(void *out, int opcode, const void *data, size_t len);
 size_t ngws_frame_overhead(size_t len);
 

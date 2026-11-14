@@ -223,54 +223,6 @@ void tag_free(tag_t *tag) {
  * Tag Array Allocation and Deallocation
  * ============================================================================ */
 
-/* tags_array_alloc - Allocate a tags array with capacity for tag_count tags
- * 
- * Creates a new tags_array_t with a pre-allocated tags array. The array is
- * initialized with count=0 (no tags yet), but can hold up to tag_count
- * tag_t structures.
- * 
- * Args: tag_count - maximum number of tags this array can hold
- * Returns: pointer to new tags_array_t on success, NULL on malloc failure
- * 
- * Caller responsibility: Must call tags_array_free() to release memory
- */
-tags_array_t *tags_array_alloc(size_t tag_count) {
-    tags_array_t *tags = (tags_array_t *)malloc(sizeof(tags_array_t));
-    if (!tags) return NULL;
-    
-    tags->tags = (tag_t *) ng_malloc_array(tag_count, sizeof(tag_t));
-    if (!tags->tags) {
-        free(tags);
-        return NULL;
-    }
-    
-    tags->count = 0;
-    memset(tags->tags, 0, tag_count * sizeof(tag_t));
-    return tags;
-}
-
-/* tags_array_free - Free a tags array and all its contained tags
- * 
- * Recursively releases a tags_array_t and all its contents:
- * - Frees each tag_t in the tags array
- * - Frees the tags array itself
- * - Frees the tags_array_t structure
- * 
- * Args: tags - pointer to tags array (NULL-safe, does nothing if NULL)
- */
-void tags_array_free(tags_array_t *tags) {
-    if (!tags) return;
-    
-    if (tags->tags) {
-        for (size_t i = 0; i < tags->count; i++) {
-            tag_release(&tags->tags[i]);
-        }
-        free(tags->tags);
-    }
-    
-    free(tags);
-}
-
 /* ============================================================================
  * String Utility Functions
  * ============================================================================ */
@@ -283,7 +235,7 @@ void tags_array_free(tags_array_t *tags) {
  * Args: str - null-terminated string to duplicate (NULL-safe)
  * Returns: malloc'd copy on success, NULL if str is NULL or malloc fails
  * 
- * Caller responsibility: Must call string_free() to release the copy
+ * Caller responsibility: must free() the copy
  */
 char *string_dup(const char *str) {
     if (!str) return NULL;
@@ -294,16 +246,6 @@ char *string_dup(const char *str) {
     
     strcpy(dup, str);
     return dup;
-}
-
-/* string_free - Free a duplicated string
- * 
- * Safely releases memory allocated by string_dup().
- * 
- * Args: str - pointer to malloc'd string (NULL-safe, does nothing if NULL)
- */
-void string_free(char *str) {
-    free(str);
 }
 
 

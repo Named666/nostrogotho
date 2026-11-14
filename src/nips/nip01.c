@@ -25,14 +25,6 @@
  *     (with the "d" tag) lives here.
  * ============================================================================ */
 
-bool nip01_validate_event(const event_t *ev) {
-    if (!ev) return false;
-    
-    /* Delegate to crypto layer for full validation
-     * (ID verification, signature verification) */
-    return check_event(ev);
-}
-
 /* ============================================================================
  * Event Dispatcher
  *
@@ -161,21 +153,6 @@ nip01_process_result_t nip01_dispatch_event(
     }
     
     return nip_plugin_store_and_broadcast(storage, event);
-}
-
-nip01_process_result_t nip01_process_event(
-    relay_conn_t *connection,
-    const event_t *event,
-    storage_context_t *storage,
-    const char *relay_url,
-    size_t max_content_length,
-    time_t created_at_lower_limit,
-    time_t created_at_upper_limit,
-    int min_pow_difficulty) {
-    nip01_process_result_t result = nip01_precheck_event(event, max_content_length,
-        created_at_lower_limit, created_at_upper_limit, min_pow_difficulty);
-    if (!result.accepted) return result;
-    return nip01_dispatch_event(connection, event, storage, relay_url);
 }
 
 /* ============================================================================

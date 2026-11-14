@@ -73,16 +73,6 @@ void dedupe_init(size_t cap) {
 
 static stripe_t *stripe_of(const uint8_t id[32]) { return &stripes[id[31] & (STRIPES - 1)]; }
 
-int dedupe_lookup(const char *hex) {
-    uint8_t id[32];
-    if (!enabled || !parse_id(hex, id)) return DEDUPE_ABSENT;
-    stripe_t *s = stripe_of(id);
-    pthread_mutex_lock(&s->mu);
-    int st = s->slots[find(s, id)].state;
-    pthread_mutex_unlock(&s->mu);
-    return st;
-}
-
 bool dedupe_claim(const char *hex) {
     uint8_t id[32];
     if (!enabled || !parse_id(hex, id)) return true;              /* no set: DB guards still apply */
@@ -142,10 +132,4 @@ void dedupe_forget(const char *hex) {
     size_t i = find(s, id);
     if (s->slots[i].state == DEDUPE_KNOWN) erase(s, i);   /* its ring entry ages out harmlessly */
     pthread_mutex_unlock(&s->mu);
-}
-
-void dedupe_free(void) {
-    if (!enabled) return;
-    for (int k = 0; k < STRIPES; k++) { free(stripes[k].slots); free(stripes[k].ring); pthread_mutex_destroy(&stripes[k].mu); }
-    enabled = false;
 }

@@ -133,7 +133,6 @@ typedef struct {
  * 
  * Memory management:
  *   - Both array and contained tags are malloc'd
- *   - Use tags_array_alloc() and tags_array_free()
  * ============================================================================ */
 typedef struct {
     tag_t *tags;
@@ -191,15 +190,7 @@ tag_t *tag_alloc(size_t element_count);
  * Note: Frees both the elements array and each element string */
 void tag_free(tag_t *tag);
 
-/* tags_array_alloc - Allocate a tags array structure with capacity for tag_count tags
- * Args: tag_count - maximum tags this array can hold
- * Returns: pointer to new tags array with count=0, or NULL on failure */
-tags_array_t *tags_array_alloc(size_t tag_count);
 
-/* tags_array_free - Free a tags array and all its contained tags
- * Args: tags - pointer to tags array (NULL-safe)
- * Note: Recursively frees all tag structures in the array */
-void tags_array_free(tags_array_t *tags);
 
 /* ============================================================================
  * String Utility Functions
@@ -208,7 +199,7 @@ void tags_array_free(tags_array_t *tags);
 /* string_dup - Duplicate a null-terminated string
  * Args: str - string to duplicate (NULL-safe)
  * Returns: malloc'd copy of string, or NULL if str is NULL or allocation fails
- * Caller: must call string_free() to release */
+ * Caller: must free() the copy */
 char *string_dup(const char *str);
 
 /* hex64_intern - Shared, reference-counted copy of a 64-hex string (a pubkey).
@@ -220,9 +211,6 @@ char *string_dup(const char *str);
 const char *hex64_intern(const char *hex);
 void hex64_release(const char *interned);
 
-/* string_free - Free a duplicated string
- * Args: str - pointer to malloc'd string (NULL-safe) */
-void string_free(char *str);
 
 /* ============================================================================
  * NIP-50 search

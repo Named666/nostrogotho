@@ -286,8 +286,6 @@ void ngws_loop_foreach(ngws_loop_t *l, void (*fn)(ngws_socket_t *, void *), void
     }
 }
 int ngws_loop_index(ngws_loop_t *l) { return l->idx; }
-void *ngws_loop_get_user(ngws_loop_t *l) { return l->user; }
-void ngws_loop_set_user(ngws_loop_t *l, void *p) { l->user = p; }
 
 static void *loop_thread(void *arg) {
     ngws_loop_t *l = (ngws_loop_t *) arg;
@@ -410,22 +408,6 @@ void ngws_server_stop(ngws_server_t *srv) {
     for (int i = 0; i < srv->n_loops; i++) if (srv->loops[i].loop) us_wakeup_loop(srv->loops[i].loop);
 }
 
-void ngws_server_free(ngws_server_t *srv) {
-    if (!srv) return;
-    for (int i = 0; i < srv->n_loops; i++) {
-        ngws_loop_t *l = &srv->loops[i];
-        if (!l->loop) continue;
-        for (pool_item_t *p = l->msg_pool, *n; p; p = n) { n = p->next; free(p); }
-        for (arena_chunk_t *c = l->arena, *n; c; c = n) { n = c->next; free(c); }
-        free(l->nodes); free(l->defer);
-        us_socket_context_free(0, l->ctx);
-        us_loop_free(l->loop);
-        pthread_mutex_destroy(&l->mu);
-    }
-    free(srv);
-}
-
-void *ngws_server_user(ngws_server_t *srv) { return srv->cfg.user; }
 size_t ngws_server_backlog_bytes(ngws_server_t *srv) { return ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED); }
 void ngws_server_stats(ngws_server_t *srv, ngws_stats_t *o) {
     o->backlog_bytes = ngws_server_backlog_bytes(srv);

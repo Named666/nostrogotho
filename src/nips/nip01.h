@@ -20,7 +20,7 @@
  * - Plugin-style handlers for different event kinds
  *
  * Threading: validation is pure and thread-safe; kind dispatch
- * (nip01_process_event and the registered handlers) runs on the writer.
+ * (nip01_dispatch_event and the registered handlers) runs on the writer.
  * Results are returned by value (nip01_process_result_t, response_msg is
  * an inline buffer); nothing is allocated for the caller.
  * ============================================================================ */
@@ -29,35 +29,6 @@
  * Event Validation
  * ============================================================================ */
 
-/* nip01_validate_event - Comprehensive event validation (NIP-01)
- * 
- * Performs full validation of a Nostr event for protocol compliance:
- * 1. Verifies event ID is the correct SHA256 hash
- * 2. Verifies Schnorr signature with public key
- * 
- * This is the primary validation function used when accepting events
- * from clients via EVENT messages.
- * 
- * Args: ev - event to validate (must not be NULL)
- * 
- * Returns: 
- *   true if event passes all validation checks
- *   false if any check fails (id or signature)
- * 
- * Requirements:
- *   - crypto_init() must have been called
- *   - event fields must be properly initialized
- * 
- * Limitations (checked elsewhere):
- *   - Timestamp validity (NIP-22 with time windows)
- *   - Proof-of-work difficulty (NIP-13)
- *   - Event size limits (application-specific)
- * 
- * Related:
- *   - check_event() in crypto.c (lower-level implementation)
- *   - crypto_init() must be called first
- */
-bool nip01_validate_event(const event_t *ev);
 
 /* ============================================================================
  * Event Stream Listener System (Plugin Architecture)
@@ -112,41 +83,12 @@ typedef nip01_process_result_t (*nip01_event_listener_t)(
     const char *relay_url
 );
 
-/* nip01_process_event - Main entry point for event processing
- * 
- * Performs comprehensive event processing:
- * 1. Validates event (ID, signature)
- * 2. Checks content size limit
- * 3. Checks timestamp limits
- * 4. Checks proof-of-work difficulty
- * 5. Dispatches to every plugin whose declared kind ranges cover this kind
- * 
- * Args:
- *   connection                  - WebSocket connection
- *   event                       - event to process
- *   storage                     - storage context
- *   relay_url                   - relay's URL
- *   max_content_length          - maximum content size (0 = unlimited)
- *   created_at_lower_limit      - max event age in seconds (0 = no limit)
- *   created_at_upper_limit      - max event future in seconds (0 = no limit)
- *   min_pow_difficulty          - minimum PoW difficulty (0 = none)
- * 
- * Returns: nip01_process_result_t with decision and message
- * 
- * Example usage:
- *   event_t event;
- *   // ... parse event ...
- *   
- *   nip01_process_result_t result = nip01_process_event(
- *       connection, &event, storage_ctx, relay_url,
- *       MAX_CONTENT, 2*3600, 15*60, 20);
- *   
- *   nip_plugin_send_status(connection, "OK", event.id, result.accepted, result.response_msg);
- *   
- *   if (result.accepted && result.should_broadcast) {
- *       broadcast_event(&event);
- *   }
- */
+/* Event processing in two steps (relay_core runs precheck on the worker,
+ * dispatch on the writer):
+ *   nip01_precheck_event  - size, created_at window and PoW limits
+ *   nip01_dispatch_event  - every plugin whose declared kind ranges cover
+ *                           the kind; default NIP-01 store and broadcast
+ * Both return a nip01_process_result_t (decision and OK message). */
 nip01_process_result_t nip01_precheck_event(
     const event_t *event,
     size_t max_content_length,
@@ -160,15 +102,5 @@ nip01_process_result_t nip01_dispatch_event(
     storage_context_t *storage,
     const char *relay_url);
 
-nip01_process_result_t nip01_process_event(
-    relay_conn_t *connection,
-    const event_t *event,
-    storage_context_t *storage,
-    const char *relay_url,
-    size_t max_content_length,
-    time_t created_at_lower_limit,
-    time_t created_at_upper_limit,
-    int min_pow_difficulty
-);
 
 #endif /* NIP01_H_ */

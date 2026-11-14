@@ -47,12 +47,6 @@ void nx_dirty_del(sockx_t *x) {
 }
 
 static void *arena_alloc(ngws_loop_t *l, size_t n);
-void *ngws_loop_alloc(ngws_loop_t *l, size_t n) {
-    arena_chunk_t *c = l->arena_cur;
-    if (c) c->used = (c->used + 15) & ~(size_t) 15;    /* caller-visible blocks are 16-aligned */
-    if (c && c->used > c->cap) c->used = c->cap;
-    return arena_alloc(l, (n + 15) & ~(size_t) 15);
-}
 
 void *ngws_loop_alloc_frame(ngws_loop_t *l, size_t n) { return arena_alloc(l, n); }
 
@@ -293,16 +287,6 @@ int ngws_send(ngws_socket_t *ws, const void *data, size_t len, int opcode) {
     sockx_t *x = X(s);
     if (x->state != ST_WS) return NGWS_SEND_DROPPED;
     return nx_queue_frame(x, opcode, data, len);
-}
-
-int ngws_send_raw(ngws_socket_t *ws, const void *frame, size_t len) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    sockx_t *x = X(s);
-    if (x->state != ST_WS) return NGWS_SEND_DROPPED;
-    char *p = nx_out_reserve(x, len);
-    if (!p) return NGWS_SEND_DROPPED;
-    memcpy(p, frame, len);
-    return send_status(x);
 }
 
 int ngws_send_raw3(ngws_socket_t *ws, const void *a, size_t an, const void *b, size_t bn, const void *c, size_t cn) {

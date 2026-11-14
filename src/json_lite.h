@@ -32,7 +32,6 @@ typedef struct {
 
 jstr_t jl_str(const char *s);
 jstr_t jl_str_n(const char *s, size_t n);
-bool jl_str_contains(jstr_t haystack, const char *needle);
 
 /* Length of the JSON value starting at s[0] (skips nothing); 0 if invalid. */
 size_t jl_value_len(const char *s, size_t n);

@@ -195,7 +195,7 @@ nip01_process_result_t nipxx_on_event(
 
 ### Dispatcher Semantics
 
-The dispatcher in `nip01_process_event()` walks the plugin registry in registration order and calls `on_event` on every plugin whose declared ranges cover the event's kind. The first listener to return `accepted = true` wins; if every matching listener rejects, the event is rejected. If no plugin claims the kind, it falls back to default NIP-01 behavior (store + broadcast, except ephemeral kinds 20000–29999 which are broadcast without storage).
+The dispatcher in `nip01_dispatch_event()` walks the plugin registry in registration order and calls `on_event` on every plugin whose declared ranges cover the event's kind. The first listener to return `accepted = true` wins; if every matching listener rejects, the event is rejected. If no plugin claims the kind, it falls back to default NIP-01 behavior (store + broadcast, except ephemeral kinds 20000–29999 which are broadcast without storage).
 
 ### Registration Order Matters
 

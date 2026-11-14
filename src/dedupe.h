@@ -25,10 +25,8 @@
 enum { DEDUPE_ABSENT = 0, DEDUPE_INFLIGHT = 1, DEDUPE_KNOWN = 2 };
 
 void dedupe_init(size_t recent_capacity);   /* 0 disables the set */
-int  dedupe_lookup(const char *hex_id);     /* DEDUPE_* */
 bool dedupe_claim(const char *hex_id);      /* true: absent -> in-flight (caller owns it) */
 void dedupe_resolve(const char *hex_id);    /* in-flight -> known (recent FIFO) */
 void dedupe_release(const char *hex_id);    /* in-flight -> absent (not stored) */
 void dedupe_forget(const char *hex_id);     /* known -> absent (e.g. NIP-09 deleted it) */
-void dedupe_free(void);
 #endif

@@ -676,7 +676,7 @@ bool ngdb_scan_kinds(const int *kinds, size_t n, void (*cb)(const event_t *ev, v
  * Deletes every stored row whose `tags` column carries an
  * ["expiration","<timestamp>"] tag with a timestamp <= now. Expired events
  * are never served (matches_filter() in server.c drops them) and never
- * accepted on publication (nip01_process_event), but without this sweep the
+ * accepted on publication (nip01_precheck_event), but without this sweep the
  * rows would accumulate indefinitely in the database.
  *
  * The bundled SQLite build has no JSON1 functions, so we can't use

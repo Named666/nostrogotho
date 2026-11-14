@@ -7,15 +7,6 @@
 jstr_t jl_str(const char *s) { jstr_t r = { s, s ? strlen(s) : 0 }; return r; }
 jstr_t jl_str_n(const char *s, size_t n) { jstr_t r = { s, n }; return r; }
 
-bool jl_str_contains(jstr_t h, const char *needle) {
-    size_t n = strlen(needle);
-    if (n == 0) return true;
-    if (!h.buf || n > h.len) return false;
-    for (size_t i = 0; i + n <= h.len; i++)
-        if (h.buf[i] == needle[0] && memcmp(h.buf + i, needle, n) == 0) return true;
-    return false;
-}
-
 static int is_ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
 static size_t skip_ws(const char *s, size_t n, size_t i) {
