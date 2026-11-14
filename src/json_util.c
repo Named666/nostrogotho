@@ -636,7 +636,28 @@ static bool parse_string_array(jstr_t raw, char ***items, size_t *count,
     char **v = (char **) ng_malloc_array(n ? n : 1, sizeof(*v));
     if (!v) return false;
     while ((offset = jl_next(raw, offset, &key, &value)) != 0) {
-        char *string = key.buf == NULL && got < n ? json_raw_string(value) : NULL;
+        char *string;
+        if (key.buf != NULL || got >= n) { release_strings(v, got, intern); return false; }
+        if (require_hex64 && value.len == 66 && value.buf[0] == '"' && value.buf[65] == '"') {
+            /* The common case: a plain quoted 64-hex token (hex has no
+             * escapes). Validate in place; intern from a stack copy, or
+             * one owned copy -- instead of json_raw_string's two mallocs. */
+            char hex[65];
+            memcpy(hex, value.buf + 1, 64); hex[64] = '\0';
+            if (!is_hex_64(hex)) { release_strings(v, got, intern); return false; }
+            if (intern) {
+                const char *shared = hex64_intern(hex);
+                if (!shared) { release_strings(v, got, intern); return false; }
+                v[got++] = (char *) shared;
+                continue;
+            }
+            string = (char *) ng_malloc_add(64, 1);
+            if (!string) { release_strings(v, got, intern); return false; }
+            memcpy(string, hex, 65);
+            v[got++] = string;
+            continue;
+        }
+        string = json_raw_string(value);
         if (!string || (require_hex64 && !is_hex_64(string))) { free(string); release_strings(v, got, intern); return false; }
         if (intern) {
             const char *shared = hex64_intern(string);
