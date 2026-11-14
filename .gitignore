@@ -11,3 +11,4 @@ build/
 TODO.md
 __pycache__/
 *.sqlite-tagidx
+tools/bench/scaling-results/

@@ -221,7 +221,8 @@ saturated at the probe's offered rate.
 - Linux thread names (`ng-worker-N`, `ng-writer`, `ng-checkpoint`, `ng-io-N`)
   added for future operational diagnostics. No write parallelism introduced.
 - Reproducible bounded `tools/bench/scaling.py` and `diagnose.py`; raw logs,
-  specs and flat profiles under `tools/bench/scaling-results/`.
+  specs and flat profiles are written to `tools/bench/scaling-results/`
+  (generated, not committed; the Nov 7-10 runs are in git history up to f619fbd).
 
 ## Overload, fan-out, backlog and verification work (Nov 10, 2026, CST)
 
@@ -229,8 +230,8 @@ Four commits on `usockets` (not pushed), each followed by the full suite.
 Numbers come from the same shared 8-core VM, relay on CPUs 0-3 and clients
 on 4-7, 1 k subscribers plus 20 k idle sockets for fan-out and 64 publishers
 x 16 in flight with FULL sync for publish. Other agents were using the host,
-so treat run-to-run spread of 10-20% as noise. Raw summaries are in
-`tools/bench/scaling-results/nov10-*.txt`.
+so treat run-to-run spread of 10-20% as noise. Raw summaries were in
+`tools/bench/scaling-results/nov10-*.txt` (removed from the tree; git history up to f619fbd).
 
 ### 1. Bounded output and slow readers (08c7170)
 
@@ -523,7 +524,7 @@ were also checked separately. No changes were pushed.
 # /workspace/ngvenv/bin/python tools/bench/genev.py 400000 /workspace/bench/ev400k.txt
 cc -O3 -march=native -std=gnu11 tools/ngload.c -pthread -lm -o build/ngload_soak
 python3 tools/bench/scaling.py
-# Profile build command is recorded in scaling-results/profile-build.txt.
+# Profile build: build/main with NG_OPT="-O2 -g -pg -no-pie" (the recorded command is in git history up to f619fbd).
 python3 tools/bench/diagnose.py --relay "$PWD/build/main_profile" --gprof --case fanout
 python3 tools/bench/diagnose.py --relay "$PWD/build/main_profile" --gprof --case publish
 python3 tools/bench/diagnose.py --relay "$PWD/build/main" --case fanout --rate 1000 --label=-1000

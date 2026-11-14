@@ -13,8 +13,8 @@ Scripts: `tools/bench/*.sh`; events from `tools/bench/genev.py`.
 
 Commits 08c7170, a89b4b8, a9f71c9 and 5e22ba3 (`usockets`, not pushed).
 The method, config keys and every run are in SCALING.md under "Overload,
-fan-out, backlog and verification work"; raw summaries are in
-`tools/bench/scaling-results/nov10-*.txt`. Same host and pinning as below.
+fan-out, backlog and verification work"; raw summaries were in
+`tools/bench/scaling-results/nov10-*.txt` (git history up to f619fbd). Same host and pinning as below.
 The host was shared and noisier than on Nov 7.
 
 | Measurement | before (33cdf36) | after |
