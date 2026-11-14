@@ -1,5 +1,5 @@
-/* Reference server for benchmarking the ngws layer (mirrors the uWS
- * reference in tools/bench/uws_ref.cpp).
+/* Reference server for benchmarking the ngws layer (it mirrored a uWS
+ * reference server, tools/bench/uws_ref.cpp, now only in git history).
  *   ngws_bench_server <port> <loops> echo|broadcast
  * echo:      every message is echoed back.
  * broadcast: every message is published to all sockets on the same loop

@@ -4,7 +4,8 @@ All numbers from one 8-core x86-64 Linux VM (~16 GB RAM, shared with other
 workloads), loopback networking. Server pinned to CPUs 0-3, `ngload` to CPUs
 4-7 (`taskset`). Runs 3-6 s after 1 s warmup, repeated 2-3x; ranges shown.
 ngws/relay: gcc `-O3 -march=native -flto=auto`. uWS reference
-(`tools/bench/uws_ref.cpp`, uWebSockets + uSockets, 4 threads, SO_REUSEPORT)
+(`tools/bench/uws_ref.cpp`, C++, removed from the tree; git history up to f619fbd;
+uWebSockets + uSockets, 4 threads, SO_REUSEPORT)
 built with clang (zig cc) `-O3 -march=native` — only used for benchmarking.
 Client: `build/ngload` (pure C, epoll, multithreaded, multiple source IPs).
 Scripts: `tools/bench/*.sh`; events from `tools/bench/genev.py`.
@@ -35,7 +36,7 @@ The host was shared and noisier than on Nov 7.
 are in git history up to f619fbd). Server pinned to CPUs 0-1 (2 loop threads; CPU 0
 for 1-thread cases), `ngload` 6 threads on CPUs 2-7, 4 s per run, 3 reps,
 runs interleaved ngws/uWS. ngws: `tools/bench/pgo_build.sh` (gcc -O3
--march=native -flto + PGO). uWS: `tools/bench/uws_ref.cpp` (clang -O3
+-march=native -flto + PGO). uWS: `tools/bench/uws_ref.cpp` (history only; clang -O3
 -march=native). Median [min-max]; CPU = server CPU% (200 = both cores busy);
 latency in µs.
 
