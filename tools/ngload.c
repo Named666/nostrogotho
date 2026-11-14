@@ -231,6 +231,30 @@ static void real_bundle(conn_t *c) {
     c->bundle_ns = now_ns();
 }
 
+/* CLOSED reasons seen (first 8 distinct, by their first 48 bytes), printed at exit. */
+static pthread_mutex_t cr_mu = PTHREAD_MUTEX_INITIALIZER;
+static char cr_text[8][49]; static unsigned long cr_n[8]; static int cr_k;
+static void closed_reason(const uint8_t *p, size_t n) {
+    const uint8_t *r = memmem(p, n, ",\"", 2), *q = r ? memmem(r + 2, n - (size_t) (r + 2 - p), ",\"", 2) : NULL;
+    if (!q) return;
+    q += 2;
+    size_t l = (size_t) (p + n - q); if (l > 48) l = 48;
+    pthread_mutex_lock(&cr_mu);
+    int i = 0;
+    for (; i < cr_k; i++) if (!strncmp(cr_text[i], (const char *) q, l) && strlen(cr_text[i]) == l) break;
+    if (i == cr_k && cr_k < 8) { memcpy(cr_text[cr_k], q, l); cr_text[cr_k][l] = 0; cr_k++; }
+    if (i < cr_k) cr_n[i]++;
+    pthread_mutex_unlock(&cr_mu);
+}
+
+/* One startup REQ answered (EOSE, or CLOSED refusing it). */
+static void real_answered(conn_t *c, uint64_t now) {
+    if (c->pend_eose > 0 && --c->pend_eose == 0 && c->in_storm) {
+        c->in_storm = false;
+        if (ng_atomic_fetch_sub(&storm_left, 1) == 1) ng_atomic_store(&storm_done_ns, now);
+    }
+}
+
 static void on_open(thr_t *t, conn_t *c) {
     c->state = C_OPEN; t->connecting--; t->open++; ng_atomic_fetch_add(&total_open, 1);
     if (mode == M_REAL && c->role == R_SUB) real_bundle(c);
@@ -316,10 +340,7 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
                 send_frame(c, 1, (const uint8_t *) "[\"CLOSE\",\"b\"]", 13);
             } else {
                 if (m) { t->eoses++; hadd(&t->ehist, now - c->bundle_ns); }
-                if (c->pend_eose > 0 && --c->pend_eose == 0 && c->in_storm) {
-                    c->in_storm = false;
-                    if (ng_atomic_fetch_sub(&storm_left, 1) == 1) ng_atomic_store(&storm_done_ns, now);
-                }
+                real_answered(c, now);
                 if (id[0] == 'P') {
                     char cl[96]; int k = snprintf(cl, sizeof(cl), "[\"CLOSE\",\"%.*s\"]", (int) (il < 64 ? il : 64), (const char *) id);
                     send_frame(c, 1, (const uint8_t *) cl, (size_t) k);
@@ -328,7 +349,8 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
         } else if (n > 11 && memcmp(p, "[\"CLOSED\",", 10) == 0) {
             if (m) t->closed++;
             if ((il = sub_id(p + 10, n - 10, &id)) == 1 && id[0] == 'b') c->browse_ns = 0;
-            else if (c->pend_eose > 0) c->pend_eose--;
+            else real_answered(c, now_ns());                 /* a refused REQ (the relay does not ack CLOSE) */
+            closed_reason(p, n);
         } else if (n > 5 && memcmp(p, "[\"OK\"", 5) == 0) {
             c->inflight--;
             if (m) { if (memmem(p, n, "\",true,", 7)) t->oks++; else t->fails++; }
@@ -731,6 +753,7 @@ int main(int argc, char **argv) {
                (double) rss2 / 1024.0, (sc1 - sc0) / secs * 100);
     }
     printf(" client_cpu_pct=%.0f\n", (cc1 - cc0) / secs * 100);
+    for (int i = 0; i < cr_k; i++) printf("closed_reason %lu %s\n", cr_n[i], cr_text[i]);
     fflush(stdout);
     free(h); free(cnt);
     return 0;
