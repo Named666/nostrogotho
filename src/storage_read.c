@@ -123,6 +123,24 @@ static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, cons
     return true;
 }
 
+/* Prepare a compiled query and bind its parameters; frees q either way.
+ * NULL (logged) when SQLite cannot prepare it. */
+static sqlite3_stmt *prepare_query(sq_query_t *q) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(ngdb_conn, q->sql, (int) q->len, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        sq_free(q);
+        return NULL;
+    }
+    for (size_t i = 0; i < q->n; i++) {             /* n <= SQ_MAX_PARAMS */
+        int idx = (int) i + 1;
+        if (q->params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q->params[i].num);
+        else sqlite3_bind_text(stmt, idx, q->params[i].text, -1, SQLITE_TRANSIENT);
+    }
+    sq_free(q);                                     /* bind copied the text */
+    return stmt;
+}
+
 /* NIP-45 HyperLogLog register update for one 32-byte pubkey. */
 static void hll_add(uint8_t hll[256], int offset, const uint8_t *pk) {
     unsigned zeros = 0;
@@ -180,18 +198,8 @@ static ng_status_t mem_filter(const filter_t *f, size_t drive, sq_mode_t mode, i
     ng_status_t st = sq_build_mode(&q, f, mode == SQ_MODE_ROWS ? SQ_MODE_ROWS : SQ_MODE_PUBKEYS, 1);
     sq_set_seq_param(false);
     if (st != NG_OK) { sq_free(&q); return st; }
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
-        sq_free(&q);
-        return NG_E_IO;
-    }
-    for (size_t i = 0; i < q.n; i++) {
-        int idx = (int) i + 1;
-        if (q.params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q.params[i].num);
-        else sqlite3_bind_text(stmt, idx, q.params[i].text, -1, SQLITE_TRANSIENT);
-    }
-    sq_free(&q);
+    sqlite3_stmt *stmt = prepare_query(&q);
+    if (!stmt) return NG_E_IO;
 
     const tag_t *tg = &f->tags[drive];
     const char letter = tg->elements[0][0];
@@ -430,19 +438,11 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
             if (topk) sqlite3_exec(ngdb_conn, "RELEASE ng_topk", NULL, NULL, NULL);
             return st;                                  /* TOOBIG: over SQ_MAX_* */
         }
-        sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
-            fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
-            sq_free(&q);
+        sqlite3_stmt *stmt = prepare_query(&q);
+        if (!stmt) {
             if (topk) sqlite3_exec(ngdb_conn, "RELEASE ng_topk", NULL, NULL, NULL);
             return NG_E_IO;
         }
-        for (size_t i = 0; i < q.n; i++) {             /* n <= SQ_MAX_PARAMS */
-            int idx = (int) i + 1;
-            if (q.params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q.params[i].num);
-            else sqlite3_bind_text(stmt, idx, q.params[i].text, -1, SQLITE_TRANSIENT);
-        }
-        sq_free(&q);                                   /* bind copied the text */
 
         bool ok;
         if (do_count) {
@@ -484,18 +484,8 @@ ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, u
     sq_query_t q = {0};
     ng_status_t st = sq_build_mode(&q, filter, SQ_MODE_PUBKEYS, 0);
     if (st != NG_OK) { sq_free(&q); return st; }
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
-        sq_free(&q);
-        return NG_E_IO;
-    }
-    for (size_t i = 0; i < q.n; i++) {
-        int idx = (int) i + 1;
-        if (q.params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q.params[i].num);
-        else sqlite3_bind_text(stmt, idx, q.params[i].text, -1, SQLITE_TRANSIENT);
-    }
-    sq_free(&q);
+    sqlite3_stmt *stmt = prepare_query(&q);
+    if (!stmt) return NG_E_IO;
     int rc, n = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const uint8_t *pk = (const uint8_t *) sqlite3_column_blob(stmt, 1);
