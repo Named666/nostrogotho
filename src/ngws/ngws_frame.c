@@ -138,7 +138,7 @@ void nx_ws_feed(sockx_t *x, unsigned char *data, size_t len) {
     }
     if (us_socket_is_closed(0, x->s) || x->state != ST_WS) { if (owned) x->rlen = 0; return; }
     size_t rest = n - off;
-    if (!rest) { x->rlen = 0; if (x->rbuf && x->rcap > 65536) { free(x->rbuf); x->rbuf = NULL; x->rcap = 0; } return; }
+    if (!rest) { x->rlen = 0; free(x->rbuf); x->rbuf = NULL; x->rcap = 0; return; }   /* idle: hold no input buffer */
     if (owned) { memmove(x->rbuf, x->rbuf + off, rest); x->rlen = rest; }
     else {
         size_t need = frame_need(x, b + off, rest);
