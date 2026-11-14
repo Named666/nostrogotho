@@ -310,17 +310,6 @@ const char *json_array_get_string(const json_value_t *values, size_t count, size
     return values[index].value.string_val;
 }
 
-bool json_array_get_number(const json_value_t *values, size_t count, size_t index, long long *out) {
-    if (index >= count) {
-        return false;
-    }
-    if (values[index].type != JSON_TYPE_NUMBER) {
-        return false;
-    }
-    *out = values[index].value.number_val;
-    return true;
-}
-
 /* ============================================================================
  * JSON Builder Implementation
  * ============================================================================ */
@@ -424,11 +413,6 @@ static void json_builder_add_comma(json_builder_t *builder) {
     char last = builder->buf[builder->pos - 1];
     if (builder->pos > 1 && last != '[' && last != '{' && last != ':')
         json_builder_byte(builder, ',');
-}
-
-void json_builder_append_null(json_builder_t *builder) {
-    json_builder_add_comma(builder);
-    json_builder_raw(builder, "null", 4);
 }
 
 void json_builder_append_bool(json_builder_t *builder, bool value) {

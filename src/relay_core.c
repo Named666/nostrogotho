@@ -111,7 +111,6 @@ static size_t query_bytes_max;    /* 0 = unlimited */
 void relay_core_set_query_bytes_max(size_t n) { query_bytes_max = n; }
 
 void relay_core_set_debug(bool enabled) { debug_logging = enabled; }
-bool relay_core_debug(void) { return debug_logging; }
 storage_context_t *relay_core_storage(void) { return storage_ctx; }
 void relay_core_set_publisher(relay_publish_fn fn) { publisher = fn; }
 void relay_core_set_admission(relay_admit_fn fn) { admission = fn; }

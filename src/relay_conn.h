@@ -51,7 +51,6 @@ void relay_conn_close(relay_conn_t *conn);
 /* Send ["EVENT",<sub_json>,<body>]. sub_json is the already JSON-encoded
  * subscription id (with quotes). Takes no reference on body unless queued. */
 void relay_conn_send_event(relay_conn_t *conn, const char *sub_json, size_t sub_len, relay_body_t *body);
-uint64_t relay_conn_id(const relay_conn_t *conn);
 const char *relay_conn_peer(const relay_conn_t *conn);
 
 /* Per-connection plugin storage (O(1), no global lists/locks). Allocate a

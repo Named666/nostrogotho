@@ -81,10 +81,6 @@ nip01_process_result_t nip_plugin_reject(const char *message) {
     return result;
 }
 
-bool nip_plugin_store(storage_context_t *storage, const event_t *event) {
-    return storage && storage->insert_record && storage->insert_record(event);
-}
-
 nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage,
                                                       const event_t *event) {
     if (!storage || !storage->insert_record) {

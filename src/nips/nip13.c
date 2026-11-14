@@ -2,7 +2,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include "crypto.h"
-#include "nip13.h"
 #include "nip_event.h"
 #include "nip_plugin.h"
 #include <stdio.h>
@@ -53,14 +52,6 @@ static int nip13_committed_target(const event_t *event) {
         free(name);
     }
     return target;
-}
-
-bool nip13_meets_difficulty(const event_t *event, int minimum_difficulty) {
-    if (minimum_difficulty <= 0) return true;
-
-    int committed = nip13_committed_target(event);
-    int required = committed > minimum_difficulty ? committed : minimum_difficulty;
-    return count_leading_zero_bits(event->id) >= required;
 }
 
 /* ============================================================================

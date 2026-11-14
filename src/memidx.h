@@ -60,13 +60,10 @@ typedef struct {
 /* Lifecycle (single-threaded: before readers / the writer start, after they stop). */
 bool memidx_open(const memidx_config_t *cfg);
 void memidx_close(void);
-bool memidx_is_open(void);
 
 /* Letters currently indexed: configured and not degraded by the memory cap.
  * Any thread. */
 bool memidx_letter(char c);
-/* The currently indexed letters as a string (e.g. "epaqtdhk"); writer / init thread. */
-const char *memidx_letters(void);
 
 /* ---- writer ---- */
 /* Index one stored event. false on OOM (the index is then incomplete: the

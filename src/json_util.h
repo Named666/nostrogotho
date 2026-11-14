@@ -107,18 +107,6 @@ void json_array_free(json_value_t *values, size_t count);
  */
 const char *json_array_get_string(const json_value_t *values, size_t count, size_t index);
 
-/* Get number value from parsed JSON array
- * 
- * Args:
- *   values - Array of parsed JSON values
- *   count - Number of values in array
- *   index - Index to access
- *   out - Output pointer for value
- * 
- * Returns: true if value exists and is a number, false otherwise
- */
-bool json_array_get_number(const json_value_t *values, size_t count, size_t index, long long *out);
-
 /* ============================================================================
  * JSON Array Builder
  * 
@@ -140,12 +128,6 @@ typedef struct {
  * Args: builder - Uninitialized builder structure
  */
 void json_builder_start(json_builder_t *builder);
-
-/* Append a null value
- * 
- * Args: builder - Builder being constructed
- */
-void json_builder_append_null(json_builder_t *builder);
 
 /* Append a boolean value
  * 

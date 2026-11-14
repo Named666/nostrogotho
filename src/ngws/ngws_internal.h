@@ -70,7 +70,6 @@ struct ngws_loop {
     sockx_t *dirty;                     /* head of dirty list */
     sockx_t *all;                       /* open WebSockets */
     sockx_t *blog;                      /* sockets with a backlog buffer (obuf) */
-    size_t n_open;
     arena_chunk_t *arena, *arena_cur;
     ionode_t *nodes; uint32_t n_nodes, cap_nodes;
     defer_t *defer; uint32_t n_defer, cap_defer;

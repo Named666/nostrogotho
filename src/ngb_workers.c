@@ -56,7 +56,6 @@ static ng_atomic_bool stopping;
 static ng_atomic_ullong stat_preverified;
 static loop_ctx_t loop_ctx[NG_MAX_IO_LOOPS];
 
-int ngb_workers_count(void) { return n_workers; }
 unsigned long long ngb_workers_preverified(void) { return ng_atomic_load(&stat_preverified); }
 size_t ngb_worker_queued_bytes(int w) { return ng_atomic_load_explicit(&workers[w].qbytes, NG_MO_RELAXED); }
 size_t ngb_message_cost(size_t len) { return sizeof(job_t) + len + 1; }

@@ -14,7 +14,6 @@ void relay_conn_close(relay_conn_t *conn) {
     if (conn && !ng_atomic_load(&conn->closed)) conn->ops->close(conn);
 }
 
-uint64_t relay_conn_id(const relay_conn_t *conn) { return conn ? conn->id : 0; }
 const char *relay_conn_peer(const relay_conn_t *conn) { return conn ? conn->peer : ""; }
 
 int relay_conn_slot_alloc(void) {

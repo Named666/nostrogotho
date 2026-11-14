@@ -32,7 +32,6 @@
 int ngb_workers_start(int n, bool batch_verify);
 /* Wake every worker, let it finish queued jobs, join it. */
 void ngb_workers_stop(void);
-int ngb_workers_count(void);
 
 /* --- I/O loop thread only ------------------------------------------------ */
 /* Queue on_open for c (takes a connection reference on success). */

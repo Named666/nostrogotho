@@ -669,8 +669,6 @@ static void mark_broken(void) {
         fprintf(stderr, "memidx: out of memory updating the tag index; tag queries use the JSON scan until restart\n");
 }
 
-const char *memidx_letters(void) { return letters_str; }
-
 bool memidx_add_event(const char *tags_json, size_t len, uint64_t seq, uint32_t created_at, int kind) {
     if (!mi_open || seq >= ((uint64_t) 1 << 48)) return false;
     bool ok = true;
@@ -986,8 +984,6 @@ bool memidx_open(const memidx_config_t *cfg) {
     mi_open = true;
     return true;
 }
-
-bool memidx_is_open(void) { return mi_open; }
 
 void memidx_close(void) {
     if (!mi_open) return;

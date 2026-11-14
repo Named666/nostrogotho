@@ -22,14 +22,9 @@
 #include "libusockets.h"
 #include "../platform/ng_alloc.h"
 
-bool ngws_is_closed(ngws_socket_t *ws) {
-    struct us_socket_t *s = (struct us_socket_t *) ws;
-    return us_socket_is_closed(0, s) || X(s)->state != ST_WS;
-}
 size_t ngws_buffered(ngws_socket_t *ws) { sockx_t *x = X((struct us_socket_t *) ws); return x->olen - x->ooff + x->qbytes; }
 void *ngws_user(ngws_socket_t *ws) { return (char *) X((struct us_socket_t *) ws) + USER_OFF; }
 ngws_loop_t *ngws_socket_loop(ngws_socket_t *ws) { return X((struct us_socket_t *) ws)->loop; }
-ngws_server_t *ngws_socket_server(ngws_socket_t *ws) { return X((struct us_socket_t *) ws)->loop->srv; }
 
 int ngws_remote_address(ngws_socket_t *ws, char *buf, size_t cap) {
     struct us_socket_t *s = (struct us_socket_t *) ws;
@@ -46,13 +41,13 @@ void nx_ws_list_add(sockx_t *x) {
     ngws_loop_t *l = x->loop;
     x->aprev = NULL; x->anext = l->all;
     if (l->all) l->all->aprev = x;
-    l->all = x; l->n_open++;
+    l->all = x;
 }
 void nx_ws_list_del(sockx_t *x) {
     ngws_loop_t *l = x->loop;
     if (x->aprev) x->aprev->anext = x->anext; else if (l->all == x) l->all = x->anext; else return;
     if (x->anext) x->anext->aprev = x->aprev;
-    x->aprev = x->anext = NULL; l->n_open--;
+    x->aprev = x->anext = NULL;
 }
 
 static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length) {
@@ -233,7 +228,6 @@ void ngws_loop_foreach(ngws_loop_t *l, void (*fn)(ngws_socket_t *, void *), void
     }
 }
 int ngws_loop_index(ngws_loop_t *l) { return l->idx; }
-size_t ngws_loop_count(ngws_loop_t *l) { return l->n_open; }
 void *ngws_loop_get_user(ngws_loop_t *l) { return l->user; }
 void ngws_loop_set_user(ngws_loop_t *l, void *p) { l->user = p; }
 
@@ -369,7 +363,6 @@ void ngws_server_free(ngws_server_t *srv) {
 }
 
 void *ngws_server_user(ngws_server_t *srv) { return srv->cfg.user; }
-int ngws_server_loop_count(ngws_server_t *srv) { return srv->n_loops; }
 size_t ngws_server_backlog_bytes(ngws_server_t *srv) { return ng_atomic_load_explicit(&srv->backlog_total, NG_MO_RELAXED); }
 void ngws_server_stats(ngws_server_t *srv, ngws_stats_t *o) {
     o->backlog_bytes = ngws_server_backlog_bytes(srv);

@@ -87,7 +87,6 @@ void ngws_server_free(ngws_server_t *srv);
 /* listen(2) backlog actually requested for cfg (see listen_backlog). */
 int ngws_listen_backlog(const ngws_config_t *cfg);
 void *ngws_server_user(ngws_server_t *srv);
-int ngws_server_loop_count(ngws_server_t *srv);
 /* Bytes currently held in socket backlogs (capacity of the private output
  * buffers, i.e. memory), all loops. Any thread, relaxed. */
 size_t ngws_server_backlog_bytes(ngws_server_t *srv);
@@ -110,11 +109,9 @@ int  ngws_send_raw3(ngws_socket_t *ws, const void *a, size_t an, const void *b, 
 int  ngws_send_shared(ngws_socket_t *ws, const void *frame, size_t len);
 void ngws_close(ngws_socket_t *ws, int code, const char *reason);  /* graceful */
 void ngws_terminate(ngws_socket_t *ws);                            /* abrupt */
-bool ngws_is_closed(ngws_socket_t *ws);
 size_t ngws_buffered(ngws_socket_t *ws);
 void *ngws_user(ngws_socket_t *ws);
 ngws_loop_t *ngws_socket_loop(ngws_socket_t *ws);
-ngws_server_t *ngws_socket_server(ngws_socket_t *ws);
 /* Peer address as text, e.g. "1.2.3.4:5678". Returns length. */
 int  ngws_remote_address(ngws_socket_t *ws, char *buf, size_t cap);
 /* Plain-HTTP reply; socket is closed after the body is flushed. */
@@ -131,7 +128,6 @@ void *ngws_loop_alloc_frame(ngws_loop_t *loop, size_t n);
  * (e.g. to drop a reference on a frame passed to ngws_send_shared). */
 void ngws_loop_defer(ngws_loop_t *loop, void (*fn)(void *), void *arg);
 int  ngws_loop_index(ngws_loop_t *loop);
-size_t ngws_loop_count(ngws_loop_t *loop);         /* open WebSockets */
 void *ngws_loop_get_user(ngws_loop_t *loop);
 void ngws_loop_set_user(ngws_loop_t *loop, void *p);
 

@@ -38,7 +38,6 @@
 void relay_core_configure(storage_context_t *storage, const char *relay_url,
                           int min_pow, time_t lower_limit, time_t upper_limit);
 void relay_core_set_debug(bool enabled);
-bool relay_core_debug(void);
 
 void relay_core_on_open(relay_conn_t *conn);
 /* payload must be NUL-terminated at payload[len]; caller keeps ownership. */

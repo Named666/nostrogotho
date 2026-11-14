@@ -187,7 +187,5 @@ nip01_process_result_t nip_plugin_store_and_broadcast(storage_context_t *storage
 nip01_process_result_t nip_plugin_store_only(storage_context_t *storage,
                                              const event_t *event);
 
-/* Thin wrapper over storage->insert_record. */
-bool nip_plugin_store(storage_context_t *storage, const event_t *event);
 
 #endif /* NIP_PLUGIN_H_ */
