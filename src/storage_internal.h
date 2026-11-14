@@ -63,6 +63,13 @@ bool ngdb_search_enabled(void);
 int ngdb_tag_cap(void);
 bool ngdb_fts_flush(void);
 void ngdb_fts_reset(void);
+/* tag_index = memory (storage_sqlite.c): the database runs memidx; the
+ * next event seq; a just-inserted seq (rollback bookkeeping); apply the
+ * deletes of a committed autocommit statement to the index. */
+bool ngdb_tag_memory(void);
+uint64_t ngdb_seq_take(void);
+void ngdb_mem_inserted(uint64_t seq);
+void ngdb_mem_settle(void);
 
 /* storage_read.c */
 event_t *ngdb_get_event_by_id(const char *id);

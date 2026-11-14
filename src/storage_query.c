@@ -136,6 +136,8 @@ bool sq_tag_indexed(const char *name) {
 
 static NG_THREAD_LOCAL bool sq_overflow;
 void sq_set_overflow(bool on) { sq_overflow = on; }
+static NG_THREAD_LOCAL bool sq_seq_first;
+void sq_set_seq_param(bool on) { sq_seq_first = on; }
 
 bool sq_is_hex64(const char *s, size_t len) {
     if (len != 64) return false;
@@ -259,6 +261,7 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     const char *sep = " WHERE ";
 #define NEXT() (sq_sql(q, sep), sep = " AND ")
 
+    if (sq_seq_first) { NEXT(); sq_sql(q, "e.seq = ?"); sq_int(q, 0); }   /* rebound per candidate */
     if (tagged && !sq_overflow) { NEXT(); sq_tag_match(q, "t", &f->tags[drive]); }
     if (tagged) { NEXT(); sq_tag_json(q, "e", &f->tags[drive]); }   /* key collisions: exact recheck */
     if (f->ids_count > 0) {

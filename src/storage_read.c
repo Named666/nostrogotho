@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "json_util.h"
+#include "memidx.h"
 #include "storage_query.h"
 
 /* get_event_by_id - Retrieve a single event by ID from database
@@ -93,33 +94,190 @@ event_t *ngdb_get_event_by_id(const char *id) {
 /* Stream one compiled query's rows to sender as ["EVENT", sub, {...}]. */
 /* The statement is bound with LIMIT limit+1: a row past the limit only
  * proves there are more (NIP-67) and is not sent. */
+static void render_row(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub) {
+    event_t event = {0};
+    snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
+    snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
+    event.created_at = (time_t) sqlite3_column_int64(stmt, 2);
+    event.kind = sqlite3_column_int(stmt, 3);
+    event.tags_json = (char *) sqlite3_column_text(stmt, 4);
+    event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
+    event.content = (char *) sqlite3_column_text(stmt, 5);
+    event.content_len = event.content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
+    snprintf(event.sig, sizeof(event.sig), "%s", (const char *) sqlite3_column_text(stmt, 6));
+    json_builder_t *builder = json_builder_scratch(JSON_SCRATCH_QUERY);
+    json_builder_append_string(builder, "EVENT");
+    json_builder_append_string(builder, sub);
+    json_serialize_event(&event, builder);
+    sender(json_builder_finish(builder), &event);   /* NULL = could not render */
+}
+
 static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, const char *sub, int limit, bool *more) {
     int rc, fetched = 0;
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (++fetched > limit) { *more = true; return true; }
-        event_t event = {0};
-        snprintf(event.id, sizeof(event.id), "%s", (const char *) sqlite3_column_text(stmt, 0));
-        snprintf(event.pubkey, sizeof(event.pubkey), "%s", (const char *) sqlite3_column_text(stmt, 1));
-        event.created_at = (time_t) sqlite3_column_int64(stmt, 2);
-        event.kind = sqlite3_column_int(stmt, 3);
-        event.tags_json = (char *) sqlite3_column_text(stmt, 4);
-        event.tags_json_len = event.tags_json ? strlen(event.tags_json) : 0;
-        event.content = (char *) sqlite3_column_text(stmt, 5);
-        event.content_len = event.content ? (size_t) sqlite3_column_bytes(stmt, 5) : 0;
-        snprintf(event.sig, sizeof(event.sig), "%s", (const char *) sqlite3_column_text(stmt, 6));
-        json_builder_t *builder = json_builder_scratch(JSON_SCRATCH_QUERY);
-        json_builder_append_string(builder, "EVENT");
-        json_builder_append_string(builder, sub);
-        json_serialize_event(&event, builder);
-        sender(json_builder_finish(builder), &event);   /* NULL = could not render */
+        render_row(stmt, sender, sub);
     }
     if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
     return true;
 }
 
+/* NIP-45 HyperLogLog register update for one 32-byte pubkey. */
+static void hll_add(uint8_t hll[256], int offset, const uint8_t *pk) {
+    unsigned zeros = 0;
+    for (int b = offset + 1; b < 32; b++) {
+        if (pk[b] == 0) { zeros += 8; continue; }
+        for (int bit = 7; bit >= 0 && !(pk[b] >> bit & 1); bit--) zeros++;
+        break;
+    }
+    uint8_t v = (uint8_t) (zeros + 1);
+    if (v > hll[pk[offset]]) hll[pk[offset]] = v;
+}
+
+/* ---------------------------------------------- tag_index = memory --- */
+/* Above this many postings for the driving tag, a filter that also names
+ * authors is cheaper through the (pubkey, kind) index with the JSON tag
+ * check than candidate by candidate. */
+#define MEM_AUTHORS_MAX_POSTINGS 2000
+
+/* The tag condition memidx drives this filter with (fewest postings), or
+ * f->tags_count: the filter takes the SQL path (no indexed letter, ids,
+ * search, or authors with a big tag). */
+static size_t mem_drive(const filter_t *f) {
+    if (!ngdb_tag_memory() || f->search || f->ids_count) return f->tags_count;
+    size_t drive = f->tags_count, best = 0;
+    for (size_t t = 0; t < f->tags_count; t++) {
+        const tag_t *tg = &f->tags[t];
+        if (tg->count < 2 || tg->count - 1 > 256 || !tg->elements[0] || !memidx_letter(tg->elements[0][0]) ||
+            tg->elements[0][1] != '\0') continue;
+        size_t est = memidx_estimate(tg->elements[0][0], tg->elements + 1, tg->count - 1);
+        if (drive == f->tags_count || est < best) { drive = t; best = est; }
+    }
+    if (drive < f->tags_count && f->authors_count && best > MEM_AUTHORS_MAX_POSTINGS) return f->tags_count;
+    return drive;
+}
+
+typedef struct { uint64_t seq; char id[65]; } mem_grp_t;
+static int grp_cmp(const void *a, const void *b) {
+    return strcmp(((const mem_grp_t *) a)->id, ((const mem_grp_t *) b)->id);
+}
+
+/* One filter driven by memidx. Candidates come newest first (created_at,
+ * then seq, DESC; kinds and since/until already applied on the posting),
+ * page by page behind a (created_at, seq) cursor so concurrent inserts
+ * neither repeat nor skip one. Each is re-read by seq with the whole
+ * filter compiled in SQL (sq_set_seq_param): the exact tag JSON match, the
+ * other conditions, and the event still existing. SQ_MODE_ROWS streams up
+ * to limit rows (NIP-01 ties: equal created_at lowest id first, so rows
+ * of one created_at are gathered, sorted by id and re-read to render);
+ * SQ_MODE_COUNT counts; SQ_MODE_PUBKEYS feeds hll. */
+static ng_status_t mem_filter(const filter_t *f, size_t drive, sq_mode_t mode, int limit,
+                              send_records_callback_t sender, const char *sub, bool *more,
+                              int *count, uint8_t *hll, int hll_offset) {
+    sq_query_t q = {0};
+    sq_set_seq_param(true);
+    ng_status_t st = sq_build_mode(&q, f, mode == SQ_MODE_ROWS ? SQ_MODE_ROWS : SQ_MODE_PUBKEYS, 1);
+    sq_set_seq_param(false);
+    if (st != NG_OK) { sq_free(&q); return st; }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(ngdb_conn, q.sql, (int) q.len, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        sq_free(&q);
+        return NG_E_IO;
+    }
+    for (size_t i = 0; i < q.n; i++) {
+        int idx = (int) i + 1;
+        if (q.params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q.params[i].num);
+        else sqlite3_bind_text(stmt, idx, q.params[i].text, -1, SQLITE_TRANSIENT);
+    }
+    sq_free(&q);
+
+    const tag_t *tg = &f->tags[drive];
+    const char letter = tg->elements[0][0];
+    size_t window = mode == SQ_MODE_ROWS ? (size_t) limit * 2 + 16 : 4096;
+    memidx_cand_t *c = NULL;
+    mem_grp_t *g = NULL;
+    size_t gn = 0, gcap = 0;
+    uint32_t gca = 0, cur_ca = 0;
+    uint64_t cur_seq = 0;
+    bool have_cur = false, done = false;
+    int sent = 0, n_match = 0;
+    st = NG_OK;
+    while (!done && st == NG_OK) {
+        memidx_cand_t *nc = (memidx_cand_t *) ng_realloc_array(c, window, sizeof(*c));
+        if (!nc) { st = NG_E_NOMEM; break; }
+        c = nc;
+        size_t got = 0;
+        int64_t until = f->until > 0 ? (int64_t) f->until : 0;
+        if (have_cur && cur_ca > 0 && (until == 0 || (int64_t) cur_ca < until)) until = cur_ca;
+        st = memidx_candidates(letter, tg->elements + 1, tg->count - 1, f->kinds, f->kinds_count,
+                               f->since > 0 ? (int64_t) f->since : 0, until, 0, window, c, &got);
+        if (st != NG_OK) break;                          /* NG_E_UNKNOWN: letter dropped meanwhile */
+        bool progressed = false;
+        for (size_t i = 0; i < got && !done && st == NG_OK; i++) {
+            if (have_cur && (c[i].ca > cur_ca || (c[i].ca == cur_ca && c[i].seq >= cur_seq))) continue;
+            progressed = true;
+            if (mode == SQ_MODE_ROWS && gn && c[i].ca != gca) {
+                /* flush the previous created_at group, lowest id first */
+                if (gn > 1) qsort(g, gn, sizeof(*g), grp_cmp);
+                for (size_t z = 0; z < gn; z++) {
+                    if (sent >= limit) { *more = true; done = true; break; }
+                    sqlite3_bind_int64(stmt, 1, (sqlite3_int64) g[z].seq);
+                    if (sqlite3_step(stmt) == SQLITE_ROW) { render_row(stmt, sender, sub); sent++; }
+                    sqlite3_reset(stmt);
+                }
+                gn = 0;
+                if (done) break;
+            }
+            sqlite3_bind_int64(stmt, 1, (sqlite3_int64) c[i].seq);
+            int rc = sqlite3_step(stmt);
+            if (rc == SQLITE_ROW) {
+                if (mode == SQ_MODE_ROWS) {
+                    if (gn == gcap) {
+                        size_t ncap = ng_grow_cap(gcap, gn + 1, 8);
+                        mem_grp_t *ng = (mem_grp_t *) ng_realloc_array(g, ncap, sizeof(*g));
+                        if (!ng) { st = NG_E_NOMEM; sqlite3_reset(stmt); break; }
+                        g = ng; gcap = ncap;
+                    }
+                    g[gn].seq = c[i].seq;
+                    snprintf(g[gn].id, sizeof(g[gn].id), "%s", (const char *) sqlite3_column_text(stmt, 0));
+                    gn++;
+                    gca = c[i].ca;
+                } else {
+                    n_match++;
+                    const uint8_t *pk = (const uint8_t *) sqlite3_column_blob(stmt, 1);
+                    if (hll && pk && sqlite3_column_bytes(stmt, 1) == 32) hll_add(hll, hll_offset, pk);
+                }
+            } else if (rc != SQLITE_DONE) {
+                fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+                st = NG_E_IO;
+            }
+            sqlite3_reset(stmt);
+        }
+        if (done || st != NG_OK || got < window) break;
+        cur_ca = c[got - 1].ca; cur_seq = c[got - 1].seq; have_cur = true;
+        if (!progressed || window < ((size_t) 1 << 16)) window *= 4;   /* a huge created_at tie: widen */
+    }
+    if (st == NG_OK && mode == SQ_MODE_ROWS && !done && gn) {
+        if (gn > 1) qsort(g, gn, sizeof(*g), grp_cmp);
+        for (size_t z = 0; z < gn; z++) {
+            if (sent >= limit) { *more = true; break; }
+            sqlite3_bind_int64(stmt, 1, (sqlite3_int64) g[z].seq);
+            if (sqlite3_step(stmt) == SQLITE_ROW) { render_row(stmt, sender, sub); sent++; }
+            sqlite3_reset(stmt);
+        }
+    }
+    free(c);
+    free(g);
+    sqlite3_finalize(stmt);
+    if (count) *count = n_match;
+    return st;
+}
+
 /* Whether any stored event overflowed tag_index_max_per_event (see
  * sq_set_overflow); probed once per query call that has tag conditions. */
 static bool tag_overflow_present(void) {
+    if (ngdb_tag_memory()) return false;                  /* no tag tables */
     sqlite3_stmt *st = NULL;
     bool yes = false;
     if (sqlite3_prepare_v2(ngdb_conn, "SELECT 1 FROM tag_overflow LIMIT 1", -1, &st, NULL) == SQLITE_OK)
@@ -167,6 +325,15 @@ ng_status_t ngdb_send_records(send_records_callback_t sender, const char *sub,
         int limit = !filter->limit_set ? ng_limits.default_limit
                   : filter->limit < ng_limits.max_limit ? filter->limit : ng_limits.max_limit;
 
+        size_t drive = mem_drive(filter);
+        if (drive < filter->tags_count) {
+            int n = 0;
+            ng_status_t ms = mem_filter(filter, drive, do_count ? SQ_MODE_COUNT : SQ_MODE_ROWS, limit,
+                                        sender, sub, &more, &n, NULL, 0);
+            if (ms == NG_OK) { total_count += n; continue; }
+            if (ms != NG_E_UNKNOWN) return ms;
+            /* the letter was dropped by the memory cap meanwhile: SQL path */
+        }
         sq_query_t q = {0};
         ng_status_t st = sq_build(&q, filter, do_count, limit + 1);
         if (st != NG_OK) {
@@ -214,6 +381,14 @@ ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, u
     memset(hll, 0, 256);
     *out_count = 0;
     sq_set_overflow(filter->tags_count > 0 && tag_overflow_present());
+    size_t drive = mem_drive(filter);
+    if (drive < filter->tags_count) {
+        int n = 0;
+        ng_status_t ms = mem_filter(filter, drive, SQ_MODE_PUBKEYS, 0, NULL, NULL, NULL, &n, hll, offset);
+        if (ms == NG_OK) { *out_count = n; return NG_OK; }
+        if (ms != NG_E_UNKNOWN) return ms;
+        memset(hll, 0, 256);
+    }
     sq_query_t q = {0};
     ng_status_t st = sq_build_mode(&q, filter, SQ_MODE_PUBKEYS, 0);
     if (st != NG_OK) { sq_free(&q); return st; }
@@ -234,14 +409,7 @@ ng_status_t ngdb_count_hll(const filter_t *filter, int offset, int *out_count, u
         const uint8_t *pk = (const uint8_t *) sqlite3_column_blob(stmt, 1);
         if (!pk || sqlite3_column_bytes(stmt, 1) != 32) continue;
         n++;
-        unsigned zeros = 0;
-        for (int b = offset + 1; b < 32; b++) {
-            if (pk[b] == 0) { zeros += 8; continue; }
-            for (int bit = 7; bit >= 0 && !(pk[b] >> bit & 1); bit--) zeros++;
-            break;
-        }
-        uint8_t v = (uint8_t) (zeros + 1);
-        if (v > hll[pk[offset]]) hll[pk[offset]] = v;
+        hll_add(hll, offset, pk);
     }
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn)); return NG_E_IO; }

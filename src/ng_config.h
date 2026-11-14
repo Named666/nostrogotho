@@ -44,6 +44,9 @@ typedef struct {
     int search;                 /* search: 1 = NIP-50 full-text index on (default), 0 = off */
     char tag_index_letters[64]; /* tag_index_letters: tag names the tag table indexes */
     int tag_index_max_per_event;/* tag_index_max_per_event: indexed tags per event */
+    char tag_index[16];         /* tag_index: "memory" (default) or "sqlite" */
+    int tag_index_memory_mb;    /* tag_index_memory_mb: memory index cap, 0 = none */
+    int tag_index_snapshot_secs;/* tag_index_snapshot_secs: memory index snapshot interval, 0 = shutdown only */
 } ng_limits_t;
 
 /* Relay identity and policy (NIP-11 document, NIP-42 relay tag, NIP-62).

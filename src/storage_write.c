@@ -8,6 +8,7 @@
 
 #include "json_lite.h"
 #include "storage_query.h"
+#include "memidx.h"
 #include "nips/nip40.h"
 #include "nips/nip_event.h"
 
@@ -50,7 +51,8 @@ static bool tag_rows_reserve(size_t rows, size_t bytes) {
  * back vanish leaves it 1, which only costs an extra point lookup. */
 static NG_THREAD_LOCAL int vanished_state = -1;
 
-/* NIP-50 bulk feed. seq is INTEGER PRIMARY KEY (max + 1 on insert), and
+/* NIP-50 bulk feed. seq is INTEGER PRIMARY KEY, increasing on insert (max
+ * + 1, or ngdb_seq_take in tag_index = memory), and
  * every DELETE on event flushes first, so the rows inserted since the last
  * flush are exactly seq >= fts_pending: one INSERT ... SELECT feeds them.
  * 0 = nothing pending. */
@@ -210,6 +212,10 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
     sqlite3_bind_text(stmt, 5, ev->tags_json ? ev->tags_json : "[]", -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 6, ev->content ? ev->content : "", -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 7, ev->sig, -1, SQLITE_STATIC);
+    const bool mem = ngdb_tag_memory();
+    const uint64_t mseq = mem ? ngdb_seq_take() : 0;
+    if (mem) sqlite3_bind_int64(stmt, 8, (sqlite3_int64) mseq);
+    else sqlite3_bind_null(stmt, 8);
     rc = sqlite3_step(stmt);
     int changes = sqlite3_changes(ngdb_conn);
     sqlite3_reset(stmt);
@@ -220,10 +226,17 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
     if (changes == 0) return STORAGE_PUT_DUPLICATE;   /* ON CONFLICT(id) DO NOTHING */
     /* The event row exists: index its tags. A
      * failed tag index fails the insert; the writer rolls the batch back. */
-    sqlite3_int64 seq = sqlite3_last_insert_rowid(ngdb_conn);
+    sqlite3_int64 seq = mem ? (sqlite3_int64) mseq : sqlite3_last_insert_rowid(ngdb_conn);
     if (ngdb_search_enabled() && !fts_pending && ev->content && ev->content[0] && ng_search_kind(ev->kind))
         fts_pending = seq;
-    if (!store_tags(ev, seq)) {
+    if (mem) {
+        /* On OOM memidx marks itself broken and every tag query takes the
+         * JSON scan until restart: the event is stored and found either way. */
+        ngdb_mem_inserted(mseq);
+        (void) memidx_add_event(ev->tags_json, ev->tags_json ? ev->tags_json_len : 0, mseq,
+                                ev->created_at < 0 ? 0u : (uint64_t) ev->created_at > UINT32_MAX ? UINT32_MAX
+                                                        : (uint32_t) ev->created_at, ev->kind);
+    } else if (!store_tags(ev, seq)) {
         /* Undo the row (the delete trigger drops any tag rows written). */
         (void) ngdb_fts_flush();
         sqlite3_stmt *del = ngdb_ps(PS_DEL_ID);
@@ -232,6 +245,7 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
             if (sqlite3_step(del) != SQLITE_DONE) fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
             sqlite3_reset(del);
         }
+        ngdb_mem_settle();
         return STORAGE_PUT_FAILED;
     }
     /* Outside a batch transaction (tests, tools): feed it now. */
@@ -308,6 +322,7 @@ storage_admit_t ngdb_replaceable_admit(const event_t *ev, const char *dtag) {
             sqlite3_reset(del);
         }
         if (!del && nv) verdict = STORAGE_ADMIT_FAILED;
+        ngdb_mem_settle();
     }
     free(victims);
     return verdict;
@@ -321,6 +336,7 @@ static bool run_delete(sqlite3_stmt *stmt, size_t *deleted) {
     if (!ok) fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
     else if (deleted) *deleted = (size_t) sqlite3_changes(ngdb_conn);
     sqlite3_finalize(stmt);
+    ngdb_mem_settle();
     return ok;
 }
 
@@ -467,6 +483,82 @@ bool ngdb_delete_all_events_by_pubkey(const char *pubkey, time_t created_at,
 }
 
 
+/* tag_index = memory: delete every stored event whose tag `name` has the
+ * first value `value` (and, kind > 0, of that kind), calling forget with
+ * each id first. memidx gives the candidates (the writer is the only
+ * mutator, so one call sees them all); each is rechecked in SQL with the
+ * exact JSON match, then deleted by seq. A letter memidx does not index
+ * (or a broken index) scans the stored JSON instead. */
+#define TAG_JSON_MATCH "EXISTS (SELECT 1 FROM json_each(x.tags) j WHERE json_extract(j.value, '$[0]') = ?1 AND json_extract(j.value, '$[1]') = ?2)"
+static bool mem_delete_tagged(char name, const char *value, int kind, void (*forget)(const char *hex_id),
+                              size_t *deleted) {
+    char n[2] = { name, '\0' };
+    char *vals[1] = { (char *) value };
+    size_t total = 0, got = 0;
+    *deleted = 0;
+    memidx_cand_t *c = NULL;
+    ng_status_t st = NG_E_UNKNOWN;
+    if (memidx_letter(name)) {
+        size_t est = memidx_estimate(name, vals, 1) + 1;
+        c = (memidx_cand_t *) ng_malloc_array(est, sizeof(*c));
+        if (!c) return false;
+        st = memidx_candidates(name, vals, 1, kind > 0 ? &kind : NULL, kind > 0 ? 1 : 0, 0, 0, 0, est, c, &got);
+        if (st == NG_E_NOMEM) { free(c); return false; }
+    }
+    sqlite3_stmt *sel = NULL, *del = NULL;
+    bool ok;
+    if (st == NG_OK) {
+        ok = prepare(kind > 0 ? "SELECT lower(hex(x.id)) FROM event x WHERE x.seq = ?3 AND x.kind = ?4 AND " TAG_JSON_MATCH
+                              : "SELECT lower(hex(x.id)) FROM event x WHERE x.seq = ?3 AND " TAG_JSON_MATCH, &sel) &&
+             prepare("DELETE FROM event WHERE seq = ?", &del) && ngdb_fts_flush();
+        for (size_t i = 0; ok && i < got; i++) {
+            sqlite3_bind_text(sel, 1, n, 1, SQLITE_STATIC);
+            sqlite3_bind_text(sel, 2, value, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(sel, 3, (sqlite3_int64) c[i].seq);
+            if (kind > 0) sqlite3_bind_int(sel, 4, kind);
+            int rc = sqlite3_step(sel);
+            if (rc == SQLITE_ROW) {
+                const char *id = (const char *) sqlite3_column_text(sel, 0);
+                if (forget && id) forget(id);
+                sqlite3_bind_int64(del, 1, (sqlite3_int64) c[i].seq);
+                ok = sqlite3_step(del) == SQLITE_DONE;
+                total += (size_t) sqlite3_changes(ngdb_conn);
+                sqlite3_reset(del);
+            } else if (rc != SQLITE_DONE) ok = false;
+            sqlite3_reset(sel);
+        }
+        if (!ok) fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        sqlite3_finalize(sel);
+        sqlite3_finalize(del);
+        free(c);
+        ngdb_mem_settle();
+        *deleted = total;
+        return ok;
+    }
+    free(c);
+    if (forget) {
+        if (!prepare(kind > 0 ? "SELECT lower(hex(x.id)) FROM event x WHERE x.kind = ?3 AND " TAG_JSON_MATCH
+                              : "SELECT lower(hex(x.id)) FROM event x WHERE " TAG_JSON_MATCH, &sel)) return false;
+        sqlite3_bind_text(sel, 1, n, 1, SQLITE_STATIC);
+        sqlite3_bind_text(sel, 2, value, -1, SQLITE_STATIC);
+        if (kind > 0) sqlite3_bind_int(sel, 3, kind);
+        int rc;
+        while ((rc = sqlite3_step(sel)) == SQLITE_ROW) {
+            const char *id = (const char *) sqlite3_column_text(sel, 0);
+            if (id) forget(id);
+        }
+        sqlite3_finalize(sel);
+        if (rc != SQLITE_DONE) return false;
+    }
+    if (!prepare(kind > 0 ? "DELETE FROM event WHERE seq IN (SELECT x.seq FROM event x WHERE x.kind = ?3 AND " TAG_JSON_MATCH ")"
+                          : "DELETE FROM event WHERE seq IN (SELECT x.seq FROM event x WHERE " TAG_JSON_MATCH ")", &del))
+        return false;
+    sqlite3_bind_text(del, 1, n, 1, SQLITE_STATIC);
+    sqlite3_bind_text(del, 2, value, -1, SQLITE_STATIC);
+    if (kind > 0) sqlite3_bind_int(del, 3, kind);
+    return run_delete(del, deleted);
+}
+
 /* ngdb_vanish - NIP-62: durable vanish record plus the deletes (see
  * storage.h). Runs inside the writer's batch transaction. */
 #define VANISH_AUTHOR "pubkey = unhex(?1) AND created_at <= ?2 AND kind != 62"
@@ -477,9 +569,11 @@ bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *he
     sqlite3_stmt *stmt;
     size_t n = 0, m = 0;
     if (!ngdb_conn || !pubkey) return false;
+    const bool mem = ngdb_tag_memory();
     if (forget) {
-        if (!prepare("SELECT lower(hex(id)) FROM event WHERE " VANISH_AUTHOR
-                     " UNION ALL SELECT lower(hex(id)) FROM event WHERE " VANISH_WRAPS, &stmt))
+        if (!prepare(mem ? "SELECT lower(hex(id)) FROM event WHERE " VANISH_AUTHOR
+                         : "SELECT lower(hex(id)) FROM event WHERE " VANISH_AUTHOR
+                           " UNION ALL SELECT lower(hex(id)) FROM event WHERE " VANISH_WRAPS, &stmt))
             return false;
         sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 2, (sqlite3_int64) until);
@@ -509,6 +603,11 @@ bool ngdb_vanish(const char *pubkey, time_t until, void (*forget)(const char *he
     if (!run_delete(stmt, &n)) return false;
     /* "Relays SHOULD delete all NIP-59 Gift Wraps that p-tagged the
      * .pubkey": every one stored now, whatever its (randomised) created_at. */
+    if (mem) {
+        if (!mem_delete_tagged('p', pubkey, 1059, forget, &m)) return false;
+        if (deleted) *deleted = n + m;
+        return true;
+    }
     if (!prepare("DELETE FROM event WHERE " VANISH_WRAPS, &stmt)) return false;
     sqlite3_bind_text(stmt, 1, pubkey, -1, SQLITE_TRANSIENT);
     if (!run_delete(stmt, &m)) return false;
@@ -524,6 +623,7 @@ bool ngdb_delete_by_id(const char *id, size_t *deleted) {
     int rc = sqlite3_step(stmt);
     if (deleted) *deleted = rc == SQLITE_DONE ? (size_t) sqlite3_changes(ngdb_conn) : 0;
     sqlite3_reset(stmt);
+    ngdb_mem_settle();
     return rc == SQLITE_DONE;
 }
 
@@ -532,6 +632,12 @@ bool ngdb_delete_by_tag(char name, const char *value, void (*forget)(const char 
     sqlite3_stmt *stmt;
     char n[2] = { name, '\0' };
     if (!ngdb_conn || !value) return false;
+    if (ngdb_tag_memory()) {
+        size_t d = 0;
+        bool ok = mem_delete_tagged(name, value, 0, forget, &d);
+        if (deleted) *deleted = d;
+        return ok;
+    }
     if (forget) {
         if (!prepare("SELECT lower(hex(x.id)) FROM tag t JOIN event x ON x.seq = t.ev WHERE t.name = unicode(?1) AND t.value = ng_tagkey(?2) AND EXISTS (SELECT 1 FROM json_each(x.tags) j WHERE json_extract(j.value, '$[0]') = ?1 AND json_extract(j.value, '$[1]') = ?2)", &stmt))
             return false;

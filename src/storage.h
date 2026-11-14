@@ -325,6 +325,14 @@ void storage_set_search(bool on);
  * what it was built with. Startup only. false = invalid (nothing set). */
 #define NG_TAG_CAP_DEFAULT 2000
 bool storage_set_tag_index(const char *letters, int max_per_event);
+/* Where the NIP-01 tag index lives. memory (default): memidx, an
+ * in-memory posting index rebuilt from the events at startup or loaded
+ * from its snapshot side file (<database>-tagidx, rewritten every
+ * snapshot_secs seconds while it changed, 0 = at shutdown only, and at
+ * shutdown); memory_mb caps it (0 = no cap): over the cap the least
+ * queried letters fall back to the JSON scan, logged. sqlite: the tag
+ * table. Switching drops the other one. Startup only; false = invalid. */
+bool storage_set_tag_index_mode(bool memory, size_t memory_mb, int snapshot_secs);
 
 void storage_context_init_sqlite3(storage_context_t *ctx);
 

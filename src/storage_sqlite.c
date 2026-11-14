@@ -1,11 +1,14 @@
 /* storage_sqlite - SQLite backend lifecycle (see storage_internal.h). */
 #include "storage_internal.h"
 #include "storage_vfs.h"
+#include "platform/ng_atomic.h"
 #include "storage_query.h"
+#include "memidx.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ============================================================================
  * SQLite3 Storage Backend
@@ -25,8 +28,9 @@
 NG_THREAD_LOCAL sqlite3 *ngdb_conn = NULL;
 
 static const char *const ps_sql[PS_COUNT] = {
-    [PS_INSERT] = ("INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig) "
-                   "VALUES (unhex(?), unhex(?), ?, ?, ?, ?, unhex(?)) ON CONFLICT(id) DO NOTHING"),
+    /* seq: explicit in tag_index = memory (ngdb_seq_take), NULL = SQLite's max + 1 otherwise. */
+    [PS_INSERT] = ("INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig, seq) "
+                   "VALUES (unhex(?), unhex(?), ?, ?, ?, ?, unhex(?), ?) ON CONFLICT(id) DO NOTHING"),
     [PS_TOMB_CHECK] = "SELECT 1 FROM deleted_event WHERE id = unhex(?) AND pubkey = unhex(?)",
     [PS_TOMB_ADD] = "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (unhex(?), unhex(?))",
     [PS_REPL_SEL] = "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = unhex(?) AND kind = ?",
@@ -66,13 +70,106 @@ static bool db_search = true;
 void storage_set_search(bool on) { db_search = on; }
 bool ngdb_search_enabled(void) { return db_search; }
 static int db_tag_cap = NG_TAG_CAP_DEFAULT;
+static char db_tag_letters[64] = SQ_TAG_LETTERS_DEFAULT;
 bool storage_set_tag_index(const char *letters, int max_per_event) {
     if (max_per_event < 1) return false;
-    if (letters && !sq_set_tag_letters(letters)) return false;
+    if (letters) {
+        if (!sq_set_tag_letters(letters)) return false;      /* validates and normalises */
+        snprintf(db_tag_letters, sizeof(db_tag_letters), "%s", sq_tag_letters());
+    }
     db_tag_cap = max_per_event;
     return true;
 }
 int ngdb_tag_cap(void) { return db_tag_cap; }
+
+static bool db_tag_memory = true;
+static size_t db_tag_memory_mb;
+static int db_tag_snapshot_secs = 300;
+bool storage_set_tag_index_mode(bool memory, size_t memory_mb, int snapshot_secs) {
+    if (snapshot_secs < 0 || memory_mb > ((size_t) 1 << 24)) return false;
+    db_tag_memory = memory;
+    db_tag_memory_mb = memory_mb;
+    db_tag_snapshot_secs = snapshot_secs;
+    return true;
+}
+/* Whether this database runs the in-memory index (set by init). */
+static bool db_mem_on;
+bool ngdb_tag_memory(void) { return db_mem_on; }
+
+/* tag_index = memory assigns seqs itself, strictly increasing over the
+ * life of the database and never reused: the snapshot's "covered" seq and
+ * the tombstone bitmap stay meaningful across deletes, rollbacks and
+ * restarts. Initialised by init past MAX(seq) and the snapshot. */
+static ng_atomic_ullong db_next_seq;
+uint64_t ngdb_seq_take(void) { return ng_atomic_fetch_add_explicit(&db_next_seq, 1, NG_MO_RELAXED); }
+
+/* ---- memory-mode transaction bookkeeping (per read-write connection) ----
+ * Deletes reach memidx through a TEMP trigger calling ng_tomb(old.seq) on
+ * every read-write connection; the seqs wait here until the delete is
+ * known committed (ngdb_mem_settle after an autocommit statement, the
+ * batch COMMIT) and are dropped if it rolls back. Inserts are indexed at
+ * once (readers recheck every candidate in SQL, so an uncommitted posting
+ * only costs a lookup); the first seq of the open transaction is kept so
+ * a rollback tombstones its whole seq range. */
+static NG_THREAD_LOCAL uint64_t *mt_pending;
+static NG_THREAD_LOCAL size_t mt_n, mt_cap;
+static NG_THREAD_LOCAL uint64_t mt_first_ins;
+
+static void mt_reset(void) { mt_n = 0; mt_first_ins = 0; }
+static void mt_apply(void) {
+    for (size_t i = 0; i < mt_n; i++) memidx_tomb_set(mt_pending[i]);
+    mt_reset();
+}
+static void mt_free(void) { free(mt_pending); mt_pending = NULL; mt_cap = 0; mt_reset(); }
+
+void ngdb_mem_inserted(uint64_t seq) {
+    if (db_mem_on && !mt_first_ins && ngdb_conn && !sqlite3_get_autocommit(ngdb_conn)) mt_first_ins = seq;
+}
+void ngdb_mem_settle(void) {
+    if (db_mem_on && ngdb_conn && sqlite3_get_autocommit(ngdb_conn)) mt_apply();
+}
+
+static void sql_tomb(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void) argc;
+    sqlite3_result_null(ctx);
+    if (!db_mem_on) return;
+    if (mt_n == mt_cap) {
+        size_t nc = ng_grow_cap(mt_cap, mt_n + 1, 64);
+        uint64_t *p = (uint64_t *) ng_realloc_array(mt_pending, nc, sizeof(*p));
+        if (!p) return;                  /* the posting stays: readers' recheck drops it */
+        mt_pending = p; mt_cap = nc;
+    }
+    mt_pending[mt_n++] = (uint64_t) sqlite3_value_int64(argv[0]);
+}
+
+/* Any rollback (ROLLBACK, or SQLite's own after an I/O / full-disk error
+ * mid-batch): the pending deletes did not happen; the events inserted in
+ * the transaction never existed. */
+static void mt_rollback_hook(void *arg) {
+    (void) arg;
+    if (!db_mem_on) return;
+    uint64_t next = ng_atomic_load_explicit(&db_next_seq, NG_MO_RELAXED);
+    if (mt_first_ins && next > mt_first_ins) memidx_tomb_range(mt_first_ins, next - 1);
+    mt_reset();
+}
+
+static const char mem_trigger_sql[] =
+    "CREATE TEMP TRIGGER IF NOT EXISTS ng_memidx_delete AFTER DELETE ON main.event BEGIN"
+    "  SELECT ng_tomb(old.seq);"
+    "END;";
+
+/* Register the delete hooks on a read-write connection (memory mode). */
+static bool mem_conn_setup(sqlite3 *db) {
+    if (!db_mem_on) return true;
+    sqlite3_rollback_hook(db, mt_rollback_hook, NULL);
+    char *err = NULL;
+    if (sqlite3_exec(db, mem_trigger_sql, NULL, NULL, &err) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", err ? err : sqlite3_errmsg(db));
+        sqlite3_free(err);
+        return false;
+    }
+    return true;
+}
 
 /* NIP-50 full-text index over content (FTS5, external content =
  * the event table, keyed by seq). Encrypted / AUTH kinds and empty
@@ -202,6 +299,136 @@ static bool tag_index_sync(void) {
     return exec_or_close(sql);
 }
 
+/* ---- tag_index = memory: open memidx, load the snapshot or rebuild ---- */
+static char db_snap_path[1100];
+static uint64_t db_token;
+
+static bool meta_get(const char *k, char *out, size_t n) {
+    sqlite3_stmt *st = NULL;
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT v FROM meta WHERE k = ?", -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        return false;
+    }
+    sqlite3_bind_text(st, 1, k, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *v = sqlite3_column_text(st, 0);
+        if (v) snprintf(out, n, "%s", (const char *) v);
+    }
+    sqlite3_finalize(st);
+    return true;
+}
+
+static sqlite3_int64 max_seq(void) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 m = 0;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT MAX(seq) FROM event", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) m = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return m;
+}
+
+/* Index every stored event with seq > after, in seq order. */
+static bool mem_replay(uint64_t after, size_t *n) {
+    sqlite3_stmt *st = NULL;
+    *n = 0;
+    if (sqlite3_prepare_v2(ngdb_conn, "SELECT seq, created_at, kind, tags FROM event WHERE seq > ? ORDER BY seq",
+                           -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
+        return false;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64) after);
+    int rc;
+    bool ok = true;
+    while (ok && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        sqlite3_int64 seq = sqlite3_column_int64(st, 0), ca = sqlite3_column_int64(st, 1);
+        const char *tags = (const char *) sqlite3_column_text(st, 3);
+        ok = memidx_add_event(tags, tags ? (size_t) sqlite3_column_bytes(st, 3) : 0, (uint64_t) seq,
+                              ca < 0 ? 0u : ca > (sqlite3_int64) UINT32_MAX ? UINT32_MAX : (uint32_t) ca,
+                              sqlite3_column_int(st, 2));
+        (*n)++;
+    }
+    sqlite3_finalize(st);
+    if (!ok) { fprintf(stderr, "memidx: out of memory building the tag index\n"); return false; }
+    if (rc != SQLITE_DONE) { fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn)); return false; }
+    return true;
+}
+
+static double secs_since(const struct timespec *t0) {
+    struct timespec t1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    return (double) (t1.tv_sec - t0->tv_sec) + (double) (t1.tv_nsec - t0->tv_nsec) / 1e9;
+}
+
+/* meta 'tag_index' = "mem|<token>": the database runs the memory index and
+ * its snapshot identity. The token is replaced at every startup (after the
+ * snapshot was loaded), so a snapshot written by a later run never matches
+ * a database restored from an older copy. Switching from sqlite drops the
+ * tag tables (rebuilt from the events if switched back). */
+static bool mem_index_init(void) {
+    char have[96];
+    if (!meta_get("tag_index", have, sizeof(have))) return false;
+    uint64_t token = strncmp(have, "mem|", 4) == 0 ? strtoull(have + 4, NULL, 16) : 0;
+    if (!token && has_table("tag"))
+        fprintf(stderr, "storage: tag_index = memory: dropping the SQLite tag table\n");
+    const char *fn = sqlite3_db_filename(ngdb_conn, "main");
+    db_snap_path[0] = '\0';
+    if (fn && fn[0]) snprintf(db_snap_path, sizeof(db_snap_path), "%s-tagidx", fn);
+
+    memidx_config_t c = { db_tag_letters, (size_t) db_tag_cap, db_tag_memory_mb << 20 };
+    if (!memidx_open(&c)) { fprintf(stderr, "memidx: cannot open the tag index\n"); return false; }
+    struct timespec t0;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t covered = 0;
+    sqlite3_int64 top = max_seq();
+    ng_status_t st = token && db_snap_path[0] ? memidx_snapshot_load(db_snap_path, token, &covered) : NG_E_UNKNOWN;
+    if (st == NG_OK && covered > (uint64_t) top) {         /* the database is older than the snapshot */
+        memidx_close();
+        if (!memidx_open(&c)) return false;
+        st = NG_E_INVALID;
+        covered = 0;
+    }
+    if (st == NG_E_INVALID)
+        fprintf(stderr, "memidx: snapshot %s unusable (corrupt, another database or other settings): full rebuild\n",
+                db_snap_path);
+    size_t n = 0;
+    if (!mem_replay(covered, &n)) { memidx_close(); return false; }
+    memidx_stats_t ms;
+    memidx_stats(&ms);
+    fprintf(stderr, "memidx: %s%s + %zu events replayed in %.2f s: %zu keys, %zu postings, %.1f MiB\n",
+            st == NG_OK ? "snapshot " : "rebuilt", st == NG_OK ? db_snap_path : "", n, secs_since(&t0),
+            ms.keys, ms.postings, (double) ms.bytes / 1048576.0);
+    memidx_enforce_cap();
+
+    uint64_t next = (uint64_t) top > covered ? (uint64_t) top : covered;
+    ng_atomic_store(&db_next_seq, next + 1);
+    sqlite3_randomness((int) sizeof(token), &token);
+    token |= 1;                                             /* never 0 */
+    char sql[512];
+    snprintf(sql, sizeof(sql), "BEGIN IMMEDIATE;%sINSERT OR REPLACE INTO meta (k, v) VALUES ('tag_index', 'mem|%016llx');COMMIT;",
+             tag_table_drop_sql, (unsigned long long) token);
+    if (!exec_or_close(sql)) { memidx_close(); return false; }
+    db_token = token;
+    db_mem_on = true;
+    if (!mem_conn_setup(ngdb_conn)) { db_mem_on = false; memidx_close(); return false; }
+    if (db_snap_path[0] && db_tag_snapshot_secs > 0 && !memidx_snapshot_start(db_snap_path, token, db_tag_snapshot_secs))
+        fprintf(stderr, "memidx: warning: no background snapshot thread; the index is written at shutdown only\n");
+    return true;
+}
+
+/* Shutdown (writer stopped): final snapshot, then free the index. */
+static void mem_index_close(void) {
+    if (!db_mem_on) return;
+    memidx_snapshot_stop();
+    if (db_snap_path[0]) {
+        ng_status_t st = memidx_snapshot_write(db_snap_path, db_token);
+        if (st != NG_OK) fprintf(stderr, "memidx: snapshot %s not written: %s\n", db_snap_path, ng_status_str(st));
+    }
+    memidx_close();
+    memidx_thread_done();
+    mt_free();
+    db_mem_on = false;
+}
 
 /* ============================================================================
  * Database Initialization and Management
@@ -258,11 +485,13 @@ static void sql_tagkey(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
 }
 static void register_fns(sqlite3 *db) {
     sqlite3_create_function(db, "ng_tagkey", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sql_tagkey, NULL, NULL);
+    sqlite3_create_function(db, "ng_tomb", 1, SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, sql_tomb, NULL, NULL);
 }
 
 static bool storage_init_sqlite3(const char *dsn) {
     snprintf(db_dsn, sizeof(db_dsn), "%s", dsn ? dsn : "");
     if (!ngdb_vfs_register()) fprintf(stderr, "warning: WAL write coalescing unavailable\n");
+    mem_index_close();                                     /* re-init without deinit */
     if (ngdb_conn) {
         sqlite3_close_v2(ngdb_conn);
     }
@@ -287,7 +516,7 @@ static bool storage_init_sqlite3(const char *dsn) {
          * pages keep the per-event write cost low: each insert dirties a
          * leaf in every index and the whole page is written to the WAL. */
         const char *ps_env = getenv("NG_PAGE_SIZE");
-        snprintf(page_sql, sizeof(page_sql), "PRAGMA page_size = %d;", ps_env ? atoi(ps_env) : 4096);
+        snprintf(page_sql, sizeof(page_sql), "PRAGMA page_size = %d;", ps_env ? atoi(ps_env) : 2048);
         sqlite3_exec(ngdb_conn, page_sql, NULL, NULL, NULL);
     }
     const char *pragmas_sql =
@@ -343,7 +572,11 @@ static bool storage_init_sqlite3(const char *dsn) {
     bool had_events = has_table("event"), had_fts = has_table("event_fts");
 
     if (!exec_or_close(schema_sql)) return false;
-    if (!tag_index_sync()) return false;
+    /* tag_index = memory: the SQL builder sees no indexed letter (its tag
+     * conditions are JSON checks); storage_read.c drives tag filters from
+     * memidx. tag_index = sqlite: the tag table. */
+    sq_set_tag_letters(db_tag_memory ? "" : db_tag_letters);
+    if (!db_tag_memory && !tag_index_sync()) return false;
     if (!exec_or_close(db_search ? search_sql :
                        "DROP TRIGGER IF EXISTS event_fts_insert; DROP TRIGGER IF EXISTS event_fts_delete;"
                        "DROP TABLE IF EXISTS event_fts;")) return false;
@@ -351,6 +584,10 @@ static bool storage_init_sqlite3(const char *dsn) {
         fprintf(stderr, "storage: building the NIP-50 search index for the stored events...\n");
         if (!exec_or_close("INSERT INTO event_fts (rowid, content) SELECT seq, content FROM event"
                            " WHERE content != '' AND " NG_SEARCH_KIND_SQL("kind"))) return false;
+    }
+    if (db_tag_memory && !mem_index_init()) {
+        if (ngdb_conn) { sqlite3_close_v2(ngdb_conn); ngdb_conn = NULL; }
+        return false;
     }
     return true;
 }
@@ -363,6 +600,7 @@ static bool storage_init_sqlite3(const char *dsn) {
  * Thread safety: NOT thread-safe; must be called during shutdown
  */
 static void storage_deinit_sqlite3(void) {
+    mem_index_close();
     ps_finalize_all();
     if (ngdb_conn) {
         sqlite3_close_v2(ngdb_conn);
@@ -407,6 +645,7 @@ static bool storage_thread_open_sqlite3(bool readonly) {
         return false;
     }
     register_fns(ngdb_conn);
+    if (!readonly && !mem_conn_setup(ngdb_conn)) { sqlite3_close_v2(ngdb_conn); ngdb_conn = NULL; return false; }
     sqlite3_exec(ngdb_conn,
                  "PRAGMA busy_timeout = 5000;"
                  "PRAGMA cache_size = -65536;"
@@ -433,6 +672,8 @@ static bool storage_thread_open_sqlite3(bool readonly) {
 
 static void storage_thread_close_sqlite3(void) {
     ps_finalize_all();
+    mt_free();
+    memidx_thread_done();
     if (ngdb_conn) { sqlite3_close_v2(ngdb_conn); ngdb_conn = NULL; }
 }
 
@@ -465,10 +706,24 @@ static bool storage_checkpoint_sqlite3(void) {
         sqlite3_wal_checkpoint_v2(ngdb_conn, NULL, SQLITE_CHECKPOINT_RESTART, &log, &done);
     return true;
 }
-static bool storage_begin_sqlite3(void) { ngdb_fts_reset(); return storage_exec_sqlite3("BEGIN IMMEDIATE"); }
+static bool storage_begin_sqlite3(void) {
+    ngdb_fts_reset();
+    mt_reset();
+    return storage_exec_sqlite3("BEGIN IMMEDIATE");
+}
 /* The batch's pending search rows go in with the batch: a failed feed
- * fails the commit (the writer rolls back and answers error:). */
-static bool storage_commit_sqlite3(void) { return ngdb_fts_flush() && storage_exec_sqlite3("COMMIT"); }
+ * fails the commit (the writer rolls back and answers error:). Memory
+ * mode: the batch's deletes reach the index once committed; then a slice
+ * of the dead-posting sweep and the memory cap, off the commit path. */
+static bool storage_commit_sqlite3(void) {
+    if (!ngdb_fts_flush() || !storage_exec_sqlite3("COMMIT")) return false;
+    if (db_mem_on) {
+        mt_apply();
+        memidx_maintain(65536);
+        memidx_enforce_cap();
+    }
+    return true;
+}
 static bool storage_rollback_sqlite3(void) {
     ngdb_fts_reset();
     /* COMMIT failed (e.g. SQLITE_BUSY/IOERR/FULL): the transaction may still be

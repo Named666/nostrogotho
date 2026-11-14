@@ -54,6 +54,12 @@ static bool apply_config(const char *service_url, int min_pow, int lower_limit, 
                 cfg.limits.tag_index_letters);
         return false;
     }
+    bool mem = strcmp(cfg.limits.tag_index, "memory") == 0;
+    if ((!mem && strcmp(cfg.limits.tag_index, "sqlite") != 0) ||
+        !storage_set_tag_index_mode(mem, (size_t) cfg.limits.tag_index_memory_mb, cfg.limits.tag_index_snapshot_secs)) {
+        fprintf(stderr, "invalid tag_index '%s': memory or sqlite\n", cfg.limits.tag_index);
+        return false;
+    }
     ng_limits_apply(&cfg.limits);
     ng_relay_info_apply(info);
     server_set_config(&cfg);

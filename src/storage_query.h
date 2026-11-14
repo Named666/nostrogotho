@@ -61,6 +61,11 @@ bool sq_tag_indexed(const char *name);
  * more tags than tag_index_max_per_event), so indexed tag conditions also
  * check those events' JSON. Set before sq_build. */
 void sq_set_overflow(bool on);
+/* Recheck form (tag_index = memory): the statement starts with
+ * "e.seq = ?" as parameter 1 (bound to 0; the caller rebinds it per
+ * candidate) and evaluates the whole filter for that one event. Set
+ * before sq_build, cleared after. */
+void sq_set_seq_param(bool on);
 /* s[0..len) is exactly 64 lowercase hex digits (stored as a 32-byte blob). */
 bool sq_is_hex64(const char *s, size_t len);
 /* 8-byte index key of a tag value (64-hex prefix or seeded FNV-1a 64,

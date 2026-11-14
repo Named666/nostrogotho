@@ -49,15 +49,20 @@ static void test_tags_and_search_fts(void) {
     f.search = (char *) "Best \"nostr\" apps! include:spam 50%_off";
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 10);
+    /* tag table keys (sq_tag_key8), then the exact JSON recheck */
     const char *want = "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
                        "JOIN event_fts ON event_fts.rowid = e.seq "
-                       "WHERE t.name = ? AND t.value IN (?,?) AND event_fts MATCH ? "
+                       "WHERE t.name = 116 AND t.value IN (unhex(?),unhex(?)) AND "
+                       "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
+                       "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') IN (?,?)) "
+                       "AND event_fts MATCH ? "
                        "ORDER BY event_fts.rank, e.created_at DESC, e.id ASC LIMIT ?";
     check("multi-value tag + NIP-50 search SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
-    int ok = q.n == 5 && !q.params[0].owned && strcmp(q.params[0].text, "t") == 0 &&
-             strcmp(q.params[1].text, "a%b") == 0 && strcmp(q.params[2].text, "c_d") == 0 &&
-             q.params[3].owned && strcmp(q.params[3].text, "\"Best\" \"nostr\" \"apps\" \"50\" \"off\"") == 0;
-    check("tag values exact, FTS5 query quoted terms, extension dropped", ok, q.n > 3 ? q.params[3].text : NULL);
+    int ok = q.n == 7 && q.params[0].owned && strlen(q.params[0].text) == 16 && q.params[1].owned &&
+             strcmp(q.params[2].text, "t") == 0 && strcmp(q.params[3].text, "a%b") == 0 &&
+             strcmp(q.params[4].text, "c_d") == 0 &&
+             q.params[5].owned && strcmp(q.params[5].text, "\"Best\" \"nostr\" \"apps\" \"50\" \"off\"") == 0;
+    check("tag values exact, FTS5 query quoted terms, extension dropped", ok, q.n > 5 ? q.params[5].text : NULL);
     sq_free(&q);
     f.search = (char *) "  include:spam !!! ";
     st = sq_build(&q, &f, false, 10);
@@ -82,13 +87,19 @@ static void test_tag_join(void) {
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 50);
     const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
-                       "WHERE t.name = ? AND t.value = unhex(?) AND t.kind IN (?,?) AND t.created_at >= 9 "
-                       "AND EXISTS (SELECT 1 FROM tag x WHERE x.name = ? AND x.value IN (?,?) "
-                       "AND x.created_at = e.created_at AND x.ev = e.seq) "
+                       "WHERE t.name = 112 AND t.value = unhex(?) AND "
+                       "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
+                       "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') = ?) "
+                       "AND t.kind IN (?,?) AND t.created_at >= 9 "
+                       "AND EXISTS (SELECT 1 FROM tag x WHERE x.name = 116 AND x.value IN (unhex(?),unhex(?)) "
+                       "AND x.created_at = e.created_at AND x.ev = e.seq) AND "
+                       "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
+                       "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') IN (?,?)) "
                        "ORDER BY t.created_at DESC, e.id ASC LIMIT ?";
     check("tag join SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
-    check("tag join params", q.n == 8 && strcmp(q.params[0].text, "p") == 0 && q.params[1].text == H1 &&
-          q.params[2].num == 1 && q.params[3].num == 7 && strcmp(q.params[4].text, "t") == 0, NULL);
+    check("tag join params", q.n == 11 && strcmp(q.params[0].text, "1111111111111111") == 0 &&
+          strcmp(q.params[1].text, "p") == 0 && q.params[2].text == H1 &&
+          q.params[3].num == 1 && q.params[4].num == 7 && strcmp(q.params[7].text, "t") == 0, NULL);
     sq_free(&q);
     st = sq_build(&q, &f, true, 50);
     check("tag COUNT", st == NG_OK && strncmp(q.sql, "SELECT COUNT(*) FROM tag t JOIN", 31) == 0, q.sql);
@@ -99,6 +110,30 @@ static void test_tag_join(void) {
     st = sq_build(&q, &f, false, 50);
     check("multi-letter tag name -> NG_E_INVALID", st == NG_E_INVALID, NULL);
     sq_free(&q);
+}
+
+/* tag_index = memory: no indexed letter in SQL; the recheck statement
+ * evaluates the whole filter for one seq (parameter 1). */
+static void test_memory_recheck(void) {
+    filter_t f; memset(&f, 0, sizeof(f));
+    char *pe[] = {(char *) "p", H1};
+    tag_t tags[1] = { { pe, 2, 2 } };
+    int kinds[] = {1};
+    f.tags = tags; f.tags_count = 1; f.kinds = kinds; f.kinds_count = 1;
+    sq_set_tag_letters("");
+    sq_set_seq_param(true);
+    sq_query_t q = {0};
+    ng_status_t st = sq_build(&q, &f, false, 1);
+    sq_set_seq_param(false);
+    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM event e WHERE e.seq = ? AND e.kind = ? AND "
+                       "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
+                       "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') = ?) "
+                       "ORDER BY e.created_at DESC, e.id ASC LIMIT ?";
+    check("memory recheck SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
+    check("memory recheck params", q.n == 5 && q.params[0].type == SQ_INT && q.params[0].num == 0 &&
+          q.params[1].num == 1 && strcmp(q.params[2].text, "p") == 0 && q.params[3].text == H1, NULL);
+    sq_free(&q);
+    sq_set_tag_letters(SQ_TAG_LETTERS_DEFAULT);
 }
 
 /* A long search string is never truncated (was a fixed 512-byte pattern). */
@@ -153,6 +188,7 @@ int main(void) {
     test_count_authors_ids();
     test_tags_and_search_fts();
     test_tag_join();
+    test_memory_recheck();
     test_long_search_not_truncated();
     test_caps();
     return failures ? 1 : 0;
