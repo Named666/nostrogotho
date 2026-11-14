@@ -33,10 +33,16 @@
  * build_count, timer, info_document).
  * ============================================================================ */
 
+/* One index entry: a filter of a subscription reachable under one key. */
+enum { IX_WILD, IX_ID, IX_AUTHOR, IX_TAG, IX_KIND };
 typedef struct sub_entry {
     struct sub_entry *next, **pprev;   /* bucket chain */
     struct subscription *sub;
-    const filter_t *filter;
+    uint64_t key;                      /* full key hash (bucket = key & mask) */
+    uint32_t vi;                       /* index of the value it is filed under */
+    uint16_t fi;                       /* filter index in sub->filters */
+    uint8_t field;                     /* IX_* */
+    uint8_t ti;                        /* IX_TAG: tag index in the filter */
 } sub_entry_t;
 
 typedef struct subscription {
@@ -64,14 +70,20 @@ static bool ip_allow(relay_conn_t *connection, rl_class_t c) {
     return !rl_enabled(c) || !cc || !cc->ipkey_len || rl_allow(c, cc->ipkey, cc->ipkey_len);
 }
 
-/* Per-shard subscription index. Each filter is indexed under the keys of its
- * most selective exact-match field (ids > authors > single-letter tag values >
- * kinds) or on the wildcard list. An event probes the buckets of its own id,
- * pubkey, tag values and kind plus the wildcard list, so only plausible
- * filters are evaluated; collisions are harmless (full match follows). */
-#define IDX_BUCKETS 16384
+/* Per-shard subscription index (strfry's ActiveMonitors, as a hash). Each
+ * filter is filed under every value of its most selective exact-match field
+ * (ids > authors > one single-letter tag's values > kinds) or on the
+ * wildcard list. An event probes the buckets of its own id, pubkey, tag
+ * values and kind plus the wildcard list. An entry stores its full key and
+ * which value it was filed under, so a probe skips other keys sharing the
+ * bucket with one compare, confirms its own value exactly, and evaluates
+ * only the rest of the filter (a 500-author filter is not rescanned for the
+ * author). The bucket array doubles when entries pass 2 per bucket. */
+#define IDX_MIN_BUCKETS 1024
 typedef struct {
-    sub_entry_t *buckets[IDX_BUCKETS];
+    sub_entry_t **buckets;
+    size_t mask;                       /* buckets - 1 */
+    size_t n_entries;
     sub_entry_t *wild;
     uint64_t gen;
     size_t n_subs;
@@ -132,7 +144,14 @@ static uint64_t key_hash(char type, const char *s, size_t n) {
 static uint64_t kind_hash(int kind) { char b[16]; int n = snprintf(b, sizeof(b), "%d", kind); return key_hash('k', b, (size_t) n); }
 
 static shard_index_t *index_of(int shard) {
-    if (!shard_idx[shard]) shard_idx[shard] = (shard_index_t *) calloc(1, sizeof(shard_index_t));
+    if (!shard_idx[shard]) {
+        shard_index_t *ix = (shard_index_t *) calloc(1, sizeof(shard_index_t));
+        if (!ix) return NULL;
+        ix->buckets = (sub_entry_t **) calloc(IDX_MIN_BUCKETS, sizeof(sub_entry_t *));
+        if (!ix->buckets) { free(ix); return NULL; }
+        ix->mask = IDX_MIN_BUCKETS - 1;
+        shard_idx[shard] = ix;
+    }
     return shard_idx[shard];
 }
 
@@ -148,6 +167,23 @@ static void entry_unlink(sub_entry_t *e) {
     e->next = NULL; e->pprev = NULL;
 }
 
+/* Double the bucket array until it holds `need` entries at <= 2 per bucket
+ * (relinks every entry; their pprev point into the new array). On OOM the
+ * index keeps its size: longer chains, still correct. */
+static void index_grow(shard_index_t *ix, size_t need) {
+    size_t nb = ix->mask + 1;
+    while (need > nb * 2 && nb < ((size_t) 1 << 30)) nb *= 2;
+    if (nb == ix->mask + 1) return;
+    sub_entry_t **nbk = (sub_entry_t **) calloc(nb, sizeof(sub_entry_t *));
+    if (!nbk) return;
+    for (size_t i = 0; i <= ix->mask; i++) {
+        sub_entry_t *e = ix->buckets[i];
+        while (e) { sub_entry_t *n = e->next; entry_link(&nbk[e->key & (nb - 1)], e); e = n; }
+    }
+    free(ix->buckets);
+    ix->buckets = nbk; ix->mask = nb - 1;
+}
+
 static bool all_len(char **v, size_t n, size_t want) {
     for (size_t i = 0; i < n; i++) if (strlen(v[i]) != want) return false;
     return n > 0;
@@ -156,24 +192,31 @@ static bool all_len(char **v, size_t n, size_t want) {
 /* Number of index keys a filter is stored under; the keys are written to
  * keys when it is not NULL. Every value of the chosen field is a key (a
  * filter must be found by any of its values), 0 = wildcard. */
-static size_t filter_keys(const filter_t *f, uint64_t *keys) {
+static size_t filter_keys(const filter_t *f, uint64_t *keys, uint8_t *field, uint8_t *ti) {
     size_t n = 0;
-    if (f->ids_count && all_len(f->ids, f->ids_count, 64)) {
+    *field = IX_WILD; *ti = 0;
+    if (f->ids_count && f->ids_count <= UINT32_MAX && all_len(f->ids, f->ids_count, 64)) {
+        *field = IX_ID;
         for (size_t i = 0; i < f->ids_count; i++, n++) if (keys) keys[n] = key_hash('i', f->ids[i], 64);
         return n;
     }
-    if (f->authors_count && all_len(f->authors, f->authors_count, 64)) {
+    if (f->authors_count && f->authors_count <= UINT32_MAX && all_len(f->authors, f->authors_count, 64)) {
+        *field = IX_AUTHOR;
         for (size_t i = 0; i < f->authors_count; i++, n++) if (keys) keys[n] = key_hash('a', f->authors[i], 64);
         return n;
     }
-    for (size_t t = 0; t < f->tags_count; t++) {
+    for (size_t t = 0; t < f->tags_count && t <= UINT8_MAX; t++) {
         const tag_t *tg = &f->tags[t];
-        if (tg->count < 2 || strlen(tg->elements[0]) != 1) continue;
+        if (tg->count < 2 || tg->count - 1 > UINT32_MAX || strlen(tg->elements[0]) != 1) continue;
+        *field = IX_TAG; *ti = (uint8_t) t;
         for (size_t v = 1; v < tg->count; v++, n++)
             if (keys) keys[n] = key_hash((char) (tg->elements[0][0] | 0x80), tg->elements[v], strlen(tg->elements[v]));
         return n;
     }
-    for (size_t i = 0; i < f->kinds_count; i++, n++) if (keys) keys[n] = kind_hash(f->kinds[i]);
+    if (f->kinds_count <= UINT32_MAX) {
+        if (f->kinds_count) *field = IX_KIND;
+        for (size_t i = 0; i < f->kinds_count; i++, n++) if (keys) keys[n] = kind_hash(f->kinds[i]);
+    }
     return n;
 }
 
@@ -183,26 +226,35 @@ static bool index_add(int shard, subscription_t *s) {
     shard_index_t *ix = index_of(shard);
     if (!ix) return false;
     size_t total = 0, most = 0;
+    uint8_t field, ti;
+    if (s->filters_count > UINT16_MAX) return false;
     for (size_t i = 0; i < s->filters_count; i++) {
-        size_t nk = filter_keys(&s->filters[i], NULL);
+        size_t nk = filter_keys(&s->filters[i], NULL, &field, &ti);
         if (nk > most) most = nk;
         if (!ng_size_add(total, nk ? nk : 1, &total)) return false;
     }
     uint64_t *keys = (uint64_t *) ng_malloc_array(most ? most : 1, sizeof(uint64_t));
     s->entries = keys ? (sub_entry_t *) calloc(total ? total : 1, sizeof(sub_entry_t)) : NULL;
     if (!s->entries) { free(keys); return false; }
-    size_t e = 0;
+    size_t e = 0, ne;
+    if (ng_size_add(ix->n_entries, total, &ne)) index_grow(ix, ne);
     for (size_t i = 0; i < s->filters_count; i++) {
-        size_t nk = filter_keys(&s->filters[i], keys);
-        if (!nk) { s->entries[e].sub = s; s->entries[e].filter = &s->filters[i]; entry_link(&ix->wild, &s->entries[e]); e++; continue; }
+        size_t nk = filter_keys(&s->filters[i], keys, &field, &ti);
+        if (!nk) {
+            s->entries[e] = (sub_entry_t) { .sub = s, .fi = (uint16_t) i, .field = IX_WILD };
+            entry_link(&ix->wild, &s->entries[e]); e++;
+            continue;
+        }
         for (size_t k = 0; k < nk; k++) {
-            s->entries[e].sub = s; s->entries[e].filter = &s->filters[i];
-            entry_link(&ix->buckets[keys[k] & (IDX_BUCKETS - 1)], &s->entries[e]);
+            s->entries[e] = (sub_entry_t) { .sub = s, .key = keys[k], .vi = (uint32_t) k, .fi = (uint16_t) i,
+                                            .field = field, .ti = ti };
+            entry_link(&ix->buckets[keys[k] & ix->mask], &s->entries[e]);
             e++;
         }
     }
     free(keys);
     s->entries_count = e;
+    ix->n_entries += e;
     ix->n_subs++;
     return true;
 }
@@ -210,8 +262,10 @@ static bool index_add(int shard, subscription_t *s) {
 static void index_del(int shard, subscription_t *s) {
     if (!s->entries) return;                 /* never indexed */
     for (size_t i = 0; i < s->entries_count; i++) entry_unlink(&s->entries[i]);
+    shard_index_t *ix = shard_idx[shard];
+    if (ix) ix->n_entries = ix->n_entries >= s->entries_count ? ix->n_entries - s->entries_count : 0;
     free(s->entries); s->entries = NULL; s->entries_count = 0;
-    if (shard_idx[shard] && shard_idx[shard]->n_subs) shard_idx[shard]->n_subs--;
+    if (ix && ix->n_subs) ix->n_subs--;
 }
 
 /* ------------------------------------------------------- event tags ---- */
@@ -288,26 +342,27 @@ static void remove_subscriptions(relay_conn_t *connection, const char *id) {
 /* live: also apply the NIP-50 search terms. Stored rows skip them: the
  * FTS5 index already selected the row (and folds more than ASCII), and a
  * row matched by one filter's SQL is delivered whatever the others say. */
-static bool matches_filter(const filter_t *filter, const event_t *event, const relay_tags_t *tags,
-                           bool live) {
+static bool matches_filter_skip(const filter_t *filter, const event_t *event, const relay_tags_t *tags,
+                                bool live, int skip, size_t skip_tag) {
     if (filter->since && event->created_at < filter->since) return false;
     if (filter->until && event->created_at > filter->until) return false;
-    if (filter->kinds_count) {
+    if (filter->kinds_count && skip != IX_KIND) {
         bool matched = false;
         for (size_t i = 0; i < filter->kinds_count && !matched; i++) if (event->kind == filter->kinds[i]) matched = true;
         if (!matched) return false;
     }
-    if (filter->ids_count) {
+    if (filter->ids_count && skip != IX_ID) {
         bool matched = false;
         for (size_t i = 0; i < filter->ids_count && !matched; i++) if (strncmp(event->id, filter->ids[i], strlen(filter->ids[i])) == 0) matched = true;
         if (!matched) return false;
     }
-    if (filter->authors_count) {
+    if (filter->authors_count && skip != IX_AUTHOR) {
         bool matched = false;
         for (size_t i = 0; i < filter->authors_count && !matched; i++) if (strncmp(event->pubkey, filter->authors[i], strlen(filter->authors[i])) == 0) matched = true;
         if (!matched) return false;
     }
     for (size_t i = 0; i < filter->tags_count; i++) {
+        if (skip == IX_TAG && i == skip_tag) continue;
         bool matched = false;
         tag_t *tag = &filter->tags[i];
         for (size_t j = 1; j < tag->count && !matched; j++) {
@@ -319,6 +374,9 @@ static bool matches_filter(const filter_t *filter, const event_t *event, const r
     if (live && filter->search &&
         !ng_search_match(filter->search, event->kind, event->content, event->content_len)) return false;
     return true;
+}
+static bool matches_filter(const filter_t *filter, const event_t *event, const relay_tags_t *tags, bool live) {
+    return matches_filter_skip(filter, event, tags, live, IX_WILD, 0);
 }
 
 static bool plugins_accept_publish(relay_conn_t *connection, const event_t *event,
@@ -379,14 +437,36 @@ void relay_bcast_free(relay_bcast_t *b) {
     free(b);
 }
 
-static void probe(shard_index_t *ix, sub_entry_t *e, const relay_bcast_t *b) {
-    for (; e; e = e->next) {
+static void deliver(shard_index_t *ix, subscription_t *s, const relay_bcast_t *b) {
+    s->gen = ix->gen;                           /* at most once per subscription */
+    if (!plugins_can_deliver(&b->ev, s->connection)) return;
+    relay_conn_send_event(s->connection, s->id_json, s->id_json_len, b->body);
+}
+
+/* Entries filed under `key` for `field`: confirm the filed value exactly
+ * (val/vlen: the event's id, pubkey or tag value; kind for IX_KIND), then
+ * check the rest of the filter. */
+static void probe(shard_index_t *ix, uint64_t key, int field, const char *val, size_t vlen, char tname,
+                  const relay_bcast_t *b) {
+    for (sub_entry_t *e = ix->buckets[key & ix->mask]; e; e = e->next) {
+        if (e->key != key || e->field != field) continue;
         subscription_t *s = e->sub;
         if (s->gen == ix->gen) continue;
-        if (!matches_filter(e->filter, &b->ev, &b->tags, true)) continue;
-        s->gen = ix->gen;                       /* at most once per subscription */
-        if (!plugins_can_deliver(&b->ev, s->connection)) continue;
-        relay_conn_send_event(s->connection, s->id_json, s->id_json_len, b->body);
+        const filter_t *f = &s->filters[e->fi];
+        switch (field) {
+        case IX_ID: if (memcmp(f->ids[e->vi], val, 64) != 0) continue; break;
+        case IX_AUTHOR: if (memcmp(f->authors[e->vi], val, 64) != 0) continue; break;
+        case IX_TAG: {
+            const tag_t *tg = &f->tags[e->ti];
+            const char *fv = tg->elements[e->vi + 1];
+            if (tg->elements[0][0] != tname || strlen(fv) != vlen || memcmp(fv, val, vlen) != 0) continue;
+            break;
+        }
+        case IX_KIND: if (f->kinds[e->vi] != b->ev.kind) continue; break;
+        default: continue;
+        }
+        if (!matches_filter_skip(f, &b->ev, &b->tags, true, field, e->ti)) continue;
+        deliver(ix, s, b);
     }
 }
 
@@ -396,15 +476,19 @@ void relay_core_broadcast_shard(int shard, const relay_bcast_t *b) {
     if (!ix || !ix->n_subs) return;
     ix->gen++;
     const event_t *ev = &b->ev;
-    probe(ix, ix->buckets[key_hash('i', ev->id, strlen(ev->id)) & (IDX_BUCKETS - 1)], b);
-    probe(ix, ix->buckets[key_hash('a', ev->pubkey, strlen(ev->pubkey)) & (IDX_BUCKETS - 1)], b);
+    if (strlen(ev->id) == 64) probe(ix, key_hash('i', ev->id, 64), IX_ID, ev->id, 64, 0, b);
+    if (strlen(ev->pubkey) == 64) probe(ix, key_hash('a', ev->pubkey, 64), IX_AUTHOR, ev->pubkey, 64, 0, b);
     for (size_t i = 0; i < b->tags.n; i++) {
         const relay_tagpair_t *t = &b->tags.p[i];
         if (t->nlen != 1 || !t->val) continue;
-        probe(ix, ix->buckets[key_hash((char) (t->name[0] | 0x80), t->val, t->vlen) & (IDX_BUCKETS - 1)], b);
+        probe(ix, key_hash((char) (t->name[0] | 0x80), t->val, t->vlen), IX_TAG, t->val, t->vlen, t->name[0], b);
     }
-    probe(ix, ix->buckets[kind_hash(ev->kind) & (IDX_BUCKETS - 1)], b);
-    probe(ix, ix->wild, b);
+    probe(ix, kind_hash(ev->kind), IX_KIND, NULL, 0, 0, b);
+    for (sub_entry_t *e = ix->wild; e; e = e->next) {
+        subscription_t *s = e->sub;
+        if (s->gen == ix->gen || !matches_filter(&s->filters[e->fi], ev, &b->tags, true)) continue;
+        deliver(ix, s, b);
+    }
 }
 
 static void query_sender(const char *json, const event_t *event) {
@@ -893,6 +977,7 @@ void relay_core_shutdown(void) {
             shard_subs[i] = s->shard_next;
             subscription_free(s);
         }
+        if (shard_idx[i]) free(shard_idx[i]->buckets);
         free(shard_idx[i]); shard_idx[i] = NULL;
     }
 }
