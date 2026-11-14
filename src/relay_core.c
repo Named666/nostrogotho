@@ -35,15 +35,26 @@
 
 /* One index entry: a filter of a subscription reachable under one key. */
 enum { IX_WILD, IX_ID, IX_AUTHOR, IX_TAG, IX_KIND };
+/* 32 bytes (was 40): the key keeps its low 32 bits (bucket = key & mask,
+ * mask < 2^30; a probe compares them, then confirms the value exactly), and
+ * the indexes are bit-packed within the configured limits asserted below. */
+#define IX_VI_BITS 15                  /* > max_filter_items (config cap 20000) */
+#define IX_FI_BITS 6                   /* filters per REQ <= NG_MAX_FILTERS (64) */
+#define IX_VI_MAX (((size_t) 1 << IX_VI_BITS) - 1)
+#define IX_VI_MASK ((1u << IX_VI_BITS) - 1)
+#define IX_FI_MASK ((1u << IX_FI_BITS) - 1)   /* masks keep -Wconversion quiet; values are in range */
+NG_STATIC_ASSERT(NG_MAX_FILTERS <= (1 << IX_FI_BITS), ix_fi_fits);
+NG_STATIC_ASSERT(MAX_TAG_ELEMENTS <= 256, ix_ti_fits);
 typedef struct sub_entry {
     struct sub_entry *next, **pprev;   /* bucket chain */
     struct subscription *sub;
-    uint64_t key;                      /* full key hash (bucket = key & mask) */
-    uint32_t vi;                       /* index of the value it is filed under */
-    uint16_t fi;                       /* filter index in sub->filters */
-    uint8_t field;                     /* IX_* */
-    uint8_t ti;                        /* IX_TAG: tag index in the filter */
+    uint32_t key;                      /* low 32 bits of the key hash */
+    unsigned vi : IX_VI_BITS;          /* index of the value it is filed under */
+    unsigned fi : IX_FI_BITS;          /* filter index in sub->filters */
+    unsigned field : 3;                /* IX_* */
+    unsigned ti : 8;                   /* IX_TAG: tag index in the filter */
 } sub_entry_t;
+NG_STATIC_ASSERT(sizeof(void *) != 8 || sizeof(sub_entry_t) == 32, sub_entry_32_bytes);
 
 typedef struct subscription {
     relay_conn_t *connection;
@@ -192,25 +203,25 @@ static bool all_len(char **v, size_t n, size_t want) {
 static size_t filter_keys(const filter_t *f, uint64_t *keys, uint8_t *field, uint8_t *ti) {
     size_t n = 0;
     *field = IX_WILD; *ti = 0;
-    if (f->ids_count && f->ids_count <= UINT32_MAX && all_len(f->ids, f->ids_count, 64)) {
+    if (f->ids_count && f->ids_count <= IX_VI_MAX && all_len(f->ids, f->ids_count, 64)) {
         *field = IX_ID;
         for (size_t i = 0; i < f->ids_count; i++, n++) if (keys) keys[n] = key_hash('i', f->ids[i], 64);
         return n;
     }
-    if (f->authors_count && f->authors_count <= UINT32_MAX && all_len(f->authors, f->authors_count, 64)) {
+    if (f->authors_count && f->authors_count <= IX_VI_MAX && all_len(f->authors, f->authors_count, 64)) {
         *field = IX_AUTHOR;
         for (size_t i = 0; i < f->authors_count; i++, n++) if (keys) keys[n] = key_hash('a', f->authors[i], 64);
         return n;
     }
     for (size_t t = 0; t < f->tags_count && t <= UINT8_MAX; t++) {
         const tag_t *tg = &f->tags[t];
-        if (tg->count < 2 || tg->count - 1 > UINT32_MAX || strlen(tg->elements[0]) != 1) continue;
+        if (tg->count < 2 || tg->count - 1 > IX_VI_MAX || strlen(tg->elements[0]) != 1) continue;
         *field = IX_TAG; *ti = (uint8_t) t;
         for (size_t v = 1; v < tg->count; v++, n++)
             if (keys) keys[n] = key_hash((char) (tg->elements[0][0] | 0x80), tg->elements[v], strlen(tg->elements[v]));
         return n;
     }
-    if (f->kinds_count <= UINT32_MAX) {
+    if (f->kinds_count <= IX_VI_MAX) {
         if (f->kinds_count) *field = IX_KIND;
         for (size_t i = 0; i < f->kinds_count; i++, n++) if (keys) keys[n] = kind_hash(f->kinds[i]);
     }
@@ -224,7 +235,7 @@ static bool index_add(int shard, subscription_t *s) {
     if (!ix) return false;
     size_t total = 0, most = 0;
     uint8_t field, ti;
-    if (s->filters_count > UINT16_MAX) return false;
+    if (s->filters_count > ((size_t) 1 << IX_FI_BITS)) return false;   /* <= max_filters */
     for (size_t i = 0; i < s->filters_count; i++) {
         size_t nk = filter_keys(&s->filters[i], NULL, &field, &ti);
         if (nk > most) most = nk;
@@ -238,13 +249,13 @@ static bool index_add(int shard, subscription_t *s) {
     for (size_t i = 0; i < s->filters_count; i++) {
         size_t nk = filter_keys(&s->filters[i], keys, &field, &ti);
         if (!nk) {
-            s->entries[e] = (sub_entry_t) { .sub = s, .fi = (uint16_t) i, .field = IX_WILD };
+            s->entries[e] = (sub_entry_t) { .sub = s, .fi = (unsigned) i & IX_FI_MASK, .field = IX_WILD };
             entry_link(&ix->wild, &s->entries[e]); e++;
             continue;
         }
         for (size_t k = 0; k < nk; k++) {
-            s->entries[e] = (sub_entry_t) { .sub = s, .key = keys[k], .vi = (uint32_t) k, .fi = (uint16_t) i,
-                                            .field = field, .ti = ti };
+            s->entries[e] = (sub_entry_t) { .sub = s, .key = (uint32_t) keys[k], .vi = (unsigned) k & IX_VI_MASK, .fi = (unsigned) i & IX_FI_MASK,
+                                            .field = field & 7u, .ti = ti };
             entry_link(&ix->buckets[keys[k] & ix->mask], &s->entries[e]);
             e++;
         }
@@ -446,7 +457,7 @@ static void deliver(shard_index_t *ix, subscription_t *s, const relay_bcast_t *b
 static void probe(shard_index_t *ix, uint64_t key, int field, const char *val, size_t vlen, char tname,
                   const relay_bcast_t *b) {
     for (sub_entry_t *e = ix->buckets[key & ix->mask]; e; e = e->next) {
-        if (e->key != key || e->field != field) continue;
+        if (e->key != (uint32_t) key || (int) e->field != field) continue;
         subscription_t *s = e->sub;
         if (s->gen == ix->gen) continue;
         const filter_t *f = &s->filters[e->fi];

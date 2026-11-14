@@ -21,6 +21,7 @@ run listen_backlog env RELAY_BIN=$B $PY tests/test_listen_backlog.py
 run nips env RELAY_BIN=$B $PY tests/test_nips.py
 run nips_sqlite env RELAY_BIN=$B NG_TEST_CONF="tag_index = sqlite" $PY tests/test_nips.py
 run durability env RELAY_BIN=$B $PY tests/test_durability.py
+run follow_list env RELAY_BIN=$B $PY tests/test_follow_list.py
 run memidx_crash env RELAY_BIN=$B $PY tests/test_memidx_crash.py
 SB=build/ngws_bench_server${2:-}; pkill -f "$SB 9001" 2>/dev/null
 $SB 9001 2 echo >/tmp/echo.log 2>&1 & E=$!; sleep 0.5
