@@ -132,7 +132,7 @@ static void pgo_flags(Cmd *cmd)
 
 /* Vendored translation units, built once per variant into BUILD_FOLDER"obj<suffix>/". */
 static const char *const US_VENDOR[] = {
-    US"bsd.c", US"context.c", US"loop.c", US"socket.c", US"udp.c", US"eventing/epoll_kqueue.c",
+    US"bsd.c", US"context.c", US"loop.c", US"socket.c", US"eventing/epoll_kqueue.c",
 };
 static const char *const CORE_VENDOR[] = {
     THIRD_PARTY_FOLDER"sqlite3.c",
