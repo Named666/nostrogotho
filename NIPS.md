@@ -13,7 +13,7 @@ Everything in this audit is done except NIP-86 and NIP-77, which the owner put o
 
 | Item | Status | Commit(s) | Notes / remaining |
 |---|---|---|---|
-| A1 NIP-01 `#tag` filters | **done** | 182fe68, 755e00d, 9b1c4fc | `tag` table + delete trigger; WAL write-coalescing VFS (`ngwal`). Only `tag_index_letters` (default e,p,a,q,t,d,h,k) are indexed, at most `tag_index_max_per_event` (default 2000) per event; other letters and tags past the cap are answered from the stored tags JSON (correct, slower). The `kind` column stays: kinds filters are checked on the tag row before the join |
+| A1 NIP-01 `#tag` filters | **done** | 182fe68, 755e00d, 9b1c4fc | `tag_index = memory` (default): in-memory posting index `memidx` (snapshot side file + replay, exact SQL recheck of every candidate; also drives COUNT/HLL, NIP-29 group deletes and NIP-62 gift-wrap deletes); `tag_index = sqlite`: compact `tag` table (letter code + 8-byte value key) + delete trigger. WAL write-coalescing VFS (`ngwal`). Only `tag_index_letters` (default e,p,a,q,t,d,h,k) are indexed, at most `tag_index_max_per_event` (default 2000) per event; other letters and tags past the cap are answered from the stored tags JSON (correct, slower). The `kind` column stays: kinds filters are checked on the tag row before the join |
 | A2 `limit:0` | **done** | 94aeaf6 | |
 | A3/B7 tag count, sizes | **done** | 2d5e673 | configurable (`max_event_tags`, `max_content_length`, ...) |
 | A4 OK for invalid events | **done** | 9257dad | NIP-01 prefixes |
@@ -38,7 +38,7 @@ Everything in this audit is done except NIP-86 and NIP-77, which the owner put o
 
 Known limitations:
 - NIP-29/43 in-memory state is updated before COMMIT. If a writer COMMIT fails, the relay-generated events roll back, but the in-memory state does not until restart, when the state is replayed from the DB.
-- Tag filters on letters outside `tag_index_letters` (e.g. NIP-22 `#E`/`#K`/`#P`, `#r`, `#g`) scan the tags JSON of the events the rest of the filter selects: correct, but O(candidates) instead of an index lookup. Add heavily queried letters to the list (the index is rebuilt at the next start).
+- Tag filters on letters outside `tag_index_letters` (e.g. NIP-22 `#E`/`#K`/`#P`, `#r`, `#g`) scan the tags JSON of the events the rest of the filter selects: correct, but O(candidates) instead of an index lookup. Add heavily queried letters to the list (the index is rebuilt at the next start: seconds per million events in memory mode).
 - Ban lists are read at startup only, because changing them at runtime would need NIP-86.
 
 Durability: `tools/fsync_check/` (LD_PRELOAD tracer) shows that every `OK true` is sent only after an fdatasync of the WAL that started after the event's frames were written. This holds with coalescing on and off. The `db_sync = normal` negative control is caught. Results are in `tools/fsync_check` output at 1f961ac: 2400/2400 OKs covered, 0 violations; 704 WAL pwrites / 668 syncs with coalescing, 19211 pwrites without; the NORMAL control flags all 2400.
