@@ -15,6 +15,15 @@
  *   nostr-fanout  -c subscribers send REQ {"kinds":[1],"limit":0}; -n
  *                 publishers send events from -f at -R events/s total; latency
  *                 per delivery (content must be the decimal event index)
+ *   nostr-real    realistic mix (tools/bench/realgen.py): -n publishers send -f
+ *                 at -R events/s; every other conn is a subscriber that sends one
+ *                 -S scenario line's REQs on connect (class TAB frame TAB ...; ids
+ *                 "P*" are closed at EOSE, the rest stay open). -b browse REQs/s
+ *                 (filters from -B, active subscribers, CLOSE at EOSE). -X s:frac
+ *                 reconnect storm: s seconds into the run frac of the subscribers
+ *                 drop (RST) and reconnect, re-sending their REQs. Reports live
+ *                 deliveries (latency = publish -> delivery), backfill events,
+ *                 REQ->EOSE and browse latency, storm recovery time.
  * options
  *   -H host (127.0.0.1)  -p port (9001)  -c conns  -t threads (nproc/2)
  *   -i source IPs (127.0.0.2..; default conns/20000+1)  -d seconds (10)
@@ -45,7 +54,7 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { M_HOLD, M_ECHO, M_BCAST, M_NPUB, M_NFAN, M_CHURN };
+enum { M_HOLD, M_ECHO, M_BCAST, M_NPUB, M_NFAN, M_CHURN, M_REAL };
 enum { C_CONNECTING, C_HANDSHAKE, C_OPEN, C_DEAD };
 enum { R_SUB, R_PUB };
 
@@ -56,6 +65,14 @@ static const char *evfile;
 static char **events; static size_t nevents;
 static uint64_t *ev_sent_ns;        /* fanout: send time per event index */
 static ng_atomic_size ev_next;        /* next event index to send */
+/* nostr-real */
+static const char *scenfile, *browsefile, *stormspec;
+static char ***scen; static int *scen_n; static char *scen_cls; static size_t nscen;
+static char **browse; static size_t nbrowse;
+static double browse_rate;
+static ng_atomic_size browse_next;
+static ng_atomic_int storm_left;        /* storm conns still recovering */
+static ng_atomic_ullong storm_t0, storm_done_ns;
 
 static const uint8_t MASK[4] = { 0x37, 0xfa, 0x21, 0x3d };
 
@@ -96,6 +113,7 @@ typedef struct {
     size_t ev_lo, ev_hi, ev_pos;    /* nostr-pub slice */
     uint64_t sent[64]; unsigned sh, st;   /* nostr-pub: send times, OKs arrive in order */
     int gi; uint64_t conn_start_ns;      /* churn */
+    int line, pend_eose; uint64_t bundle_ns, browse_ns; bool in_storm;   /* nostr-real */
 } conn_t;
 
 typedef struct {
@@ -105,7 +123,8 @@ typedef struct {
     int open, failed, connecting;
     int next_to_connect;
     uint64_t msgs, bytes, oks, fails;
-    hist_t hist;
+    uint64_t backfill, bfbytes, eoses, browses, closed, notices;
+    hist_t hist, ehist, bhist;           /* nostr-real: REQ->EOSE, browse */
     bool measuring;
     pthread_mutex_t hmu;
 } thr_t;
@@ -205,8 +224,16 @@ static bool send_next_event(conn_t *c, bool fanout) {
     return true;
 }
 
+static void real_bundle(conn_t *c) {
+    if (c->line < 0) return;
+    c->pend_eose = 0;
+    for (int i = 0; i < scen_n[c->line]; i++) { const char *f = scen[c->line][i]; send_frame(c, 1, (const uint8_t *) f, strlen(f)); c->pend_eose++; }
+    c->bundle_ns = now_ns();
+}
+
 static void on_open(thr_t *t, conn_t *c) {
     c->state = C_OPEN; t->connecting--; t->open++; ng_atomic_fetch_add(&total_open, 1);
+    if (mode == M_REAL && c->role == R_SUB) real_bundle(c);
     if (mode == M_NFAN && c->role == R_SUB) {
         static const char req[] = "[\"REQ\",\"f\",{\"kinds\":[1],\"limit\":0}]";
         send_frame(c, 1, (const uint8_t *) req, sizeof(req) - 1);
@@ -220,6 +247,14 @@ static void start_traffic(thr_t *t, conn_t *c) {
     else if (mode == M_BCAST && c->role == R_PUB && rate <= 0) for (int i = 0; i < pipel; i++) send_bcast(c);
     else if (mode == M_NPUB) for (int i = 0; i < pipel; i++) if (!send_next_event(c, false)) break;
     do_write(t, c);
+}
+
+/* subscription id of ["EVENT"|"EOSE"|"CLOSED","<id>"...]: p points after the verb's comma */
+static size_t sub_id(const uint8_t *p, size_t n, const uint8_t **id) {
+    if (n < 2 || p[0] != '"') return 0;
+    const uint8_t *e = memchr(p + 1, '"', n - 1);
+    if (!e) return 0;
+    *id = p + 1; return (size_t) (e - p - 1);
 }
 
 static long parse_index_from_event(const uint8_t *p, size_t n) {
@@ -266,6 +301,40 @@ static void on_message(thr_t *t, conn_t *c, int op, uint8_t *p, size_t n) {
             if (ng_atomic_load(&phase) == 1) send_next_event(c, false);
         }
         break;
+    case M_REAL: {
+        const uint8_t *id = NULL; size_t il;
+        if (n > 10 && memcmp(p, "[\"EVENT\",", 9) == 0 && (il = sub_id(p + 9, n - 9, &id)) > 0) {
+            if (id[0] == 'L' && c->pend_eose == 0) {          /* live delivery */
+                long i = parse_index_from_event(p, n);
+                if (m) { t->msgs++; t->bytes += n; if (i >= 0 && (size_t) i < nevents && ev_sent_ns[i]) hadd(&t->hist, now_ns() - ev_sent_ns[i]); }
+            } else if (m) { t->backfill++; t->bfbytes += n; }
+        } else if (n > 9 && memcmp(p, "[\"EOSE\",", 8) == 0 && (il = sub_id(p + 8, n - 8, &id)) > 0) {
+            uint64_t now = now_ns();
+            if (id[0] == 'b' && il == 1) {
+                if (m && c->browse_ns) { t->browses++; hadd(&t->bhist, now - c->browse_ns); }
+                c->browse_ns = 0;
+                send_frame(c, 1, (const uint8_t *) "[\"CLOSE\",\"b\"]", 13);
+            } else {
+                if (m) { t->eoses++; hadd(&t->ehist, now - c->bundle_ns); }
+                if (c->pend_eose > 0 && --c->pend_eose == 0 && c->in_storm) {
+                    c->in_storm = false;
+                    if (ng_atomic_fetch_sub(&storm_left, 1) == 1) ng_atomic_store(&storm_done_ns, now);
+                }
+                if (id[0] == 'P') {
+                    char cl[96]; int k = snprintf(cl, sizeof(cl), "[\"CLOSE\",\"%.*s\"]", (int) (il < 64 ? il : 64), (const char *) id);
+                    send_frame(c, 1, (const uint8_t *) cl, (size_t) k);
+                }
+            }
+        } else if (n > 11 && memcmp(p, "[\"CLOSED\",", 10) == 0) {
+            if (m) t->closed++;
+            if ((il = sub_id(p + 10, n - 10, &id)) == 1 && id[0] == 'b') c->browse_ns = 0;
+            else if (c->pend_eose > 0) c->pend_eose--;
+        } else if (n > 5 && memcmp(p, "[\"OK\"", 5) == 0) {
+            c->inflight--;
+            if (m) { if (memmem(p, n, "\",true,", 7)) t->oks++; else t->fails++; }
+        } else if (n > 10 && memcmp(p, "[\"NOTICE\"", 10) == 0) { if (m) t->notices++; }
+        break;
+    }
     case M_NFAN:
         if (n > 12 && memcmp(p, "[\"EVENT\",\"f\"", 12) == 0) {
             long i = parse_index_from_event(p, n);
@@ -329,7 +398,7 @@ static void recycle(thr_t *t, conn_t *c) {
     epoll_ctl(t->ep, EPOLL_CTL_DEL, c->fd, NULL);
     close(c->fd);
     if (c->state == C_OPEN) { t->open--; ng_atomic_fetch_sub(&total_open, 1); } else t->connecting--;
-    c->rlen = 0; c->wlen = c->woff = 0;
+    c->rlen = 0; c->wlen = c->woff = 0; c->pend_eose = 0; c->browse_ns = 0;
     start_connect(t, c, c->gi);
 }
 
@@ -369,6 +438,43 @@ static void handshake_send(thr_t *t, conn_t *c) {
     do_write(t, c);
 }
 
+/* nostr-real per-thread tick: browse REQs at browse_rate (this thread's share), storm. */
+static NG_THREAD_LOCAL uint64_t rt_last, rt_debt_ns; static NG_THREAD_LOCAL int rt_cursor, rt_storm_done;
+static void real_tick(thr_t *t) {
+    uint64_t now = now_ns();
+    if (!rt_last) { rt_last = now; return; }
+    if (now - rt_last < 10000000) return;          /* 10 ms */
+    uint64_t dt = now - rt_last; rt_last = now;
+    if (stormspec && !rt_storm_done && ng_atomic_load(&storm_t0) && now >= ng_atomic_load(&storm_t0)) {
+        rt_storm_done = 1;
+        double frac = atof(strchr(stormspec, ':') ? strchr(stormspec, ':') + 1 : "0.5");
+        for (int i = 0; i < t->n; i++) {
+            conn_t *c = &t->c[i];
+            if (c->role != R_SUB || c->state != C_OPEN || (double) (((unsigned) c->gi * 2654435761u) % 10000u) >= frac * 10000) continue;
+            c->in_storm = true; ng_atomic_fetch_add(&storm_left, 1);
+            recycle(t, c);
+        }
+    }
+    if (browse_rate <= 0 || !nbrowse) return;
+    double per_thread = browse_rate / nthreads;
+    rt_debt_ns += dt;
+    uint64_t gap = (uint64_t) (1e9 / per_thread);
+    int sent = 0;
+    while (rt_debt_ns >= gap && sent < 1000) {
+        rt_debt_ns -= gap;
+        for (int tries = 0; tries < t->n; tries++) {
+            conn_t *c = &t->c[rt_cursor++ % t->n];
+            if (c->role != R_SUB || c->state != C_OPEN || c->line < 0 || scen_cls[c->line] != 'a' || c->browse_ns || c->pend_eose) continue;
+            size_t bi = ng_atomic_fetch_add_explicit(&browse_next, 1, NG_MO_RELAXED) % nbrowse;
+            char *f = browse[bi]; size_t fl = strlen(f);
+            char *msg = need(malloc(fl + 16)); int k = snprintf(msg, fl + 16, "[\"REQ\",\"b\",%s]", f);
+            send_frame(c, 1, (const uint8_t *) msg, (size_t) k); free(msg);
+            c->browse_ns = now; do_write(t, c); sent++;
+            break;
+        }
+    }
+}
+
 static void *thr_main(void *arg) {
     thr_t *t = arg;
     t->ep = epoll_create1(0);
@@ -397,7 +503,8 @@ static void *thr_main(void *arg) {
             if (c->state != C_DEAD && (ev[i].events & EPOLLIN)) do_read(t, c);
         }
         /* rate-driven publishers */
-        if (ph == 1 && rate > 0 && (mode == M_BCAST || mode == M_NFAN || mode == M_ECHO)) {
+        if (ph == 1 && mode == M_REAL) real_tick(t);
+        if (ph == 1 && rate > 0 && (mode == M_BCAST || mode == M_NFAN || mode == M_ECHO || mode == M_REAL)) {
             uint64_t now = now_ns();
             if (now - last_tick >= 200000) {
                 last_tick = now;
@@ -455,10 +562,39 @@ static void load_events(void) {
     ev_sent_ns = calloc(nevents, sizeof(uint64_t));
 }
 
+static char **load_lines(const char *path, size_t *n) {
+    FILE *f = fopen(path, "r");
+    if (!f) { perror(path); exit(1); }
+    size_t cap = 1024; char **v = need(calloc(cap, sizeof(char *))); *n = 0;
+    char *line = NULL; size_t lc = 0; ssize_t r;
+    while ((r = getline(&line, &lc, f)) > 0) {
+        while (r && (line[r-1] == '\n' || line[r-1] == '\r')) line[--r] = 0;
+        if (!r) continue;
+        if (*n == cap) { cap *= 2; v = need(realloc(v, cap * sizeof(char *))); }
+        v[(*n)++] = need(strndup(line, (size_t) r));
+    }
+    free(line); fclose(f);
+    return v;
+}
+static void load_scenario(void) {
+    char **lines = load_lines(scenfile, &nscen);
+    scen = need(calloc(nscen, sizeof(char **))); scen_n = need(calloc(nscen, sizeof(int))); scen_cls = need(calloc(nscen, 1));
+    for (size_t i = 0; i < nscen; i++) {
+        char *sv = NULL, *tok = strtok_r(lines[i], "\t", &sv);
+        scen_cls[i] = tok ? tok[0] : '?';
+        int cap = 8; scen[i] = need(calloc((size_t) cap, sizeof(char *)));
+        while ((tok = strtok_r(NULL, "\t", &sv))) {
+            if (scen_n[i] == cap) { cap *= 2; scen[i] = need(realloc(scen[i], (size_t) cap * sizeof(char *))); }
+            scen[i][scen_n[i]++] = tok;               /* points into lines[i] (kept) */
+        }
+    }
+    free(lines);                                      /* the strings stay referenced */
+}
+
 int main(int argc, char **argv) {
     nthreads = (int) sysconf(_SC_NPROCESSORS_ONLN) / 2; if (nthreads < 1) nthreads = 1;
     int opt; nsrc = -1;
-    while ((opt = getopt(argc, argv, "H:p:c:t:i:d:m:P:n:R:f:x:w:k:q")) != -1) {
+    while ((opt = getopt(argc, argv, "H:p:c:t:i:d:m:P:n:R:f:x:w:k:qS:B:b:X:")) != -1) {
         switch (opt) {
         case 'H': host = optarg; break; case 'p': port = atoi(optarg); break;
         case 'c': nconns = atoi(optarg); break; case 't': nthreads = atoi(optarg); break;
@@ -468,17 +604,23 @@ int main(int argc, char **argv) {
         case 'f': evfile = optarg; break; case 'x': server_pid = atoi(optarg); break;
         case 'w': warmup = atoi(optarg); break; case 'k': cbatch = atoi(optarg); break;
         case 'q': quiet = 1; break;
+        case 'S': scenfile = optarg; break; case 'B': browsefile = optarg; break;
+        case 'b': browse_rate = atof(optarg); break; case 'X': stormspec = optarg; break;
         default: fprintf(stderr, "see source header for usage\n"); return 2;
         }
     }
     if (optind >= argc) { fprintf(stderr, "mode required\n"); return 2; }
     const char *ms = argv[optind];
     mode = !strcmp(ms, "hold") ? M_HOLD : !strcmp(ms, "echo") ? M_ECHO : !strcmp(ms, "bcast") ? M_BCAST :
-           !strcmp(ms, "nostr-pub") ? M_NPUB : !strcmp(ms, "nostr-fanout") ? M_NFAN : !strcmp(ms, "churn") ? M_CHURN : -1;
+           !strcmp(ms, "nostr-pub") ? M_NPUB : !strcmp(ms, "nostr-fanout") ? M_NFAN : !strcmp(ms, "churn") ? M_CHURN :
+           !strcmp(ms, "nostr-real") ? M_REAL : -1;
     if (mode < 0) { fprintf(stderr, "bad mode\n"); return 2; }
     if (mode == M_NPUB && pipel > 64) { fprintf(stderr, "nostr-pub: -P max 64\n"); return 2; }
     if ((mode == M_NPUB || mode == M_NFAN) && !evfile) { fprintf(stderr, "-f events file required\n"); return 2; }
+    if (mode == M_REAL && !scenfile) { fprintf(stderr, "nostr-real: -S scenario file required\n"); return 2; }
     if (evfile) load_events();
+    if (scenfile) load_scenario();
+    if (browsefile) browse = load_lines(browsefile, &nbrowse);
     if (nsrc < 0) nsrc = nconns / 20000 + 1;
     if (strcmp(host, "127.0.0.1") != 0) nsrc = 0;
     struct rlimit rl; getrlimit(RLIMIT_NOFILE, &rl); rl.rlim_cur = rl.rlim_max; setrlimit(RLIMIT_NOFILE, &rl);
@@ -498,7 +640,8 @@ int main(int argc, char **argv) {
         for (int i = 0; i < T[k].n; i++, g++) {
             conn_t *c = &T[k].c[i];
             int gi = k + i * nthreads;
-            c->role = (mode == M_BCAST || mode == M_NFAN) ? (gi < npubs ? R_PUB : R_SUB) : R_SUB;
+            c->role = (mode == M_BCAST || mode == M_NFAN || mode == M_REAL) ? (gi < npubs ? R_PUB : R_SUB) : R_SUB;
+            c->line = (mode == M_REAL && c->role == R_SUB && nscen) ? (int) ((size_t) (gi - npubs) % nscen) : -1;
             if (mode == M_NPUB) { size_t per = nevents / (size_t) nconns; c->ev_lo = c->ev_pos = per * (size_t) gi; c->ev_hi = c->ev_lo + per; }
             (void) g;
         }
@@ -516,6 +659,15 @@ int main(int argc, char **argv) {
     }
     double connect_s = (double) (now_ns() - t0) / 1e9;
     if (mode == M_NFAN) usleep(500000 + (useconds_t) nconns * 20);   /* let REQs register */
+    if (mode == M_REAL) {                     /* wait for the startup REQs' EOSEs (max 120 s) */
+        uint64_t w = now_ns();
+        for (;;) {
+            int pend = 0;
+            for (int k = 0; k < nthreads; k++) for (int i = 0; i < T[k].n; i++) pend += T[k].c[i].pend_eose > 0;
+            if (!pend || now_ns() - w > 120000000000ull) { if (!quiet) fprintf(stderr, "startup EOSE wait %.2fs, pending %d\n", (double) (now_ns() - w) / 1e9, pend); break; }
+            usleep(50000);
+        }
+    }
     long rss1 = server_pid ? rss_kb(server_pid) : -1;
     if (!quiet) fprintf(stderr, "connected %d (failed %d) in %.2fs\n", ng_atomic_load(&total_open), ng_atomic_load(&total_failed), connect_s);
 
@@ -527,13 +679,14 @@ int main(int argc, char **argv) {
     double sc0 = server_pid ? cpu_s(server_pid) : 0, cc0 = self_cpu_s();
     ng_atomic_store(&measuring, true);
     uint64_t w0 = now_ns();
+    if (stormspec) { ng_atomic_store(&storm_left, 0); ng_atomic_store(&storm_t0, w0 + (uint64_t) (atof(stormspec) * 1e9)); }
     for (int s = 0; s < duration * 10; s++) {
         usleep(100000);
         if (mode == M_NPUB) {     /* stop early when all events acked */
             uint64_t m = ng_atomic_load_explicit(&npub_acked, NG_MO_RELAXED);
             if (m >= nevents - (nevents % (size_t) nconns)) break;
         }
-        if (mode == M_NFAN && ng_atomic_load(&ev_next) >= nevents) { usleep(300000); break; }
+        if ((mode == M_NFAN || mode == M_REAL) && ng_atomic_load(&ev_next) >= nevents) { usleep(300000); break; }
     }
     ng_atomic_store(&measuring, false);
     double secs = (double) (now_ns() - w0) / 1e9;
@@ -542,12 +695,16 @@ int main(int argc, char **argv) {
     ng_atomic_store(&phase, 2);
     for (int k = 0; k < nthreads; k++) pthread_join(T[k].th, NULL);
 
-    uint64_t msgs = 0, bytes = 0, oks = 0, fails = 0;
-    hist_t *h = need(calloc(1, sizeof(hist_t)));
+    uint64_t msgs = 0, bytes = 0, oks = 0, fails = 0, bf = 0, bfb = 0, eo = 0, br = 0, cl = 0, no = 0;
+    hist_t *h = need(calloc(3, sizeof(hist_t))), *he = h + 1, *hb = h + 2;
     for (int k = 0; k < nthreads; k++) {
         msgs += T[k].msgs; bytes += T[k].bytes; oks += T[k].oks; fails += T[k].fails;
-        for (int i = 0; i < HB; i++) h->b[i] += T[k].hist.b[i];
-        h->n += T[k].hist.n; h->sum += T[k].hist.sum; if (T[k].hist.max > h->max) h->max = T[k].hist.max;
+        bf += T[k].backfill; bfb += T[k].bfbytes; eo += T[k].eoses; br += T[k].browses; cl += T[k].closed; no += T[k].notices;
+        const hist_t *src[3] = { &T[k].hist, &T[k].ehist, &T[k].bhist };
+        for (int j = 0; j < 3; j++) {
+            for (int i = 0; i < HB; i++) h[j].b[i] += src[j]->b[i];
+            h[j].n += src[j]->n; h[j].sum += src[j]->sum; if (src[j]->max > h[j].max) h[j].max = src[j]->max;
+        }
     }
     (void) m0; (void) b0;
     printf("mode=%s conns=%d open=%d failed=%d threads=%d src_ips=%d connect_s=%.2f",
@@ -556,7 +713,16 @@ int main(int argc, char **argv) {
     for (int i = 1; i < 256; i++) { unsigned n = ng_atomic_load(&connect_errno[i]); if (n) printf(" errno_%d=%u", i, n); }
     if (mode != M_HOLD)
         printf(" secs=%.2f msgs=%llu msgs_s=%.0f MB_s=%.1f", secs, (unsigned long long) msgs, (double) msgs / secs, (double) bytes / secs / 1e6);
-    if (mode == M_NPUB || mode == M_NFAN) printf(" ok=%llu rejected=%llu", (unsigned long long) oks, (unsigned long long) fails);
+    if (mode == M_NPUB || mode == M_NFAN || mode == M_REAL) printf(" ok=%llu rejected=%llu", (unsigned long long) oks, (unsigned long long) fails);
+    if (mode == M_REAL) {
+        printf(" backfill_ev=%llu backfill_MB=%.1f eose=%llu eose_ms_p50=%.1f p99=%.1f browse=%llu browse_s=%.1f browse_ms_p50=%.2f p99=%.2f closed=%llu notices=%llu",
+               (unsigned long long) bf, (double) bfb / 1e6, (unsigned long long) eo, hq(he, .5) / 1e6, hq(he, .99) / 1e6,
+               (unsigned long long) br, (double) br / secs, hq(hb, .5) / 1e6, hq(hb, .99) / 1e6, (unsigned long long) cl, (unsigned long long) no);
+        if (stormspec) {
+            uint64_t d = ng_atomic_load(&storm_done_ns), s0 = ng_atomic_load(&storm_t0);
+            printf(" storm_left=%d storm_recover_s=%.2f", ng_atomic_load(&storm_left), d > s0 ? (double) (d - s0) / 1e9 : -1.0);
+        }
+    }
     if (h->n) printf(" lat_us_p50=%.0f p99=%.0f p999=%.0f max=%.0f", hq(h, .5) / 1e3, hq(h, .99) / 1e3, hq(h, .999) / 1e3, (double) h->max / 1e3);
     if (server_pid) {
         printf(" srv_rss_base_mb=%.1f srv_rss_conn_mb=%.1f bytes_per_conn=%.0f srv_rss_end_mb=%.1f srv_cpu_pct=%.0f",
