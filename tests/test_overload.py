@@ -226,7 +226,7 @@ alive, st = r.stop()
 check("C admission rejections counted", alive and st.get("shed_admission", 0) >= 2, str(st))
 
 # ---------------------------------------------------------------- D ----
-r = Relay("conn_pending_max = 8\n")
+r = Relay("conn_pending_max = 8\nread_pause = 1024\n")
 c = WS(r.port); time.sleep(.2)
 c.send(*[["REQ", f"q{i}", {"kinds": [7], "limit": 1}] for i in range(300)])
 ans = {}
@@ -244,8 +244,8 @@ check("D over conn_pending_max the socket is read-paused, not refused", len(shed
 alive, st = r.stop()
 check("D relay alive, read pause counted", alive and st.get("read_paused", 0) > 0 and st.get("shed_inline", 0) == 0, str(st))
 
-# D2: the same burst with read pausing off (NG_READ_PAUSE=0) is shed inline.
-r = Relay("conn_pending_max = 8\n", {"NG_READ_PAUSE": "0"})
+# D2: the same burst with read pausing off (the default) is shed inline.
+r = Relay("conn_pending_max = 8\n")
 c = WS(r.port); time.sleep(.2)
 c.send(*[["REQ", f"q{i}", {"kinds": [7], "limit": 1}] for i in range(300)])
 ans = {}

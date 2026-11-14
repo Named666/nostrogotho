@@ -112,6 +112,7 @@ typedef struct {
     size_t worker_queue_max;    /* worker_queue_max: queued inbound bytes per worker */
     int writer_queue_max;       /* writer_queue_max: EVENTs waiting for the writer */
     int conn_pending_max;       /* conn_pending_max: queued messages per connection */
+    int read_pause;             /* read_pause: over budget, queue up to N per conn and pause reads (0: shed) */
     ng_limits_t limits;         /* protocol limits (see ng_limits_t) */
     ng_relay_info_t info;       /* identity and policy (see ng_relay_info_t) */
     ng_policy_t policy;         /* rate limits and bans (see ng_policy_t) */

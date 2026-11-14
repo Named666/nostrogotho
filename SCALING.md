@@ -243,6 +243,7 @@ Config keys (with K/M/G suffixes):
 | `worker_queue_max` | 16M | Bytes queued per worker. When full, the I/O thread answers inline with "error: relay overloaded, try again later" and never blocks. |
 | `writer_queue_max` | 65536 | EVENTs queued for the single writer. Over it, `OK false` with the overload error. |
 | `conn_pending_max` | 1024 | Unprocessed messages per connection. |
+| `read_pause` | 0 | Over the budgets above, queue up to N more messages per connection (worker queue up to 5/4 of `worker_queue_max`) and pause reading the socket until the worker drains, instead of refusing. Off by default: in the 20k reconnect-storm run it served more of the storm but recovered later, with higher live latency and memory. |
 
 - Stored-event replies to a REQ are capped at `conn_out_max/2` bytes. EOSE
   still follows.

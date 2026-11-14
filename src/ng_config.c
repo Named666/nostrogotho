@@ -106,6 +106,7 @@ static const cfg_key_t keys[] = {
     { "worker_queue_max",   K_SIZE,    (size_t) 64 << 10,  (size_t) 1 << 36, F(worker_queue_max) },
     { "writer_queue_max",   K_INT,     1, (size_t) 1 << 24,            F(writer_queue_max) },
     { "conn_pending_max",   K_INT,     1, (size_t) 1 << 20,            F(conn_pending_max) },
+    { "read_pause",         K_INT,     0, 1024,                        F(read_pause) },
     { "max_message_length", K_SIZE,    (size_t) 64 << 10, (size_t) 64 << 20,  F(limits.max_message_length) },
     { "max_event_size",     K_SIZE,    (size_t) 4 << 10,  (size_t) 4 << 20,   F(limits.max_event_size) },
     { "max_content_length", K_SIZE,    1,                 (size_t) 4 << 20,   F(limits.max_content_length) },

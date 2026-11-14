@@ -84,7 +84,6 @@ static size_t info_doc_len;
 static ng_atomic_llong stat_open_conns;
 static ng_atomic_ullong stat_shed_loop, stat_shed_core, stat_read_paused;
 static int n_io_loops;
-static bool read_pause = true;           /* NG_READ_PAUSE=0: shed instead (A/B) */
 
 static int env_int(const char *name, int dflt) {
     const char *v = getenv(name);
@@ -178,12 +177,17 @@ static void on_drain(ngws_socket_t *ws) {
 }
 
 /* ------------------------------------------------- read pause / resume --
- * Over the soft budgets (worker_queue_max, conn_pending_max) a message is
- * still queued, but its socket stops being read until the worker drains
- * (TCP backpressure, as nginx/Envoy apply it): a reconnect storm is served
- * late instead of refused. Past twice the budgets (a client that keeps
- * sending regardless) or for a message larger than the whole budget, it is
- * refused inline as before. */
+ * Over the soft budgets (worker_queue_max, conn_pending_max) a connection
+ * with fewer than read_pause (config, default 0 = off) messages in flight still gets this one queued,
+ * and its socket stops being read until the worker drains (TCP backpressure,
+ * as nginx/Envoy apply it): in a reconnect storm every client's first REQs
+ * are served instead of refused. The slack is bounded (at most read_pause
+ * messages per connection, worker_queue_max + 1/4 per worker) so a storm
+ * cannot grow the queue, its latency or the output buffers much past the
+ * budget; beyond it, or for a message larger than the whole budget, the
+ * message is refused inline as before. Off by default: in the 20k-conn
+ * reconnect storm, serving the storm late cost more recovery time, live
+ * latency and memory than refusing it (round3-report.md). */
 static bool resumable(const ng_conn_t *c) {
     return ngb_worker_queued_bytes(c->base.shard) < opt.worker_queue_max / 2 &&
            ng_atomic_load_explicit(&c->pending, NG_MO_RELAXED) < (opt.conn_pending_max + 1) / 2;
@@ -221,8 +225,8 @@ static void on_message(ngws_socket_t *ws, char *data, size_t len, int op) {
     size_t queued = ngb_worker_queued_bytes(c->base.shard) + ngb_message_cost(len);
     int pending = ng_atomic_load_explicit(&c->pending, NG_MO_RELAXED);
     bool over = pending >= opt.conn_pending_max || queued > opt.worker_queue_max;
-    if (over && !(read_pause && ngb_message_cost(len) <= opt.worker_queue_max &&
-                  pending < 2 * opt.conn_pending_max && queued <= 2 * opt.worker_queue_max)) {
+    if (over && !(pending < opt.read_pause && ngb_message_cost(len) <= opt.worker_queue_max &&
+                  queued <= opt.worker_queue_max + opt.worker_queue_max / 4)) {
         shed_inline(ws, data, len);
         return;
     }
@@ -275,8 +279,6 @@ bool server_run(int port) {
     relay_core_set_query_bytes_max(opt.conn_outbound_max / 2);
     const char *bv = getenv("NG_BATCH_VERIFY");      /* NG_BATCH_VERIFY=0 disables (A/B benchmarks) */
 
-    const char *rp = getenv("NG_READ_PAUSE");
-    read_pause = !(rp && strcmp(rp, "0") == 0);
     n_io_loops = n_loops;
     ngb_workers_on_drained(on_worker_drained, opt.worker_queue_max / 2);
     n_shards = ngb_workers_start(n_workers, !(bv && strcmp(bv, "0") == 0));
