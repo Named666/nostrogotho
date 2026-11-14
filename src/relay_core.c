@@ -102,8 +102,6 @@ static relay_admit_fn admission;
 
 /* Per-thread query context for the storage streaming callback. */
 static NG_THREAD_LOCAL relay_conn_t *query_connection;
-static NG_THREAD_LOCAL filter_t *query_filters;
-static NG_THREAD_LOCAL size_t query_filters_count;
 static NG_THREAD_LOCAL size_t query_bytes;
 static NG_THREAD_LOCAL bool query_bytes_dropped;   /* NIP-67: budget cut the reply */
 static NG_THREAD_LOCAL bool query_render_failed;   /* a stored row could not be rendered */
@@ -493,13 +491,9 @@ void relay_core_broadcast_shard(int shard, const relay_bcast_t *b) {
 static void query_sender(const char *json, const event_t *event) {
     if (!query_connection || !event) return;
     if (!json) { query_render_failed = true; return; }   /* storage could not render the row */
-    relay_tags_t tags;
-    if (!relay_tags_parse(event, &tags)) return;   /* OOM: tag filters cannot be evaluated; skip */
-    bool matched = false;
-    for (size_t i = 0; i < query_filters_count && !matched; i++)
-        if (matches_filter(&query_filters[i], event, &tags, false)) matched = true;
-    relay_tags_free(&tags);
-    if (matched && plugins_can_deliver(event, query_connection)) {
+    /* Storage returns only rows that match the filters exactly (SQL plus
+     * the exact tag JSON recheck in both tag_index modes): no second match. */
+    if (plugins_can_deliver(event, query_connection)) {
         size_t n = strlen(json);
         /* Byte budget per stored-event reply: a REQ may not queue more than
          * the connection's output budget allows in one burst; the rest is
@@ -521,8 +515,6 @@ static bool query_events(relay_conn_t *connection, const char *sub,
     query_bytes = 0;
     query_bytes_dropped = false;
     query_render_failed = false;
-    query_filters = filters;
-    query_filters_count = count;
     uint8_t hll[256];
     bool have_hll = false;
     int hll_offset = do_count && storage_ctx->count_hll ? plugins_count_hll_offset(filters, count) : -1;
@@ -534,8 +526,6 @@ static bool query_events(relay_conn_t *connection, const char *sub,
         st = storage_ctx->send_records(query_sender, sub, filters, count, do_count, &total_count, &more);
     }
     query_connection = NULL;
-    query_filters = NULL;
-    query_filters_count = 0;
     if (st != NG_OK) {
         nip_plugin_send_status(connection, "CLOSED", sub, false,
             st == NG_E_TOOBIG ? "error: query too complex (see NIP-11 limitation)"
