@@ -393,6 +393,71 @@ echo results at d8d8a31 match the earlier baselines:
 - REQ `limit:0` still returns up to 500 stored events (now byte-capped).
 - There are no per-identity quotas.
 
+## Realistic-load results and tuning (Nov 13, 2026, CST)
+
+Load model: `/workspace/bench/gate-results/realload-model.md` (cited client
+behaviour, live relay samples). Generator: `ngload nostr-real` (20,004
+connections, home/thread/notification/DM subscriptions, 300 ev/s publish,
+100 browse REQ/s, reconnect storm), 1M-event preload, 4 relay cores.
+
+### Memory per connection and subscription
+
+| state (20k conns, memory tag index) | bytes / connection |
+|---|---|
+| idle socket, no subscription (userspace) | 685 |
+| live scenario, before (61fc72b) | 25,284 |
+| + author interning (92cd349) | 21,589 |
+| + free idle input buffer (28e16c3) | 21,079 |
+| + `MALLOC_ARENA_MAX=1` (environment only) | 16,905 |
+
+The scenario has ~1.9 live subscriptions and ~108 author references per
+connection (49,982 distinct authors), so the author strings were the largest
+part of a subscription; they are now interned (one refcounted copy). A sub-index
+entry costs 40 B per indexed value. The earlier 722 KB/connection peak was not
+steady-state state: it was stalled backfill output (500-event home feeds that
+took >100 s to compute) plus SQLite page-cache growth. With the top-k backfill
+(3db5f40) those buffers drain in milliseconds and the peak is gone.
+
+glibc creates one malloc arena per thread; with many worker/I/O threads the
+freed per-connection blocks are spread over arenas and not returned.
+`MALLOC_ARENA_MAX=1` (or 2) cut ~4 KB/connection here with no measured
+throughput loss at this load; set it in the service environment.
+
+### Serialization
+
+Live fan-out serializes each event once: `relay_bcast_new` builds one
+refcounted body shared by every matching subscription; only the
+`["EVENT","<subid>",` prefix is per subscription. Backfill rows are rendered
+per REQ from the stored JSON (no re-serialization), and the duplicate
+per-row filter recheck was removed (3320b53).
+
+### Kernel socket tuning
+
+The relay sets no `SO_SNDBUF`/`SO_RCVBUF`, so Linux autotuning applies
+(`net.ipv4.tcp_wmem`/`tcp_rmem` min/default/max); setting the option per socket
+disables autotuning, so leave it. Idle sockets cost kernel memory only for
+their small default buffers, which autotuning grows on demand; the global cap
+is `net.ipv4.tcp_mem` (pages; when exceeded the kernel enters memory pressure
+and shrinks buffers). For 1M mostly idle sockets: raise `fs.nr_open`,
+`fs.file-max` and `LimitNOFILE` as above, size `tcp_mem` to ~2-4 KB per idle
+socket plus headroom for active senders, keep the default `tcp_wmem` max
+(4 MB) unless WAN BDP testing says otherwise, and watch
+`/proc/net/sockstat` (`TCP: mem`) and `ss -tm` under load. The relay already
+bounds userspace output per connection (`max_output_bytes`).
+
+### In-memory tag index (`tag_index = memory`)
+
+| events | postings | keys | index MB | RSS MB | B/event |
+|---|---|---|---|---|---|
+| 1M (realistic preload) | - | - | 124.7 | - | - |
+| 5M | 30.2M | - | 441.5 | 441.9 | 88 |
+| 10M | 60.2M | - | 894.1 | 881.0 | 89 |
+| 20M | 120.3M | 4.40M | 1537.7 | 1511.5 | 76.9 |
+
+20M events: add 166k ev/s, 4.6 us per 500-limit tag query, 12.78 B/posting;
+snapshot 751 MB written in 5.7 s and loaded in 4.5 s. Budget roughly
+80 B/event of RAM for the default tag letters (`tools/bench/memidx_scale.c`).
+
 ## Production starting point for one million concurrent users
 
 This is **a tuning proposal, not certified capacity**. Registered users and
