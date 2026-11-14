@@ -14,7 +14,6 @@
 #include "ng_config.h"
 #include "ws_proto.h"
 
-#define OUTBOX_FLUSH (256u * 1024)      /* post a loop's outbox once it holds this much */
 #ifndef SMALL_EVENT_COPY
 #define SMALL_EVENT_COPY 2048           /* event bodies up to this size are copied per subscriber */
 #endif
@@ -34,13 +33,15 @@ typedef struct outtask {
     char data[];
 } outtask_t;
 
-/* Pool of base-size tasks (nginx-style free list): a busy worker fills and
- * posts one 16 KiB task per loop per flush, and the loop frees it after the
- * write; recycling them removes that malloc/free pair (and its cross-thread
- * free) per flush. Bounded: OUTTASK_POOL_MAX * 16 KiB = 2 MiB. Tasks grown
- * past the base size are freed as before. */
-#define OUTTASK_BASE 16384u
-#define OUTTASK_POOL_MAX 128
+/* Output tasks are fixed-size chunks from a pool (nginx-style chain of
+ * buffers from a free list): a worker fills one per loop, posts it when the
+ * next record does not fit and takes another, and the loop returns it after
+ * the write. No realloc growth, no malloc/free (and cross-thread free) per
+ * flush, and a long backfill reaches the socket chunk by chunk instead of
+ * after a 256 KiB build-up. A record larger than a chunk gets its own exact
+ * allocation. Bounded: OUTTASK_POOL_MAX * 32 KiB = 2 MiB kept. */
+#define OUTTASK_BASE 32768u
+#define OUTTASK_POOL_MAX 64
 static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static outtask_t *pool_head;
 static int pool_n;
@@ -210,16 +211,8 @@ static char *outbox_reserve(ng_conn_t *c, uint32_t kind, size_t len, relay_body_
     if (NG_UNLIKELY(len > (size_t) UINT32_MAX - 8)) goto fail;   /* rec_t.len is 32-bit */
     size_t need = rec_size((uint32_t) len);
     if (ob->t && ob->t->len + need > ob->t->cap) {
-        if (ob->t->len >= OUTBOX_FLUSH) outbox_flush_loop(li);
-        else {
-            size_t want, nc, bytes;
-            if (!ng_size_add(ob->t->len, need, &want)) goto fail;
-            nc = ng_grow_cap(ob->t->cap, want, OUTTASK_BASE);
-            if (!ng_size_add(sizeof(outtask_t), nc, &bytes)) goto fail;
-            outtask_t *nt = (outtask_t *) realloc(ob->t, bytes);
-            if (!nt) goto fail;
-            ob->t = nt; nt->cap = nc;
-        }
+        if (ob->t->len) outbox_flush_loop(li);
+        else { outtask_put(ob->t); ob->t = NULL; }     /* empty chunk too small for this record */
     }
     if (!ob->t) {
         if (need <= OUTTASK_BASE) ob->t = outtask_get();
