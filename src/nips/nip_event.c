@@ -24,6 +24,11 @@ static bool tag_name_value(jstr_t tag, jstr_t *name, jstr_t *value) {
     return true;
 }
 
+bool nip_tag_named(jstr_t tag, const char *name, jstr_t *value) {
+    jstr_t n;
+    return tag_name_value(tag, &n, value) && jl_tok_eq(n, name);
+}
+
 bool nip_event_has_tag(const event_t *event, const char *name, const char *value) {
     jstr_t key, tag, tags = jl_str(event->tags_json); size_t offset = 0;
     while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
@@ -57,13 +62,9 @@ bool nip_event_has_relay_tag(const event_t *event, const char *relay) {
 }
 
 char *nip_event_tag_value(const event_t *event, const char *name) {
-    jstr_t key, tag, tags = jl_str(event->tags_json ? event->tags_json : "[]");
+    jstr_t key, tag, v, tags = jl_str(event->tags_json ? event->tags_json : "[]");
     size_t offset = 0;
-    while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
-        char *n = nip_tag_element(tag, 0);
-        bool hit = n && strcmp(n, name) == 0;
-        free(n);
-        if (hit) return nip_tag_element(tag, 1);
-    }
+    while ((offset = jl_next(tags, offset, &key, &tag)) != 0)
+        if (nip_tag_named(tag, name, &v)) return jl_unquote(v);
     return NULL;
 }

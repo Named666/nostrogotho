@@ -26,26 +26,27 @@
 bool nip40_event_is_expired(const event_t *event) {
     if (!event || !event->tags_json) return false;
 
-    jstr_t key, tag, tags = jl_str(event->tags_json);
+    jstr_t key, tag, value, tags = jl_str(event->tags_json);
     size_t offset = 0;
-    time_t now = time(NULL);
+    time_t now = 0;
 
+    /* Runs per delivery candidate and per stored row: no allocation unless
+     * the value is unusually long. An expired tag governs even if another
+     * expiration tag is not expired; a non-string value is ignored. */
     while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
-        if (name && strcmp(name, "expiration") == 0) {
-            char *value = nip_tag_element(tag, 1);
-            bool expired = false;
-            if (value) {
-                time_t expiration = (time_t) strtoll(value, NULL, 10);
-                expired = expiration <= now;
-            }
-            free(value);
-            free(name);
-            if (expired) return true;
-            /* An expired tag governs even if another tag is unexpired. */
-        } else {
-            free(name);
+        if (!nip_tag_named(tag, "expiration", &value) || !value.buf || value.buf[0] != '"') continue;
+        char small[40], *heap = NULL, *text = small;
+        size_t len = 0;
+        if (value.len <= sizeof(small)) {
+            if (!jl_unescape(value, small, &len)) continue;
+            small[len] = '\0';
+        } else if (!(text = heap = jl_unquote(value))) {
+            continue;
         }
+        time_t expiration = (time_t) strtoll(text, NULL, 10);
+        free(heap);
+        if (!now) now = time(NULL);
+        if (expiration <= now) return true;
     }
     return false;
 }

@@ -35,10 +35,9 @@ static int nip13_committed_target(const event_t *event) {
     int target = 0;
 
     while ((offset = jl_next(tags, offset, &key, &tag)) != 0) {
-        char *name = nip_tag_element(tag, 0);
-        if (name && strcmp(name, "nonce") == 0) {
+        jstr_t second;
+        if (nip_tag_named(tag, "nonce", &second)) {
             char *value = nip_tag_element(tag, 2);
-            free(name);
             if (value) {
                 char *end = NULL;
                 long parsed = strtol(value, &end, 10);
@@ -49,7 +48,6 @@ static int nip13_committed_target(const event_t *event) {
             }
             return target;
         }
-        free(name);
     }
     return target;
 }

@@ -267,21 +267,15 @@ bool ngdb_add_tombstone(const char *id, const char *pubkey) {
 
 /* d-tag value of a tags JSON array ("" when absent), compared to want. */
 static bool tags_d_equals(const char *tags_json, const char *want) {
-    bool match = want[0] == '\0';
-    if (!tags_json) return match;
-    jstr_t key, t, tags_str = jl_str(tags_json);
+    if (!tags_json) return want[0] == '\0';
+    jstr_t key, t, v, tags_str = jl_str(tags_json);
     size_t offset = 0;
     while ((offset = jl_next(tags_str, offset, &key, &t)) != 0) {
-        char *name = nip_tag_element(t, 0);
-        bool is_d = name && strcmp(name, "d") == 0;
-        free(name);
-        if (!is_d) continue;
-        char *v = nip_tag_element(t, 1);
-        match = strcmp(v ? v : "", want) == 0;
-        free(v);
-        break;
+        if (!nip_tag_named(t, "d", &v)) continue;
+        if (v.buf && v.buf[0] == '"') return jl_tok_eq(v, want);
+        return want[0] == '\0';            /* a non-string value counts as "" */
     }
-    return match;
+    return want[0] == '\0';
 }
 
 storage_admit_t ngdb_replaceable_admit(const event_t *ev, const char *dtag) {
