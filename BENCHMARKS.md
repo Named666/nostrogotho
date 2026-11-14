@@ -31,7 +31,8 @@ The host was shared and noisier than on Nov 7.
 ## Final head-to-head: ngws (PGO) vs uWebSockets (Nov 7 2026)
 
 `tools/bench/h2h.sh 3 ngws=<pgo bench server> uws=<uws_ref>`, summarized with
-`tools/bench/h2h_summ.py`. Server pinned to CPUs 0-1 (2 loop threads; CPU 0
+`tools/bench/h2h_summ.py` (both removed from the tree with `uws_ref.cpp`; they
+are in git history up to f619fbd). Server pinned to CPUs 0-1 (2 loop threads; CPU 0
 for 1-thread cases), `ngload` 6 threads on CPUs 2-7, 4 s per run, 3 reps,
 runs interleaved ngws/uWS. ngws: `tools/bench/pgo_build.sh` (gcc -O3
 -march=native -flto + PGO). uWS: `tools/bench/uws_ref.cpp` (clang -O3
