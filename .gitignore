@@ -10,3 +10,4 @@ build/
 *.old
 TODO.md
 __pycache__/
+*.sqlite-tagidx

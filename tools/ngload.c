@@ -551,13 +551,17 @@ static void *thr_main(void *arg) {
 }
 
 /* ---------------------------------------------------------- proc stats -- */
-static long rss_kb(int pid) {
+/* field: "VmRSS:" (all resident) or "RssAnon:" (heap/stacks only; excludes
+ * file pages such as SQLite's mmap of the database, which the kernel can
+ * reclaim and which do not scale with connections). */
+static long proc_kb(int pid, const char *field) {
     char p[64]; snprintf(p, sizeof(p), "/proc/%d/status", pid);
     FILE *f = fopen(p, "r"); if (!f) return -1;
-    char line[256]; long v = -1;
-    while (fgets(line, sizeof(line), f)) if (!strncmp(line, "VmRSS:", 6)) { v = atol(line + 6); break; }
+    char line[256]; long v = -1; size_t fl = strlen(field);
+    while (fgets(line, sizeof(line), f)) if (!strncmp(line, field, fl)) { v = atol(line + fl); break; }
     fclose(f); return v;
 }
+static long rss_kb(int pid) { return proc_kb(pid, "VmRSS:"); }
 static double cpu_s(int pid) {
     char p[64]; snprintf(p, sizeof(p), "/proc/%d/stat", pid);
     FILE *f = fopen(p, "r"); if (!f) return -1;
@@ -667,7 +671,7 @@ int main(int argc, char **argv) {
             if (mode == M_NPUB) { size_t per = nevents / (size_t) nconns; c->ev_lo = c->ev_pos = per * (size_t) gi; c->ev_hi = c->ev_lo + per; }
             (void) g;
         }
-    long rss0 = server_pid ? rss_kb(server_pid) : -1;
+    long rss0 = server_pid ? rss_kb(server_pid) : -1, anon0 = server_pid ? proc_kb(server_pid, "RssAnon:") : -1;
     uint64_t t0 = now_ns();
     for (int k = 0; k < nthreads; k++) pthread_create(&T[k].th, NULL, thr_main, &T[k]);
     /* wait for connect phase */
@@ -690,7 +694,7 @@ int main(int argc, char **argv) {
             usleep(50000);
         }
     }
-    long rss1 = server_pid ? rss_kb(server_pid) : -1;
+    long rss1 = server_pid ? rss_kb(server_pid) : -1, anon1 = server_pid ? proc_kb(server_pid, "RssAnon:") : -1;
     if (!quiet) fprintf(stderr, "connected %d (failed %d) in %.2fs\n", ng_atomic_load(&total_open), ng_atomic_load(&total_failed), connect_s);
 
     int connected = ng_atomic_load(&total_open);
@@ -751,6 +755,8 @@ int main(int argc, char **argv) {
                (double) rss0 / 1024.0, (double) rss1 / 1024.0,
                (double) (rss1 - rss0) * 1024.0 / (double) (ng_atomic_load(&total_open) ? ng_atomic_load(&total_open) : 1),
                (double) rss2 / 1024.0, (sc1 - sc0) / secs * 100);
+        printf(" anon_bytes_per_conn=%.0f",
+               (double) (anon1 - anon0) * 1024.0 / (double) (ng_atomic_load(&total_open) ? ng_atomic_load(&total_open) : 1));
     }
     printf(" client_cpu_pct=%.0f\n", (cc1 - cc0) / secs * 100);
     for (int i = 0; i < cr_k; i++) printf("closed_reason %lu %s\n", cr_n[i], cr_text[i]);
