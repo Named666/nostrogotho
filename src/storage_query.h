@@ -24,12 +24,14 @@
 #define SQ_MAX_SQL    (1024u * 1024u)
 #define SQ_MAX_PARAMS 30000u   /* below SQLite's 32766 host parameters */
 
-typedef enum { SQ_INT, SQ_TEXT } sq_type_t;
+/* SQ_HEX: text is lowercase hex, bound as the decoded blob (ids, pubkeys,
+ * tag keys), so SQL compares raw bytes without a per-execution unhex(). */
+typedef enum { SQ_INT, SQ_TEXT, SQ_HEX } sq_type_t;
 
 typedef struct {
     sq_type_t type;
     long long num;          /* SQ_INT */
-    char *text;             /* SQ_TEXT */
+    char *text;             /* SQ_TEXT, SQ_HEX */
     bool owned;             /* text is heap-owned by the query */
 } sq_param_t;
 

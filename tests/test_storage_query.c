@@ -33,8 +33,8 @@ static void test_count_authors_ids(void) {
     f.ids = ids; f.ids_count = 2; f.authors = authors; f.authors_count = 1; f.until = 5;
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, true, 500);
-    const char *want = "SELECT COUNT(*) FROM event e WHERE e.id IN (unhex(?),unhex(?)) AND "
-                       "e.pubkey = unhex(?) AND e.created_at <= 5";
+    const char *want = "SELECT COUNT(*) FROM event e WHERE e.id IN (?,?) AND "
+                       "e.pubkey = ? AND e.created_at <= 5";
     check("COUNT ids+authors SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
     check("COUNT ids+authors params (no LIMIT)", q.n == 3 && q.params[0].text == H1 && q.params[1].text == H2 &&
           q.params[2].text == H2 && !q.params[0].owned, NULL);
@@ -52,7 +52,7 @@ static void test_tags_and_search_fts(void) {
     /* tag table keys (sq_tag_key8), then the exact JSON recheck */
     const char *want = "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
                        "JOIN event_fts ON event_fts.rowid = e.seq "
-                       "WHERE t.name = 116 AND t.value IN (unhex(?),unhex(?)) AND "
+                       "WHERE t.name = 116 AND t.value IN (?,?) AND "
                        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
                        "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') IN (?,?)) "
                        "AND event_fts MATCH ? "
@@ -87,11 +87,11 @@ static void test_tag_join(void) {
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 50);
     const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
-                       "WHERE t.name = 112 AND t.value = unhex(?) AND "
+                       "WHERE t.name = 112 AND t.value = ? AND "
                        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
                        "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') = ?) "
                        "AND t.kind IN (?,?) AND t.created_at >= 9 "
-                       "AND EXISTS (SELECT 1 FROM tag x WHERE x.name = 116 AND x.value IN (unhex(?),unhex(?)) "
+                       "AND EXISTS (SELECT 1 FROM tag x WHERE x.name = 116 AND x.value IN (?,?) "
                        "AND x.created_at = e.created_at AND x.ev = e.seq) AND "
                        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
                        "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') IN (?,?)) "

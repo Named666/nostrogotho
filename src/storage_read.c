@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "crypto.h"
 #include "json_util.h"
 #include "memidx.h"
 #include "storage_query.h"
@@ -106,6 +107,16 @@ static bool stream_rows(sqlite3_stmt *stmt, send_records_callback_t sender, cons
     return true;
 }
 
+/* Bind lowercase hex (validated by the filter parser) as its bytes; the
+ * blob is copied by SQLite. Malformed hex binds NULL, which matches nothing,
+ * the same as unhex() returning NULL did. */
+static void bind_hex(sqlite3_stmt *stmt, int idx, const char *hex) {
+    uint8_t b[32]; size_t n = 0;
+    size_t hl = hex ? strlen(hex) : 0;
+    if (hl && hex_to_bytes(hex, hl, b, sizeof b, &n)) sqlite3_bind_blob(stmt, idx, b, (int) n, SQLITE_TRANSIENT);
+    else sqlite3_bind_null(stmt, idx);
+}
+
 /* Prepare a compiled query and bind its parameters; frees q either way.
  * NULL (logged) when SQLite cannot prepare it. */
 static sqlite3_stmt *prepare_query(sq_query_t *q) {
@@ -118,6 +129,7 @@ static sqlite3_stmt *prepare_query(sq_query_t *q) {
     for (size_t i = 0; i < q->n; i++) {             /* n <= SQ_MAX_PARAMS */
         int idx = (int) i + 1;
         if (q->params[i].type == SQ_INT) sqlite3_bind_int64(stmt, idx, q->params[i].num);
+        else if (q->params[i].type == SQ_HEX) bind_hex(stmt, idx, q->params[i].text);
         else sqlite3_bind_text(stmt, idx, q->params[i].text, -1, SQLITE_TRANSIENT);
     }
     sq_free(q);                                     /* bind copied the text */
@@ -304,9 +316,9 @@ static bool topk_applies(const filter_t *f) {
 static ng_status_t topk_since(const filter_t *f, size_t need, time_t *since_out) {
     *since_out = f->since;
     const char *sql = f->kinds_count
-        ? "SELECT created_at FROM event WHERE pubkey = unhex(?1) AND kind = ?2 AND created_at >= ?3 AND created_at <= ?4"
+        ? "SELECT created_at FROM event WHERE pubkey = ?1 AND kind = ?2 AND created_at >= ?3 AND created_at <= ?4"
           " ORDER BY created_at DESC LIMIT ?5"
-        : "SELECT created_at FROM event WHERE pubkey = unhex(?1) AND created_at >= ?3 AND created_at <= ?4"
+        : "SELECT created_at FROM event WHERE pubkey = ?1 AND created_at >= ?3 AND created_at <= ?4"
           " ORDER BY created_at DESC LIMIT ?5";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(ngdb_conn, sql, -1, &st, NULL) != SQLITE_OK) {
@@ -321,7 +333,7 @@ static ng_status_t topk_since(const filter_t *f, size_t need, time_t *since_out)
     sqlite3_bind_int64(st, 5, (sqlite3_int64) need);
     size_t nk = f->kinds_count ? f->kinds_count : 1;
     for (size_t a = 0; a < f->authors_count && rs == NG_OK; a++) {
-        sqlite3_bind_text(st, 1, f->authors[a], -1, SQLITE_STATIC);
+        bind_hex(st, 1, f->authors[a]);
         for (size_t k = 0; k < nk && rs == NG_OK; k++) {
             if (f->kinds_count) sqlite3_bind_int(st, 2, f->kinds[k]);
             sqlite3_bind_int64(st, 3, n == need ? h[0] : (f->since > 0 ? (sqlite3_int64) f->since : 0));

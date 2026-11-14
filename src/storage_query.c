@@ -78,6 +78,11 @@ static void sq_text(sq_query_t *q, char *borrowed) {
     if (p) { p->type = SQ_TEXT; p->text = borrowed; }
 }
 
+static void sq_hex(sq_query_t *q, char *borrowed) {
+    sq_param_t *p = sq_param(q);
+    if (p) { p->type = SQ_HEX; p->text = borrowed; }
+}
+
 static void sq_owned(sq_query_t *q, char *owned) {      /* takes owned (NULL = OOM) */
     if (!owned) { sq_fail(q, NG_E_NOMEM); return; }
     sq_param_t *p = sq_param(q);
@@ -165,7 +170,7 @@ void sq_tag_key8(const char *v, size_t len, unsigned char out[8]) {
     for (int i = 0; i < 8; i++) out[i] = (unsigned char) (h >> (56 - 8 * i));
 }
 
-/* One tag-table key placeholder: unhex('<16 hex digits of sq_tag_key8>'). */
+/* One tag-table key placeholder, bound as the 8-byte key (SQ_HEX). */
 static void sq_tag_value(sq_query_t *q, const char *value) {
     static const char hexd[] = "0123456789abcdef";
     unsigned char k[8];
@@ -175,8 +180,9 @@ static void sq_tag_value(sq_query_t *q, const char *value) {
         for (int i = 0; i < 8; i++) { hx[2 * i] = hexd[k[i] >> 4]; hx[2 * i + 1] = hexd[k[i] & 15]; }
         hx[16] = '\0';
     }
-    sq_sql(q, "unhex(?)");
+    sq_sql(q, "?");
     sq_owned(q, hx);
+    if (q->status == NG_OK) q->params[q->n - 1].type = SQ_HEX;
 }
 
 /* "<alias>.name = <letter code> AND <alias>.value IN (<keys>)" for one tag
@@ -266,15 +272,15 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     if (tagged) { NEXT(); sq_tag_json(q, "e", &f->tags[drive]); }   /* key collisions: exact recheck */
     if (f->ids_count > 0) {
         NEXT();
-        if (f->ids_count == 1) sq_sql(q, "e.id = unhex(?)");
-        else { sq_sql(q, "e.id IN ("); sq_list(q, "unhex(?)", f->ids_count); sq_sql(q, ")"); }
-        for (size_t i = 0; i < f->ids_count; i++) sq_text(q, f->ids[i]);
+        if (f->ids_count == 1) sq_sql(q, "e.id = ?");
+        else { sq_sql(q, "e.id IN ("); sq_list(q, "?", f->ids_count); sq_sql(q, ")"); }
+        for (size_t i = 0; i < f->ids_count; i++) sq_hex(q, f->ids[i]);
     }
     if (f->authors_count > 0) {
         NEXT();
-        if (f->authors_count == 1) sq_sql(q, "e.pubkey = unhex(?)");
-        else { sq_sql(q, "e.pubkey IN ("); sq_list(q, "unhex(?)", f->authors_count); sq_sql(q, ")"); }
-        for (size_t i = 0; i < f->authors_count; i++) sq_text(q, f->authors[i]);
+        if (f->authors_count == 1) sq_sql(q, "e.pubkey = ?");
+        else { sq_sql(q, "e.pubkey IN ("); sq_list(q, "?", f->authors_count); sq_sql(q, ")"); }
+        for (size_t i = 0; i < f->authors_count; i++) sq_hex(q, f->authors[i]);
     }
     if (f->kinds_count > 0) {
         NEXT();
