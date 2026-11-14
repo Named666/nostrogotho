@@ -609,76 +609,45 @@ static bool is_lower_hex(const char *s, size_t len) {
     return true;
 }
 
-/* append_string - Append `value` to a growable array of owned strings.
- *
- * `capacity` is in/out: the caller passes the current allocation size and it
- * is updated here after every growth. The previous version passed it by
- * value and recomputed it from a constant, so the array could never grow
- * beyond 32 slots while callers allowed up to 256 entries — a heap buffer
- * overflow reachable from a single REQ filter with >32 ids/authors.
- */
-static bool append_string(char ***items, size_t *count, size_t *capacity, const char *value) {
-    if (*count >= *capacity) {
-        size_t new_capacity = *capacity == 0 ? 16 : *capacity * 2;
-        char **resized = (char **) ng_realloc_array(*items, new_capacity, sizeof(**items));
-        if (!resized) return false;
-        *items = resized;
-        *capacity = new_capacity;
-    }
-    (*items)[*count] = string_dup(value);
-    if (!(*items)[*count]) return false;
-    (*count)++;
-    return true;
-}
-
-static bool parse_string_array(jstr_t raw, char ***items, size_t *count,
-                               size_t max_items, bool require_hex64) {
-    jstr_t key, value;
-    size_t offset = 0;
-    size_t alloc_size = 16;
-    *items = (char **) calloc(alloc_size, sizeof(**items));
-    if (!*items) return false;
-
-    while ((offset = jl_next(raw, offset, &key, &value)) != 0) {
-        char *string;
-        if (*count >= max_items || key.buf != NULL) {
-            /* Free previously allocated strings on error */
-            for (size_t i = 0; i < *count; i++) free((*items)[i]);
-            free(*items);
-            *items = NULL;
-            *count = 0;
-            return false;
-        }
-        string = json_raw_string(value);
-        if (!string || (require_hex64 && !is_hex_64(string))) {
-            free(string);
-            /* Free previously allocated strings on error */
-            for (size_t i = 0; i < *count; i++) free((*items)[i]);
-            free(*items);
-            *items = NULL;
-            *count = 0;
-            return false;
-        }
-        if (!append_string(items, count, &alloc_size, string)) {
-            free(string);
-            /* Free previously allocated strings on error */
-            for (size_t i = 0; i < *count; i++) free((*items)[i]);
-            free(*items);
-            *items = NULL;
-            *count = 0;
-            return false;
-        }
-        free(string);
-    }
-    return true;
-}
-
 /* Number of elements of a JSON array/object token. */
 static size_t jl_count(jstr_t raw) {
     jstr_t key, value;
     size_t offset = 0, n = 0;
     while ((offset = jl_next(raw, offset, &key, &value)) != 0) n++;
     return n;
+}
+
+/* parse_string_array - A filter's ids / authors: a JSON array of at most
+ * max_items strings (64-character lowercase hex when require_hex64). The
+ * array is sized once from the element count; each string is owned by it,
+ * or with intern a shared hex64_intern copy (authors). On failure nothing
+ * is left allocated. */
+static void release_strings(char **items, size_t n, bool intern) {
+    for (size_t i = 0; i < n; i++) { if (intern) hex64_release(items[i]); else free(items[i]); }
+    free(items);
+}
+
+static bool parse_string_array(jstr_t raw, char ***items, size_t *count,
+                               size_t max_items, bool require_hex64, bool intern) {
+    jstr_t key, value;
+    size_t offset = 0, n = jl_count(raw), got = 0;
+    *items = NULL; *count = 0;
+    if (n > max_items) return false;
+    char **v = (char **) ng_malloc_array(n ? n : 1, sizeof(*v));
+    if (!v) return false;
+    while ((offset = jl_next(raw, offset, &key, &value)) != 0) {
+        char *string = key.buf == NULL && got < n ? json_raw_string(value) : NULL;
+        if (!string || (require_hex64 && !is_hex_64(string))) { free(string); release_strings(v, got, intern); return false; }
+        if (intern) {
+            const char *shared = hex64_intern(string);
+            free(string);
+            if (!shared) { release_strings(v, got, intern); return false; }
+            string = (char *) shared;
+        }
+        v[got++] = string;
+    }
+    *items = v; *count = got;
+    return true;
 }
 
 static bool append_filter_tag(filter_t *filter, const char *name,
@@ -799,10 +768,13 @@ bool json_parse_filter_why(const char *json_str, filter_t *filter, const char **
             *why = "error: too many values in one filter field (see NIP-11 limitation)";
             ok = false;
         } else if (strcmp(field, "ids") == 0) {
-            ok = parse_string_array(value, &filter->ids, &filter->ids_count, (size_t) ng_limits.max_filter_items, true);
+            release_strings(filter->ids, filter->ids_count, false);     /* a repeated key: last wins */
+            ok = parse_string_array(value, &filter->ids, &filter->ids_count, (size_t) ng_limits.max_filter_items, true, false);
             if (!ok) *why = "invalid: ids must be 64-character lowercase hex";
         } else if (strcmp(field, "authors") == 0) {
-            ok = parse_string_array(value, &filter->authors, &filter->authors_count, (size_t) ng_limits.max_filter_items, true);
+            release_strings(filter->authors, filter->authors_count, filter->authors_interned);
+            ok = parse_string_array(value, &filter->authors, &filter->authors_count, (size_t) ng_limits.max_filter_items, true, true);
+            filter->authors_interned = ok;
             if (!ok) *why = "invalid: authors must be 64-character lowercase hex";
         } else if (strcmp(field, "kinds") == 0) {
             jstr_t array_key, array_value;

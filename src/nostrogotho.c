@@ -2,6 +2,9 @@
 #include "platform/ng_alloc.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <pthread.h>
 
 static void tag_release(tag_t *tag);
 
@@ -106,7 +109,8 @@ void filter_release(filter_t *f) {
 
     if (f->authors) {
         for (size_t i = 0; i < f->authors_count; i++) {
-            free(f->authors[i]);
+            if (f->authors_interned) hex64_release(f->authors[i]);
+            else free(f->authors[i]);
         }
         free(f->authors);
         f->authors = NULL;
@@ -411,4 +415,82 @@ bool ng_search_match(const char *search, int kind, const char *content, size_t c
     if (!ng_search_kind(kind)) return false;
     live_t l = { content ? content : "", content ? content_len : 0 };
     return each_term(search, live_term, &l);
+}
+
+/* ============================================================================
+ * hex64_intern: striped hash sets of shared pubkey strings
+ * ============================================================================ */
+#define INTERN_STRIPES 64
+typedef struct intern_ent { struct intern_ent *next; uint32_t refs; char hex[65]; } intern_ent_t;
+typedef struct {
+    pthread_mutex_t mu;
+    intern_ent_t **slots;
+    size_t mask, n;            /* slots = mask + 1 (power of two, 0 = none yet) */
+} intern_stripe_t;
+static intern_stripe_t intern_tab[INTERN_STRIPES] = {
+#define S0 { PTHREAD_MUTEX_INITIALIZER, NULL, 0, 0 }
+#define S8 S0, S0, S0, S0, S0, S0, S0, S0
+    S8, S8, S8, S8, S8, S8, S8, S8
+#undef S8
+#undef S0
+};
+
+static uint64_t intern_hash(const char *hex) {      /* FNV-1a; pubkeys are already uniform */
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (int i = 0; i < 64; i++) { h ^= (unsigned char) hex[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+
+static bool intern_grow(intern_stripe_t *s) {
+    size_t ncap = s->slots ? (s->mask + 1) * 2 : 64;
+    intern_ent_t **ns = (intern_ent_t **) calloc(ncap, sizeof(*ns));
+    if (!ns) return false;
+    for (size_t i = 0; s->slots && i <= s->mask; i++)
+        for (intern_ent_t *e = s->slots[i], *nx; e; e = nx) {
+            nx = e->next;
+            size_t b = (size_t) (intern_hash(e->hex) >> 6) & (ncap - 1);
+            e->next = ns[b]; ns[b] = e;
+        }
+    free(s->slots);
+    s->slots = ns; s->mask = ncap - 1;
+    return true;
+}
+
+const char *hex64_intern(const char *hex) {
+    if (!hex || strlen(hex) != 64) return NULL;
+    uint64_t h = intern_hash(hex);
+    intern_stripe_t *s = &intern_tab[h & (INTERN_STRIPES - 1)];
+    const char *out = NULL;
+    pthread_mutex_lock(&s->mu);
+    if (s->slots) {
+        for (intern_ent_t *e = s->slots[(size_t) (h >> 6) & s->mask]; e; e = e->next)
+            if (memcmp(e->hex, hex, 64) == 0 && e->refs < UINT32_MAX) { e->refs++; out = e->hex; break; }
+    }
+    if (!out && ((s->slots && s->n <= s->mask) || intern_grow(s))) {
+        intern_ent_t *e = (intern_ent_t *) malloc(sizeof(*e));
+        if (e) {
+            memcpy(e->hex, hex, 65);
+            e->refs = 1;
+            size_t b = (size_t) (h >> 6) & s->mask;
+            e->next = s->slots[b]; s->slots[b] = e; s->n++;
+            out = e->hex;
+        }
+    }
+    pthread_mutex_unlock(&s->mu);
+    return out;
+}
+
+void hex64_release(const char *interned) {
+    if (!interned) return;
+    uint64_t h = intern_hash(interned);
+    intern_stripe_t *s = &intern_tab[h & (INTERN_STRIPES - 1)];
+    intern_ent_t *e = (intern_ent_t *) (void *) (interned - offsetof(intern_ent_t, hex));
+    pthread_mutex_lock(&s->mu);
+    if (--e->refs == 0) {
+        intern_ent_t **pp = &s->slots[(size_t) (h >> 6) & s->mask];
+        while (*pp && *pp != e) pp = &(*pp)->next;
+        if (*pp) { *pp = e->next; s->n--; }
+        free(e);
+    }
+    pthread_mutex_unlock(&s->mu);
 }

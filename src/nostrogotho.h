@@ -118,6 +118,7 @@ typedef struct {
     bool hide_gift_wraps;   /* relay policy: exclude kinds 1059/21059 (COUNT) */
     
     char *search;
+    bool authors_interned;  /* authors[] come from hex64_intern (filter_release drops them) */
 } filter_t;
 
 /* ============================================================================
@@ -209,6 +210,15 @@ void tags_array_free(tags_array_t *tags);
  * Returns: malloc'd copy of string, or NULL if str is NULL or allocation fails
  * Caller: must call string_free() to release */
 char *string_dup(const char *str);
+
+/* hex64_intern - Shared, reference-counted copy of a 64-hex string (a pubkey).
+ *
+ * Live subscriptions name the same authors over and over (follow lists
+ * overlap); a filter keeps a pointer to one shared copy per pubkey instead
+ * of its own 65-byte string. Thread-safe. NULL on OOM. Every non-NULL
+ * result is released exactly once with hex64_release. */
+const char *hex64_intern(const char *hex);
+void hex64_release(const char *interned);
 
 /* string_free - Free a duplicated string
  * Args: str - pointer to malloc'd string (NULL-safe) */
