@@ -130,7 +130,9 @@ class Relay:
         self.port = port or free_port()
         self.db = db or os.path.join(self.dir, "t.sqlite")
         self.conf = os.path.join(self.dir, "nostrogotho.conf")
-        open(self.conf, "w").write(conf)
+        # NG_TEST_CONF: extra config lines for every relay (e.g. "tag_index = sqlite"
+        # to run a suite against the other tag index mode).
+        open(self.conf, "w").write(conf + ("\n" + os.environ["NG_TEST_CONF"] + "\n" if os.environ.get("NG_TEST_CONF") else ""))
         self.url = f"ws://127.0.0.1:{self.port}"
         self.env = dict(os.environ, **(env or {}))
         self.start()
