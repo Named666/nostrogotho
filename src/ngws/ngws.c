@@ -338,6 +338,11 @@ bool ngws_server_run(ngws_server_t *srv) {
         if (!l->ls) { fprintf(stderr, "ngws: listen on :%d failed\n", srv->cfg.port); return false; }
     }
     for (int i = 0; i < srv->n_loops; i++) pthread_create(&srv->loops[i].th, NULL, loop_thread, &srv->loops[i]);
+    /* Loop threads were created with the caller's mask; from now on the
+     * calling thread (idle in join) is the one that takes SIGINT/SIGTERM. */
+    sigset_t stop_sigs;
+    sigemptyset(&stop_sigs); sigaddset(&stop_sigs, SIGINT); sigaddset(&stop_sigs, SIGTERM);
+    pthread_sigmask(SIG_UNBLOCK, &stop_sigs, NULL);
     for (int i = 0; i < srv->n_loops; i++) pthread_join(srv->loops[i].th, NULL);
     return true;
 }

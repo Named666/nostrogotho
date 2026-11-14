@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -206,13 +207,21 @@ int main(int argc, const char **argv) {
     if (!apply_config(service_url && *service_url ? service_url : NULL, min_pow, lower_limit, upper_limit)) return 1;
     if (!apply_policy()) return 1;
 
+    /* Every thread started from here on inherits SIGINT/SIGTERM blocked;
+     * ngws_server_run unblocks them in this thread once its loop threads
+     * exist, so sigint_handler -> server_stop always runs here. */
+    sigset_t stop_sigs;
+    sigemptyset(&stop_sigs); sigaddset(&stop_sigs, SIGINT); sigaddset(&stop_sigs, SIGTERM);
+    pthread_sigmask(SIG_BLOCK, &stop_sigs, NULL);
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     if (!init_storage(db_path)) {
         return 1;
     }
 
     server_configure(&storage_ctx, ng_relay_info.relay_url, ng_relay_info.min_pow_difficulty,
                      (time_t) ng_relay_info.created_at_lower_limit, (time_t) ng_relay_info.created_at_upper_limit);
-    signal(SIGINT, sigint_handler);
     const bool result = server_run(port);
     cleanup();
     return result ? 0 : 1;
