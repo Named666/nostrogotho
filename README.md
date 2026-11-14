@@ -16,7 +16,6 @@ nostrogotho/
 ├── nob.c                    Two-stage build driver
 ├── nob.h                    Nob header
 ├── nostrogotho.sqlite       SQLite database (WAL mode)
-├── nob.c README.md          Nob build system documentation
 ├── QUICKSTART.md            Quick start guide
 ├── README.md                Project overview and NIP support
 ├── NOSTR_COMPATABILITY.md   NIP implementation status (living document)

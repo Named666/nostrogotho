@@ -70,7 +70,6 @@ nostrogotho/
 │
 └── 📄 Additional Files
     ├── TODO.md                ← TODO list
-    ├── nob.c README.md        ← Nob build system docs
     ├── QUICKSTART.md          ← Quick start guide
     └── nostrogotho.sqlite     ← SQLite database (WAL mode)
 ```
