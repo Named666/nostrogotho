@@ -116,7 +116,8 @@ static size_t frame_need(sockx_t *x, const unsigned char *b, size_t n) {
 void nx_ws_feed(sockx_t *x, unsigned char *data, size_t len) {
     unsigned char *b = data; size_t n = len;
     bool owned = false;
-    if (x->rlen) {                        /* append to partial frame */
+    if (x->paused) nx_read_off(x);        /* a write may have re-armed reading */
+    if (x->rlen && len) {                 /* append to partial frame */
         if (x->rlen + len > x->rcap) {
             size_t want;
             if (!ng_size_add(x->rlen, len, &want)) { ngws_terminate((ngws_socket_t *) x->s); return; }
@@ -128,10 +129,10 @@ void nx_ws_feed(sockx_t *x, unsigned char *data, size_t len) {
             x->rbuf = nb; x->rcap = nc;
         }
         memcpy(x->rbuf + x->rlen, data, len); x->rlen += len;
-        b = x->rbuf; n = x->rlen; owned = true;
     }
+    if (x->rlen) { b = x->rbuf; n = x->rlen; owned = true; }
     size_t off = 0;
-    while (off < n && x->state == ST_WS && !us_socket_is_closed(0, x->s)) {
+    while (off < n && x->state == ST_WS && !x->paused && !us_socket_is_closed(0, x->s)) {
         long used = ws_frame(x, b + off, n - off);
         if (used <= 0) break;
         off += (size_t) used;

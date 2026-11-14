@@ -47,6 +47,11 @@ void ngb_queue_close(ng_conn_t *c);
 size_t ngb_worker_queued_bytes(int w);
 /* Bytes one queued message of len costs against that budget. */
 size_t ngb_message_cost(size_t len);
+/* Read-pause support: after ngb_worker_want_drained(w), worker w calls fn(w)
+ * once, from its thread, when a job finishes with its queue below `below`
+ * bytes (a paused connection may then be resumable). */
+void ngb_workers_on_drained(void (*fn)(int w), size_t below);
+void ngb_worker_want_drained(int w);
 
 /* --- writer thread ------------------------------------------------------ */
 /* Hand n committed broadcasts to every worker; takes ownership of them and

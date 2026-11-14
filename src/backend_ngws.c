@@ -82,7 +82,9 @@ static ng_atomic_ullong next_conn_id = { 1 };
 static char *info_doc;                  /* NIP-11 document, immutable while loops run */
 static size_t info_doc_len;
 static ng_atomic_llong stat_open_conns;
-static ng_atomic_ullong stat_shed_loop, stat_shed_core;
+static ng_atomic_ullong stat_shed_loop, stat_shed_core, stat_read_paused;
+static int n_io_loops;
+static bool read_pause = true;           /* NG_READ_PAUSE=0: shed instead (A/B) */
 
 static int env_int(const char *name, int dflt) {
     const char *v = getenv(name);
@@ -175,14 +177,62 @@ static void on_drain(ngws_socket_t *ws) {
     if (c) ng_atomic_store_explicit(&c->out_buffered, ngws_buffered(ws), NG_MO_RELAXED);
 }
 
+/* ------------------------------------------------- read pause / resume --
+ * Over the soft budgets (worker_queue_max, conn_pending_max) a message is
+ * still queued, but its socket stops being read until the worker drains
+ * (TCP backpressure, as nginx/Envoy apply it): a reconnect storm is served
+ * late instead of refused. Past twice the budgets (a client that keeps
+ * sending regardless) or for a message larger than the whole budget, it is
+ * refused inline as before. */
+static bool resumable(const ng_conn_t *c) {
+    return ngb_worker_queued_bytes(c->base.shard) < opt.worker_queue_max / 2 &&
+           ng_atomic_load_explicit(&c->pending, NG_MO_RELAXED) < (opt.conn_pending_max + 1) / 2;
+}
+
+static void resume_one(ngws_socket_t *ws, void *arg) {
+    (void) arg;
+    ng_conn_t *c = *(ng_conn_t **) ngws_user(ws);
+    if (!c || resumable(c)) { ngws_resume(ws); return; }
+    ngb_worker_want_drained(c->base.shard);
+    if (resumable(c)) ngws_resume(ws);       /* drained before the flag was seen */
+}
+
+static ngws_task_t resume_task[NG_MAX_IO_LOOPS];
+static ng_atomic_bool resume_posted[NG_MAX_IO_LOOPS];
+static void resume_run(ngws_task_t *t, ngws_loop_t *l) {
+    (void) t;
+    ng_atomic_store(&resume_posted[ngws_loop_index(l)], false);
+    ngws_loop_foreach_paused(l, resume_one, NULL);
+}
+
+static void on_worker_drained(int w) {           /* worker thread */
+    (void) w;
+    for (int i = 0; i < n_io_loops; i++)
+        if (!ng_atomic_exchange(&resume_posted[i], true)) {
+            resume_task[i].run = resume_run;
+            ngws_loop_post(ngws_server_loop(srv, i), &resume_task[i]);
+        }
+}
+
 static void on_message(ngws_socket_t *ws, char *data, size_t len, int op) {
     (void) op;
     ng_conn_t *c = *(ng_conn_t **) ngws_user(ws);
     if (!c) return;
-    if (ng_atomic_load_explicit(&c->pending, NG_MO_RELAXED) >= opt.conn_pending_max ||
-        ngb_worker_queued_bytes(c->base.shard) + ngb_message_cost(len) > opt.worker_queue_max ||
-        !ngb_queue_message(c, data, len))        /* OOM: answer, never drop silently */
+    size_t queued = ngb_worker_queued_bytes(c->base.shard) + ngb_message_cost(len);
+    int pending = ng_atomic_load_explicit(&c->pending, NG_MO_RELAXED);
+    bool over = pending >= opt.conn_pending_max || queued > opt.worker_queue_max;
+    if (over && !(read_pause && ngb_message_cost(len) <= opt.worker_queue_max &&
+                  pending < 2 * opt.conn_pending_max && queued <= 2 * opt.worker_queue_max)) {
         shed_inline(ws, data, len);
+        return;
+    }
+    if (!ngb_queue_message(c, data, len)) { shed_inline(ws, data, len); return; }   /* OOM: answer, never drop silently */
+    if (over && !ngws_paused(ws)) {
+        ngws_pause(ws);
+        ng_atomic_fetch_add_explicit(&stat_read_paused, 1, NG_MO_RELAXED);
+        ngb_worker_want_drained(c->base.shard);
+        if (resumable(c)) ngws_resume(ws);
+    }
 }
 
 static void on_close(ngws_socket_t *ws, int code) {
@@ -225,6 +275,10 @@ bool server_run(int port) {
     relay_core_set_query_bytes_max(opt.conn_outbound_max / 2);
     const char *bv = getenv("NG_BATCH_VERIFY");      /* NG_BATCH_VERIFY=0 disables (A/B benchmarks) */
 
+    const char *rp = getenv("NG_READ_PAUSE");
+    read_pause = !(rp && strcmp(rp, "0") == 0);
+    n_io_loops = n_loops;
+    ngb_workers_on_drained(on_worker_drained, opt.worker_queue_max / 2);
     n_shards = ngb_workers_start(n_workers, !(bv && strcmp(bv, "0") == 0));
     bool ok = n_shards > 0 && ngb_writer_start(opt.writer_queue_max);
     if (!ok) fprintf(stderr, "server: could not start worker/writer threads\n");
@@ -254,9 +308,10 @@ bool server_run(int port) {
     if (srv) {
         ngws_stats_t ns; ngws_server_stats(srv, &ns);
         fprintf(stderr, "overload: shed_inline=%llu shed_admission=%llu shed_writer_full=%llu "
-                "closed_conn_limit=%llu closed_total_limit=%llu batch_verified=%llu\n",
+                "closed_conn_limit=%llu closed_total_limit=%llu batch_verified=%llu read_paused=%llu\n",
                 (unsigned long long) ng_atomic_load(&stat_shed_loop), (unsigned long long) ng_atomic_load(&stat_shed_core),
-                ngb_writer_shed(), ns.closed_conn_limit, ns.closed_total_limit, ngb_workers_preverified());
+                ngb_writer_shed(), ns.closed_conn_limit, ns.closed_total_limit, ngb_workers_preverified(),
+                (unsigned long long) ng_atomic_load(&stat_read_paused));
     }
     relay_core_shutdown();
     return ok;

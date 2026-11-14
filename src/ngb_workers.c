@@ -37,6 +37,7 @@ typedef struct {
     pthread_cond_t cv;
     job_t *head, *tail;
     NG_ALIGNED(NG_CACHELINE) ng_atomic_size qbytes;   /* queued + in-progress inbound bytes */
+    ng_atomic_bool want_drained;                      /* a paused socket waits on this worker */
 } worker_t;
 
 /* Per-loop pending jobs for each worker, flushed at the end of the loop
@@ -55,6 +56,9 @@ static bool batch_verify = true;
 static ng_atomic_bool stopping;
 static ng_atomic_ullong stat_preverified;
 static loop_ctx_t loop_ctx[NG_MAX_IO_LOOPS];
+static void (*drained_hook)(int w);
+static size_t drained_below;
+
 
 unsigned long long ngb_workers_preverified(void) { return ng_atomic_load(&stat_preverified); }
 size_t ngb_worker_queued_bytes(int w) { return ng_atomic_load_explicit(&workers[w].qbytes, NG_MO_RELAXED); }
@@ -201,8 +205,16 @@ static void run_job(worker_t *wk, job_t *j) {
         }
         bset_unref(j->bset); break;
     }
-    if (j->type != J_BSET) ng_atomic_fetch_sub_explicit(&wk->qbytes, job_cost(j), NG_MO_RELAXED);
+    if (j->type != J_BSET) {
+        size_t left = ng_atomic_fetch_sub_explicit(&wk->qbytes, job_cost(j), NG_MO_RELAXED) - job_cost(j);
+        if (NG_UNLIKELY(ng_atomic_load_explicit(&wk->want_drained, NG_MO_RELAXED)) &&
+            left < drained_below && ng_atomic_exchange(&wk->want_drained, false))
+            drained_hook(wk->idx);
+    }
 }
+
+void ngb_workers_on_drained(void (*fn)(int w), size_t below) { drained_hook = fn; drained_below = below; }
+void ngb_worker_want_drained(int w) { if (drained_hook) ng_atomic_store(&workers[w].want_drained, true); }
 
 static void *worker_thread(void *arg) {
     worker_t *wk = (worker_t *) arg;

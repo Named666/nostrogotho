@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "libusockets.h"
+#include "internal/internal.h"          /* LIBUS_SOCKET_READABLE/WRITABLE for read pausing */
 #include "../platform/ng_alloc.h"
 
 size_t ngws_buffered(ngws_socket_t *ws) { sockx_t *x = X((struct us_socket_t *) ws); return x->olen - x->ooff + x->qbytes; }
@@ -48,6 +49,58 @@ void nx_ws_list_del(sockx_t *x) {
     if (x->aprev) x->aprev->anext = x->anext; else if (l->all == x) l->all = x->anext; else return;
     if (x->anext) x->anext->aprev = x->aprev;
     x->aprev = x->anext = NULL;
+}
+
+/* ------------------------------------------------------ read pausing ---
+ * A paused socket's frames are not parsed: input that still arrives (one
+ * read at most, see nx_read_off) is kept in rbuf, and the poll stops asking
+ * for readability, so further input waits in the kernel (TCP flow control
+ * pushes back on the client). */
+#define NX_READABLE ((int) LIBUS_SOCKET_READABLE)
+#define NX_WRITABLE ((int) LIBUS_SOCKET_WRITABLE)
+void nx_read_off(sockx_t *x) {
+    struct us_poll_t *p = (struct us_poll_t *) x->s;          /* the poll is the socket's first member */
+    int ev = us_poll_events(p);
+    if (ev & NX_READABLE) us_poll_change(p, x->loop->loop, ev & NX_WRITABLE);
+}
+
+static void paused_del(sockx_t *x) {
+    if (!x->paused) return;
+    if (x->pprev) x->pprev->pnext = x->pnext; else x->loop->paused = x->pnext;
+    if (x->pnext) x->pnext->pprev = x->pprev;
+    x->pprev = x->pnext = NULL; x->paused = 0;
+}
+
+void ngws_pause(ngws_socket_t *ws) {
+    sockx_t *x = X((struct us_socket_t *) ws);
+    if (x->paused || x->state != ST_WS) return;
+    x->paused = 1;
+    x->pprev = NULL; x->pnext = x->loop->paused;
+    if (x->pnext) x->pnext->pprev = x;
+    x->loop->paused = x;
+    nx_read_off(x);
+}
+
+bool ngws_paused(ngws_socket_t *ws) { return X((struct us_socket_t *) ws)->paused != 0; }
+
+void ngws_resume(ngws_socket_t *ws) {
+    struct us_socket_t *s = (struct us_socket_t *) ws;
+    sockx_t *x = X(s);
+    if (!x->paused) return;
+    paused_del(x);
+    if (x->state != ST_WS || us_socket_is_closed(0, s)) return;
+    struct us_poll_t *p = (struct us_poll_t *) s;
+    us_poll_change(p, x->loop->loop, us_poll_events(p) | NX_READABLE);
+    if (x->rlen && !x->in_data) {                  /* frames that arrived while paused */
+        x->in_data = 1;
+        nx_ws_feed(x, NULL, 0);
+        x->in_data = 0;
+        if (us_socket_is_closed(0, s)) { nx_free_inputs(x); return; }
+    }
+}
+
+void ngws_loop_foreach_paused(ngws_loop_t *l, void (*fn)(ngws_socket_t *ws, void *arg), void *arg) {
+    for (sockx_t *x = l->paused, *n; x; x = n) { n = x->pnext; fn((ngws_socket_t *) x->s, arg); }
 }
 
 static struct us_socket_t *on_data(struct us_socket_t *s, char *data, int length) {
@@ -117,6 +170,7 @@ static struct us_socket_t *on_close(struct us_socket_t *s, int code, void *reaso
     sockx_t *x = X(s);
     int was = x->state;
     x->state = ST_CLOSED;
+    paused_del(x);
     nx_dirty_del(x);
     nx_out_release(x);
     if (!x->in_data) nx_free_inputs(x);
@@ -134,6 +188,10 @@ static struct us_socket_t *on_end(struct us_socket_t *s) { return us_socket_clos
 static struct us_socket_t *on_timeout(struct us_socket_t *s) {
     sockx_t *x = X(s);
     unsigned it = SRV(x)->cfg.idle_timeout;
+    if (x->state == ST_WS && it && x->paused) {   /* we are not reading it: not idle */
+        us_socket_timeout(0, s, it);
+        return s;
+    }
     if (x->state == ST_WS && it && !x->ping_sent) {
         x->ping_sent = 1;
         nx_queue_frame(x, NGWS_OP_PING, "", 0);

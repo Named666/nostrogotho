@@ -117,6 +117,14 @@ int  ngws_remote_address(ngws_socket_t *ws, char *buf, size_t cap);
 /* Plain-HTTP reply; socket is closed after the body is flushed. */
 void ngws_http_respond(ngws_socket_t *s, const char *status, const char *extra_headers,
                        const char *content_type, const void *body, size_t len);
+/* Flow control: stop parsing this socket's input and stop reading it from
+ * the kernel (callable from on_message; frames already read are kept and
+ * delivered after ngws_resume). A paused socket is not idle-timed out. */
+void ngws_pause(ngws_socket_t *ws);
+void ngws_resume(ngws_socket_t *ws);
+bool ngws_paused(ngws_socket_t *ws);
+/* Visit every read-paused socket on this loop; fn may resume or close it. */
+void ngws_loop_foreach_paused(ngws_loop_t *loop, void (*fn)(ngws_socket_t *ws, void *arg), void *arg);
 /* Visit every open WebSocket on this loop (loop thread). */
 void ngws_loop_foreach(ngws_loop_t *loop, void (*fn)(ngws_socket_t *ws, void *arg), void *arg);
 /* Scratch memory valid until the end of the current loop iteration. */

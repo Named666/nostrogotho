@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """Overload / slow-reader regression tests. Each case starts its own relay
 (RELAY_BIN, default build/main) with a small budget config.
@@ -238,9 +239,28 @@ while len(ans) < 300:
         if check_dup: break
 shed = [m for m in ans.values() if m[0] == "CLOSED"]
 check("D every REQ answered exactly once", len(ans) == 300 and not (c.recv(0.5)), f"{len(ans)}")
-check("D overflow shed inline with CLOSED error:", len(shed) > 0 and all(m[2] == "error: relay overloaded, try again later" for m in shed), f"{len(shed)} shed")
+shed = [m for m in shed if "overloaded" in m[2]]     # (the rest: max_subscriptions, all REQs stay open)
+check("D over conn_pending_max the socket is read-paused, not refused", len(shed) == 0, f"{len(shed)} shed")
 alive, st = r.stop()
-check("D relay alive, shed_inline counted", alive and st.get("shed_inline", 0) == len(shed), str(st))
+check("D relay alive, read pause counted", alive and st.get("read_paused", 0) > 0 and st.get("shed_inline", 0) == 0, str(st))
+
+# D2: the same burst with read pausing off (NG_READ_PAUSE=0) is shed inline.
+r = Relay("conn_pending_max = 8\n", {"NG_READ_PAUSE": "0"})
+c = WS(r.port); time.sleep(.2)
+c.send(*[["REQ", f"q{i}", {"kinds": [7], "limit": 1}] for i in range(300)])
+ans = {}
+while len(ans) < 300:
+    m = c.recv(5)
+    if m is None: break
+    if m[0] in ("EOSE", "CLOSED"):
+        check_dup = m[1] in ans
+        ans[m[1]] = m
+        if check_dup: break
+shed = [m for m in ans.values() if m[0] == "CLOSED"]
+check("D2 every REQ answered exactly once", len(ans) == 300 and not (c.recv(0.5)), f"{len(ans)}")
+check("D2 overflow shed inline with CLOSED error:", len(shed) > 0 and all(m[2] == "error: relay overloaded, try again later" for m in shed), f"{len(shed)} shed")
+alive, st = r.stop()
+check("D2 relay alive, shed_inline counted", alive and st.get("shed_inline", 0) == len(shed), str(st))
 
 # ---------------------------------------------------------------- E ----
 r = Relay("writer_queue_max = 2\n")

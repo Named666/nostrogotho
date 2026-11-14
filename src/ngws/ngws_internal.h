@@ -38,9 +38,10 @@ typedef struct sockx {
     struct sockx *dprev, *dnext;      /* loop dirty list (needs flush) */
     struct sockx *aprev, *anext;      /* loop list of open WebSockets */
     struct sockx *bprev, *bnext;      /* loop list of sockets owning a backlog buffer */
+    struct sockx *pprev, *pnext;      /* loop list of read-paused sockets (ngws_pause) */
     struct us_socket_t *s;
     ngws_loop_t *loop;
-    uint8_t state, msg_op, ping_sent, dirty, shutdown_after_flush, in_data, in_frame, frame_op, drain;
+    uint8_t state, msg_op, ping_sent, dirty, shutdown_after_flush, in_data, in_frame, frame_op, drain, paused;
     unsigned char *rbuf; size_t rlen, rcap;    /* HTTP header / native partial frame */
     unsigned char *msg;  size_t mlen, mcap;    /* fragmented message / split control frame */
     char *obuf; size_t olen, ooff, ocap;       /* backlog the kernel did not take */
@@ -70,6 +71,7 @@ struct ngws_loop {
     sockx_t *dirty;                     /* head of dirty list */
     sockx_t *all;                       /* open WebSockets */
     sockx_t *blog;                      /* sockets with a backlog buffer (obuf) */
+    sockx_t *paused;                    /* read-paused sockets */
     arena_chunk_t *arena, *arena_cur;
     ionode_t *nodes; uint32_t n_nodes, cap_nodes;
     defer_t *defer; uint32_t n_defer, cap_defer;
@@ -112,5 +114,6 @@ void nx_drain_input(sockx_t *x, unsigned char *d, size_t n);
 /* ngws.c: the loop's list of open WebSockets */
 void nx_ws_list_add(sockx_t *x);
 void nx_ws_list_del(sockx_t *x);
+void nx_read_off(sockx_t *x);
 
 #endif /* NGWS_INTERNAL_H_ */
