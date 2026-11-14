@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1270,6 +1271,9 @@ static int snap_interval;
 
 static void *snap_thread(void *arg) {
     (void) arg;
+    sigset_t block;                 /* SIGINT is for the main thread (sigint_handler -> server_stop) */
+    sigemptyset(&block); sigaddset(&block, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &block, NULL);
 #ifdef __linux__
     pthread_setname_np(pthread_self(), "ng-tagsnap");
 #endif
