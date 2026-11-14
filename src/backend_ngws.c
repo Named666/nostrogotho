@@ -316,6 +316,7 @@ bool server_run(int port) {
                 (unsigned long long) ng_atomic_load(&stat_read_paused));
     }
     relay_core_shutdown();
+    ngb_outbox_pool_drain();
     return ok;
 }
 

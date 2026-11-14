@@ -1,6 +1,8 @@
 /* ngb_outbox - see ngb_outbox.h. */
 #include "ngb_outbox.h"
 
+#include <pthread.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -25,13 +27,50 @@ typedef struct {
     relay_body_t *body;         /* R_EVENT */
 } rec_t;
 
-typedef struct {
+typedef struct outtask {
     ngws_task_t task;
-    size_t len;
+    size_t len, cap;
+    struct outtask *pool_next;
     char data[];
 } outtask_t;
 
-typedef struct { outtask_t *t; size_t cap; relay_body_t *rbody; int rn; } outbox_t;
+/* Pool of base-size tasks (nginx-style free list): a busy worker fills and
+ * posts one 16 KiB task per loop per flush, and the loop frees it after the
+ * write; recycling them removes that malloc/free pair (and its cross-thread
+ * free) per flush. Bounded: OUTTASK_POOL_MAX * 16 KiB = 2 MiB. Tasks grown
+ * past the base size are freed as before. */
+#define OUTTASK_BASE 16384u
+#define OUTTASK_POOL_MAX 128
+static pthread_mutex_t pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static outtask_t *pool_head;
+static int pool_n;
+
+static outtask_t *outtask_get(void) {
+    outtask_t *t = NULL;
+    pthread_mutex_lock(&pool_mu);
+    if (pool_head) { t = pool_head; pool_head = t->pool_next; pool_n--; }
+    pthread_mutex_unlock(&pool_mu);
+    if (!t) {
+        t = (outtask_t *) ng_malloc_add(sizeof(outtask_t), OUTTASK_BASE);
+        if (!t) return NULL;
+        t->cap = OUTTASK_BASE;
+    }
+    t->len = 0;
+    return t;
+}
+
+static void outtask_put(outtask_t *t) {
+    if (t->cap == OUTTASK_BASE) {
+        pthread_mutex_lock(&pool_mu);
+        bool keep = pool_n < OUTTASK_POOL_MAX;
+        if (keep) { t->pool_next = pool_head; pool_head = t; pool_n++; }
+        pthread_mutex_unlock(&pool_mu);
+        if (keep) return;
+    }
+    free(t);
+}
+
+typedef struct { outtask_t *t; relay_body_t *rbody; int rn; } outbox_t;
 
 static ngws_server_t *srv;                          /* set once before connections exist */
 static ng_atomic_size out_task_bytes;               /* posted, not yet run by a loop */
@@ -77,7 +116,7 @@ static void outtask_free(void *p) {
         o += rec_size(r->len);
     }
     if (run) relay_body_release_n(run, n);
-    free(t);
+    outtask_put(t);
 }
 
 static void run_outtask(ngws_task_t *tk, ngws_loop_t *loop) {
@@ -128,7 +167,7 @@ static void outbox_flush_loop(int i) {
     outbox_commit_ref(ob);
     if (!ob->t || !ob->t->len) return;
     outtask_t *t = ob->t;
-    ob->t = NULL; ob->cap = 0;
+    ob->t = NULL;
     t->task.run = run_outtask;
     ng_atomic_fetch_add_explicit(&out_task_bytes, t->len, NG_MO_RELAXED);
     ngws_loop_post(ngws_server_loop(srv, i), &t->task);
@@ -170,23 +209,24 @@ static char *outbox_reserve(ng_conn_t *c, uint32_t kind, size_t len, relay_body_
     if (NG_UNLIKELY(fault_armed) && fault_fire()) goto fail;
     if (NG_UNLIKELY(len > (size_t) UINT32_MAX - 8)) goto fail;   /* rec_t.len is 32-bit */
     size_t need = rec_size((uint32_t) len);
-    if (ob->t && ob->t->len + need > ob->cap) {
+    if (ob->t && ob->t->len + need > ob->t->cap) {
         if (ob->t->len >= OUTBOX_FLUSH) outbox_flush_loop(li);
         else {
             size_t want, nc, bytes;
             if (!ng_size_add(ob->t->len, need, &want)) goto fail;
-            nc = ng_grow_cap(ob->cap, want, 16384);
+            nc = ng_grow_cap(ob->t->cap, want, OUTTASK_BASE);
             if (!ng_size_add(sizeof(outtask_t), nc, &bytes)) goto fail;
             outtask_t *nt = (outtask_t *) realloc(ob->t, bytes);
             if (!nt) goto fail;
-            ob->t = nt; ob->cap = nc;
+            ob->t = nt; nt->cap = nc;
         }
     }
     if (!ob->t) {
-        size_t cap = need > 16384 ? need : 16384;
-        ob->t = (outtask_t *) ng_malloc_add(sizeof(outtask_t), cap);
+        if (need <= OUTTASK_BASE) ob->t = outtask_get();
+        else if ((ob->t = (outtask_t *) ng_malloc_add(sizeof(outtask_t), need)) != NULL) {
+            ob->t->len = 0; ob->t->cap = need;
+        }
         if (!ob->t) goto fail;
-        ob->t->len = 0; ob->cap = cap;
     }
     rec_t *r = (rec_t *) (void *) (ob->t->data + ob->t->len);
     r->kind = kind; r->len = (uint32_t) len; r->conn = c; r->body = body;
@@ -259,4 +299,11 @@ void ngb_outbox_flush_and_unref(void) {
 void ngb_outbox_thread_done(void) {
     ngb_outbox_flush_and_unref();
     free(tl_unref); tl_unref = NULL; tl_unref_cap = 0;
+}
+
+void ngb_outbox_pool_drain(void) {
+    pthread_mutex_lock(&pool_mu);
+    outtask_t *t = pool_head; pool_head = NULL; pool_n = 0;
+    pthread_mutex_unlock(&pool_mu);
+    while (t) { outtask_t *n = t->pool_next; free(t); t = n; }
 }

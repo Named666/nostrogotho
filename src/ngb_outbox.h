@@ -59,4 +59,7 @@ void ngb_outbox_flush_and_unref(void);
 /* Thread exit: flush and release this thread's outbox buffers. */
 void ngb_outbox_thread_done(void);
 
+/* Shutdown, after every loop and worker has stopped: free the task pool. */
+void ngb_outbox_pool_drain(void);
+
 #endif /* NGB_OUTBOX_H_ */
