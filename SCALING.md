@@ -443,13 +443,13 @@ and shrinks buffers). For 1M mostly idle sockets: raise `fs.nr_open`,
 socket plus headroom for active senders, keep the default `tcp_wmem` max
 (4 MB) unless WAN BDP testing says otherwise, and watch
 `/proc/net/sockstat` (`TCP: mem`) and `ss -tm` under load. The relay already
-bounds userspace output per connection (`max_output_bytes`).
+bounds userspace output per connection (`conn_outbound_max`).
 
 ### In-memory tag index (`tag_index = memory`)
 
 | events | postings | keys | index MB | RSS MB | B/event |
 |---|---|---|---|---|---|
-| 1M (realistic preload) | - | - | 124.7 | - | - |
+| 1M | 6.0M | 1.08M | 124.7 | - | 125 |
 | 5M | 30.2M | - | 441.5 | 441.9 | 88 |
 | 10M | 60.2M | - | 894.1 | 881.0 | 89 |
 | 20M | 120.3M | 4.40M | 1537.7 | 1511.5 | 76.9 |
