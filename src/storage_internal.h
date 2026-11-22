@@ -37,6 +37,11 @@ enum { PS_INSERT, PS_TOMB_CHECK, PS_TOMB_ADD, PS_REPL_SEL, PS_DEL_ID, PS_TAG_INS
  * and content borrow the row (valid until the next step/reset). */
 void ngdb_row_event(sqlite3_stmt *stmt, event_t *ev);
 
+/* Bind hex (id, pubkey, sig) as its bytes, decoded into buf (cap bytes) and
+ * bound SQLITE_STATIC: buf must outlive the step and reset. Malformed or
+ * too-long hex binds NULL, as unhex() returning NULL did. */
+void ngdb_bind_hex(sqlite3_stmt *stmt, int idx, const char *hex, uint8_t *buf, size_t cap);
+
 /* The statement, reset and with bindings cleared; NULL on prepare error. */
 sqlite3_stmt *ngdb_ps(int which);
 

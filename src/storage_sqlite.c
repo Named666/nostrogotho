@@ -27,19 +27,21 @@
  * thread_open(true) to get their own read-only WAL connection. */
 NG_THREAD_LOCAL sqlite3 *ngdb_conn = NULL;
 
+/* Hex ids/pubkeys/sigs are bound as their bytes (ngdb_bind_hex), not
+ * converted with unhex() in SQL: no per-execution function call. */
 static const char *const ps_sql[PS_COUNT] = {
     /* seq: explicit in tag_index = memory (ngdb_seq_take), NULL = SQLite's max + 1 otherwise. */
     [PS_INSERT] = ("INSERT INTO event (id, pubkey, created_at, kind, tags, content, sig, seq) "
-                   "VALUES (unhex(?), unhex(?), ?, ?, ?, ?, unhex(?), ?) ON CONFLICT(id) DO NOTHING"),
-    [PS_TOMB_CHECK] = "SELECT 1 FROM deleted_event WHERE id = unhex(?) AND pubkey = unhex(?)",
-    [PS_TOMB_ADD] = "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (unhex(?), unhex(?))",
-    [PS_REPL_SEL] = "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = unhex(?) AND kind = ?",
-    [PS_DEL_ID] = "DELETE FROM event WHERE id = unhex(?)",
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING"),
+    [PS_TOMB_CHECK] = "SELECT 1 FROM deleted_event WHERE id = ? AND pubkey = ?",
+    [PS_TOMB_ADD] = "INSERT OR IGNORE INTO deleted_event (id, pubkey) VALUES (?, ?)",
+    [PS_REPL_SEL] = "SELECT lower(hex(id)), created_at, tags FROM event WHERE pubkey = ? AND kind = ?",
+    [PS_DEL_ID] = "DELETE FROM event WHERE id = ?",
     [PS_TAG_OVERFLOW] = "INSERT OR IGNORE INTO tag_overflow (ev, created_at, kind) VALUES (?, ?, ?)",
     [PS_TAG_INSERT] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES (?, ?, ?, ?, ?)",
     [PS_TAG_INSERT_CHUNK] = "INSERT OR IGNORE INTO tag (name, value, created_at, ev, kind) VALUES "
                             "(?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)",
-    [PS_VANISH_CHECK] = "SELECT 1 FROM vanished WHERE pubkey = unhex(?) AND until >= ?",
+    [PS_VANISH_CHECK] = "SELECT 1 FROM vanished WHERE pubkey = ? AND until >= ?",
     [PS_FTS_FEED] = "INSERT INTO event_fts (rowid, content) SELECT seq, content FROM event"
                     " WHERE seq >= ? AND content != '' AND " NG_SEARCH_KIND_SQL("kind"),
 };

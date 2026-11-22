@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "crypto.h"
 #include "json_lite.h"
 #include "storage_query.h"
 #include "memidx.h"
@@ -173,14 +174,21 @@ static int vanished_any(void) {
     return vanished_state;
 }
 
+void ngdb_bind_hex(sqlite3_stmt *stmt, int idx, const char *hex, uint8_t *buf, size_t cap) {
+    size_t n = 0, hl = hex ? strlen(hex) : 0;
+    if (hl && hex_to_bytes(hex, hl, buf, cap, &n)) sqlite3_bind_blob(stmt, idx, buf, (int) n, SQLITE_STATIC);
+    else sqlite3_bind_null(stmt, idx);
+}
+
 storage_put_t ngdb_insert_event(const event_t *ev) {
     if (!ngdb_conn || !ev) return STORAGE_PUT_FAILED;
+    uint8_t idb[32], pkb[32], sigb[64];     /* bound STATIC below; reset before return */
 
     /* NIP-09: an author's deletion request permanently blocks the id. */
     sqlite3_stmt *t = ngdb_ps(PS_TOMB_CHECK);
     if (!t) return STORAGE_PUT_FAILED;
-    sqlite3_bind_text(t, 1, ev->id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(t, 2, ev->pubkey, -1, SQLITE_STATIC);
+    ngdb_bind_hex(t, 1, ev->id, idb, sizeof idb);
+    ngdb_bind_hex(t, 2, ev->pubkey, pkb, sizeof pkb);
     int rc = sqlite3_step(t);
     sqlite3_reset(t);
     if (rc == SQLITE_ROW) return STORAGE_PUT_TOMBSTONED;
@@ -194,7 +202,7 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
         if (v) {
             t = ngdb_ps(PS_VANISH_CHECK);
             if (!t) return STORAGE_PUT_FAILED;
-            sqlite3_bind_text(t, 1, ev->pubkey, -1, SQLITE_STATIC);
+            ngdb_bind_hex(t, 1, ev->pubkey, pkb, sizeof pkb);
             sqlite3_bind_int64(t, 2, (sqlite3_int64) ev->created_at);
             rc = sqlite3_step(t);
             sqlite3_reset(t);
@@ -205,13 +213,13 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
 
     sqlite3_stmt *stmt = ngdb_ps(PS_INSERT);
     if (!stmt) return STORAGE_PUT_FAILED;
-    sqlite3_bind_text(stmt, 1, ev->id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, ev->pubkey, -1, SQLITE_STATIC);
+    ngdb_bind_hex(stmt, 1, ev->id, idb, sizeof idb);
+    ngdb_bind_hex(stmt, 2, ev->pubkey, pkb, sizeof pkb);
     sqlite3_bind_int64(stmt, 3, (sqlite3_int64) ev->created_at);
     sqlite3_bind_int(stmt, 4, ev->kind);
     sqlite3_bind_text(stmt, 5, ev->tags_json ? ev->tags_json : "[]", -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt, 6, ev->content ? ev->content : "", -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 7, ev->sig, -1, SQLITE_STATIC);
+    ngdb_bind_hex(stmt, 7, ev->sig, sigb, sizeof sigb);
     const bool mem = ngdb_tag_memory();
     const uint64_t mseq = mem ? ngdb_seq_take() : 0;
     if (mem) sqlite3_bind_int64(stmt, 8, (sqlite3_int64) mseq);
@@ -241,7 +249,7 @@ storage_put_t ngdb_insert_event(const event_t *ev) {
         (void) ngdb_fts_flush();
         sqlite3_stmt *del = ngdb_ps(PS_DEL_ID);
         if (del) {
-            sqlite3_bind_text(del, 1, ev->id, -1, SQLITE_STATIC);
+            ngdb_bind_hex(del, 1, ev->id, idb, sizeof idb);
             if (sqlite3_step(del) != SQLITE_DONE) fprintf(stderr, "SQL error: %s\n", sqlite3_errmsg(ngdb_conn));
             sqlite3_reset(del);
         }
@@ -258,8 +266,9 @@ bool ngdb_insert_record(const event_t *ev) { return ngdb_insert_event(ev) == STO
 bool ngdb_add_tombstone(const char *id, const char *pubkey) {
     sqlite3_stmt *t = ngdb_ps(PS_TOMB_ADD);
     if (!t || !id || !pubkey) return false;
-    sqlite3_bind_text(t, 1, id, -1, SQLITE_STATIC);
-    sqlite3_bind_text(t, 2, pubkey, -1, SQLITE_STATIC);
+    uint8_t idb[32], pkb[32];
+    ngdb_bind_hex(t, 1, id, idb, sizeof idb);
+    ngdb_bind_hex(t, 2, pubkey, pkb, sizeof pkb);
     int rc = sqlite3_step(t);
     sqlite3_reset(t);
     return rc == SQLITE_DONE;
@@ -281,7 +290,8 @@ static bool tags_d_equals(const char *tags_json, const char *want) {
 storage_admit_t ngdb_replaceable_admit(const event_t *ev, const char *dtag) {
     sqlite3_stmt *sel = ngdb_ps(PS_REPL_SEL);
     if (!sel || !ev) return STORAGE_ADMIT_FAILED;
-    sqlite3_bind_text(sel, 1, ev->pubkey, -1, SQLITE_STATIC);
+    uint8_t pkb[32], idb[32];
+    ngdb_bind_hex(sel, 1, ev->pubkey, pkb, sizeof pkb);
     sqlite3_bind_int(sel, 2, ev->kind);
     char (*victims)[MAX_ID_SIZE + 1] = NULL;
     size_t nv = 0, cap = 0;
@@ -311,7 +321,7 @@ storage_admit_t ngdb_replaceable_admit(const event_t *ev, const char *dtag) {
     if (verdict == STORAGE_ADMIT_NEWEST) {
         sqlite3_stmt *del = ngdb_ps(PS_DEL_ID);
         for (size_t i = 0; del && i < nv; i++) {
-            sqlite3_bind_text(del, 1, victims[i], -1, SQLITE_STATIC);
+            ngdb_bind_hex(del, 1, victims[i], idb, sizeof idb);
             if (sqlite3_step(del) != SQLITE_DONE) verdict = STORAGE_ADMIT_FAILED;
             sqlite3_reset(del);
         }
@@ -613,7 +623,8 @@ bool ngdb_delete_by_id(const char *id, size_t *deleted) {
     if (!id || !ngdb_fts_flush()) return false;
     sqlite3_stmt *stmt = ngdb_ps(PS_DEL_ID);
     if (!stmt) return false;
-    sqlite3_bind_text(stmt, 1, id, -1, SQLITE_STATIC);
+    uint8_t idb[32];
+    ngdb_bind_hex(stmt, 1, id, idb, sizeof idb);
     int rc = sqlite3_step(stmt);
     if (deleted) *deleted = rc == SQLITE_DONE ? (size_t) sqlite3_changes(ngdb_conn) : 0;
     sqlite3_reset(stmt);
