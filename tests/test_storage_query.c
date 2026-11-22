@@ -19,8 +19,8 @@ static void test_simple_req(void) {
     f.kinds = kinds; f.kinds_count = 1; f.since = 100;
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 20);
-    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM event e WHERE e.kind = ? AND e.created_at >= 100 "
-                       "ORDER BY e.created_at DESC, e.id ASC LIMIT ?";
+    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM (SELECT e.seq AS s FROM event e WHERE e.kind = ? AND e.created_at >= 100 "
+                       "ORDER BY e.created_at DESC, e.id ASC LIMIT ?) k CROSS JOIN event e ON e.seq = k.s";
     check("kinds+since SQL", st == NG_OK && q.sql && strcmp(q.sql, want) == 0 && q.len == strlen(want), q.sql);
     check("kinds+since params", q.n == 2 && q.params[0].type == SQ_INT && q.params[0].num == 1 &&
           q.params[1].type == SQ_INT && q.params[1].num == 20, NULL);
@@ -86,7 +86,7 @@ static void test_tag_join(void) {
     f.tags = tags; f.tags_count = 2; f.kinds = kinds; f.kinds_count = 2; f.since = 9;
     sq_query_t q = {0};
     ng_status_t st = sq_build(&q, &f, false, 50);
-    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM tag t JOIN event e ON e.seq = t.ev "
+    const char *want = "SELECT " SQ_EVENT_COLUMNS " FROM (SELECT e.seq AS s FROM tag t JOIN event e ON e.seq = t.ev "
                        "WHERE t.name = 112 AND t.value = ? AND "
                        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
                        "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') = ?) "
@@ -95,7 +95,7 @@ static void test_tag_join(void) {
                        "AND x.created_at = e.created_at AND x.ev = e.seq) AND "
                        "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(e.tags) THEN e.tags ELSE '[]' END) j "
                        "WHERE json_extract(j.value, '$[0]') = ? AND json_extract(j.value, '$[1]') IN (?,?)) "
-                       "ORDER BY t.created_at DESC, e.id ASC LIMIT ?";
+                       "ORDER BY t.created_at DESC, e.id ASC LIMIT ?) k CROSS JOIN event e ON e.seq = k.s";
     check("tag join SQL", st == NG_OK && strcmp(q.sql, want) == 0, q.sql);
     check("tag join params", q.n == 11 && strcmp(q.params[0].text, "1111111111111111") == 0 &&
           strcmp(q.params[1].text, "p") == 0 && q.params[2].text == H1 &&

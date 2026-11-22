@@ -244,9 +244,17 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
     bool multi = tagged && f->tags[drive].count > 2;   /* one event can match several values */
     const char *tc = tagged ? "t." : "e.";             /* created_at / kind source */
     char buf[96];
+    /* Rows mode sorts and limits seqs only, then fetches the full rows in
+     * that order (CROSS JOIN keeps the subquery as the outer loop): the
+     * sorter holds small keys instead of tags/content. Not for NIP-50 (rank)
+     * or the per-candidate seq probe (one row). */
+    bool fts_req = f->search && ng_search_has_terms(f->search);
+    bool ids_first = mode == SQ_MODE_ROWS && !fts_req && !sq_seq_first;
 
     if (do_count) sq_sql(q, multi ? "SELECT COUNT(DISTINCT e.seq) FROM " : "SELECT COUNT(*) FROM ");
     else if (mode == SQ_MODE_PUBKEYS) sq_sql(q, multi ? "SELECT DISTINCT e.seq, e.pubkey FROM " : "SELECT e.seq, e.pubkey FROM ");
+    else if (ids_first) sq_sql(q, multi ? "SELECT " SQ_EVENT_COLUMNS " FROM (SELECT DISTINCT e.seq AS s FROM "
+                                          : "SELECT " SQ_EVENT_COLUMNS " FROM (SELECT e.seq AS s FROM ");
     else sq_sql(q, multi ? "SELECT DISTINCT " SQ_EVENT_COLUMNS " FROM " : "SELECT " SQ_EVENT_COLUMNS " FROM ");
     if (tagged && sq_overflow) {
         /* Some events carry more tags than tag_index_max_per_event: their
@@ -326,6 +334,7 @@ ng_status_t sq_build_mode(sq_query_t *q, const filter_t *f, sq_mode_t mode, int 
         sq_sql(q, tagged && !multi ? " ORDER BY t.created_at DESC, e.id ASC LIMIT ?"
                                    : " ORDER BY e.created_at DESC, e.id ASC LIMIT ?");
         sq_int(q, limit);
+        if (ids_first) sq_sql(q, ") k CROSS JOIN event e ON e.seq = k.s");
     }
     return q->status;
 }
